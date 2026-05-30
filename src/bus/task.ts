@@ -5,6 +5,7 @@ import { atomicWriteSync, ensureDir } from '../utils/atomic.js';
 import { randomDigits } from '../utils/random.js';
 import { validatePriority } from '../utils/validate.js';
 import { logEvent } from './event.js';
+import { vaultWriteTask, vaultMoveTask, vaultArchiveTask } from './vault-sync.js';
 
 /**
  * Create a new task. Identical JSON format to bash create-task.sh.
@@ -91,6 +92,9 @@ export function createTask(
   for (const downId of blocks) addSymmetricEdge(paths, downId, 'blocked_by', taskId);
 
   appendTaskAudit(paths, taskId, { event: 'create', agent: agentName, to: 'pending', note: title });
+
+  // MEMORY-07: Sync new task to Obsidian vault (best-effort, never blocks).
+  vaultWriteTask(task);
 
   return taskId;
 }
@@ -282,6 +286,12 @@ export function updateTask(
     throw new Error(`Task ${taskId} update failed: ${err}`);
   }
   appendTaskAudit(paths, taskId, { event: 'update', agent: assignee || 'unknown', from: prevStatus, to: status });
+
+  // MEMORY-07: Move vault file to new status folder (best-effort).
+  if (prevStatus !== undefined) {
+    const updatedTask = JSON.parse(readFileSync(filePath, 'utf-8')) as Task;
+    vaultMoveTask(updatedTask, prevStatus);
+  }
 }
 
 /**
@@ -507,6 +517,12 @@ export function completeTask(
     } catch {
       // Never let observability break task completion.
     }
+  }
+
+  // MEMORY-07: Move vault file to completed folder (best-effort).
+  if (prevStatus !== undefined) {
+    const completedTask = JSON.parse(readFileSync(filePath, 'utf-8')) as Task;
+    vaultMoveTask(completedTask, prevStatus);
   }
 }
 
@@ -810,6 +826,8 @@ export function compactTasks(
       try {
         appendFileSync(archivePath, JSON.stringify(entry) + '\n', { encoding: 'utf-8', mode: 0o600 });
         unlinkSync(join(taskDir, `${task.id}.json`));
+        // MEMORY-07: Move vault file to archive subfolder (best-effort).
+        vaultArchiveTask(task.id, task.assigned_to ?? 'unassigned');
       } catch (err) {
         report.skipped.push({ id: task.id, reason: `archive write failed: ${err}` });
         continue;
