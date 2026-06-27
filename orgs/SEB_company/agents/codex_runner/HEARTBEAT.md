@@ -58,7 +58,7 @@ Ref: `plugins/cortextos-agent-skills/skills/memory/SKILL.md`
 TODAY=$(date -u +%Y-%m-%d); LOCAL=$(date +'%-I:%M %p %Z' 2>/dev/null || date)
 cat >> "memory/$TODAY.md" << MEMORY
 
-## Heartbeat $(date -u +%H:%M UTC) / $LOCAL
+## Heartbeat $(date -u +'%H:%MZ') / $LOCAL
 - WORKING ON: <task_id or "none">
 - Status: <healthy/working/blocked>
 - Inbox: <N processed>
