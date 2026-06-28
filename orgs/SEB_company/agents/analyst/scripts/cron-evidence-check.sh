@@ -25,7 +25,10 @@ set -uo pipefail
 HOME_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"   # analyst agent home (absolute)
 REPO_DIR="/c/Users/Sebas/cortextos"                          # for auto-commit git evidence
 NOW=$(date -u +%s)
-GRACE_MIN=${CRON_EV_GRACE_MIN:-30}   # LLM-cron handler needs minutes; 30min = low-FP "had time to act"
+GRACE_MIN=${CRON_EV_GRACE_MIN:-45}   # LLM-cron handler needs minutes; 45min absorbs herd serial-delay
+# (raised 30->45 2026-06-28: theta-wave-pulse self-flagged when co-fired crons serialized its own
+# ledger-write past 30min. Evidence is analyst-self-written, so a busy session legitimately lags.
+# 45min still catches a genuinely-dead daily/3d cron within the hour. Tune via CRON_EV_GRACE_MIN.)
 
 epoch() { [[ -z "${1:-}" ]] && { echo 0; return; }; date -u -d "$1" +%s 2>/dev/null || echo 0; }
 mtime() { [[ -f "$1" ]] && stat -c '%Y' "$1" 2>/dev/null || echo 0; }
