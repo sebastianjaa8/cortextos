@@ -12,9 +12,17 @@ Data sources (all JSONL, read-only):
   - fires:  <STATE>/<agent>/cron-execution.log   {ts,cron,status,...}
   - events: <EVENTS>/<agent>/<date>.jsonl        {agent,timestamp,event,...}
 
+Also flags OVERDUE crons (added 2026-07-01): enabled crons in crons.json whose
+last fire (or created_at, if never fired) is older than 2x their nominal period.
+Catches the interval-cron reset bug — never-fired interval crons ("7d", "14d")
+recompute nextFireAt from *now* on every daemon restart, so a daemon that
+restarts more often than the interval means the cron NEVER fires (real cases:
+vault_keeper/weekly-lint-gap-finder, brand_writer/nanoneuro-biweekly-update).
+
 Output:
   - one summary line appended to seb_boss/.watchdog.log
   - one `bus log-event monitoring cron_effectiveness_gap` per flagged cron
+  - one `bus log-event metric cron_overdue_gap` per overdue cron
 
 Always exits 0 in normal mode (watchdog sub-check must never abort the chain).
 Run `--self-test` for the built-in synthetic check.
@@ -27,6 +35,7 @@ Env overrides (used by --self-test, harmless in prod):
   CRON_AUDIT_BUS          "off" to skip real bus calls
 """
 import os
+import re
 import sys
 import json
 import glob
@@ -155,6 +164,64 @@ def trailing_silent_streak(fires, event_times, now):
     return streak, len(closed)
 
 
+def nominal_period(schedule):
+    """Nominal fire period for a schedule, or None if unjudgeable.
+
+    Interval shorthand ("30m","2h","7d") parses exactly. 5-field cron exprs are
+    estimated coarsely: month-restricted -> None (seasonal, skip), day-of-month
+    -> ~31d, day-of-week -> 7d, else -> 1d. Sub-daily cron exprs collapse to 1d,
+    which only makes the 2x-overdue check MORE conservative (never false-flags).
+    """
+    m = re.fullmatch(r"(\d+)([smhd])", schedule.strip())
+    if m:
+        n = int(m.group(1))
+        return timedelta(seconds=n * {"s": 1, "m": 60, "h": 3600, "d": 86400}[m.group(2)])
+    fields = schedule.split()
+    if len(fields) != 5:
+        return None
+    _minute, _hour, dom, month, dow = fields
+    if month != "*":
+        return None
+    if dom != "*":
+        return timedelta(days=31)
+    if dow != "*":
+        return timedelta(days=7)
+    return timedelta(days=1)
+
+
+def audit_overdue(now):
+    """Flag enabled crons whose last fire (or created_at) is > 2x period ago.
+
+    Returns [(agent, cron, days_overdue_baseline, never_fired), ...].
+    Judges crons.json directly, so it catches crons the fire-based audit can
+    never see: ones that have NEVER fired.
+    """
+    flagged = []
+    if not os.path.isdir(STATE_DIR):
+        return flagged
+    for agent in sorted(os.listdir(STATE_DIR)):
+        path = os.path.join(STATE_DIR, agent, "crons.json")
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                crons = json.load(fh).get("crons", [])
+        except (OSError, ValueError):
+            continue
+        for c in crons:
+            if not c.get("enabled"):
+                continue
+            period = nominal_period(str(c.get("schedule", "")))
+            if period is None:
+                continue
+            fired = parse_ts(c.get("last_fired_at")) or parse_ts(c.get("last_fire_attempted_at"))
+            baseline = fired or parse_ts(c.get("created_at"))
+            if baseline is None:
+                continue
+            if now - baseline > 2 * period:
+                age_days = (now - baseline).total_seconds() / 86400.0
+                flagged.append((agent, c.get("name", "?"), round(age_days, 1), fired is None))
+    return flagged
+
+
 def discover_agents():
     if not os.path.isdir(STATE_DIR):
         return []
@@ -190,10 +257,21 @@ def log_line(text):
 
 
 def emit_bus_event(agent, cron, streak):
+    _emit("cron_effectiveness_gap",
+          {"agent": agent, "cron": cron, "silent_fires": streak,
+           "window_min": WINDOW_MIN, "detected_by": "cron-effectiveness-audit"})
+
+
+def emit_overdue_event(agent, cron, age_days, never_fired):
+    _emit("cron_overdue_gap",
+          {"agent": agent, "cron": cron, "days_since_last_fire": age_days,
+           "never_fired": never_fired, "detected_by": "cron-effectiveness-audit"})
+
+
+def _emit(event, payload):
     if not BUS_ENABLED:
         return
-    meta = json.dumps({"agent": agent, "cron": cron, "silent_fires": streak,
-                       "window_min": WINDOW_MIN, "detected_by": "cron-effectiveness-audit"})
+    meta = json.dumps(payload)
     # The `cortextos` CLI is an npm shim (.cmd on Windows); CreateProcess won't resolve
     # it without a shell, so go through the shell. Python's shell=True uses cmd.exe on
     # Windows even when launched from Git Bash, so escape the JSON's quotes as \" .
@@ -201,12 +279,12 @@ def emit_bus_event(agent, cron, streak):
     # action/error/metric/milestone/heartbeat/message/task/approval — a silent-cron finding
     # is a monitoring metric. Severity must be info/warning/error/critical (not "warn").
     if os.name == "nt":
-        cmd = ('cortextos bus log-event metric cron_effectiveness_gap warning '
-               '--meta "%s"' % meta.replace('"', '\\"'))
+        cmd = ('cortextos bus log-event metric %s warning '
+               '--meta "%s"' % (event, meta.replace('"', '\\"')))
     else:
         import shlex
-        cmd = ("cortextos bus log-event metric cron_effectiveness_gap warning "
-               "--meta %s" % shlex.quote(meta))
+        cmd = ("cortextos bus log-event metric %s warning "
+               "--meta %s" % (event, shlex.quote(meta)))
     try:
         subprocess.run(cmd, shell=True, check=False, capture_output=True, timeout=30)
     except (OSError, subprocess.SubprocessError) as e:
@@ -215,14 +293,26 @@ def emit_bus_event(agent, cron, streak):
 
 def run(quiet=False):
     now, checked, gaps = audit()
+    overdue = audit_overdue(now)
     ts = now.strftime("%Y-%m-%dT%H:%MZ")
+    parts = []
     if gaps:
         detail = ", ".join("%s/%s (%d silent fires)" % (a, c, s) for a, c, s, _ in gaps)
-        line = "[%s] cron-effectiveness-audit: %d GAP(s) — %s" % (ts, len(gaps), detail)
+        parts.append("%d GAP(s) — %s" % (len(gaps), detail))
         for agent, cron, streak, _ in gaps:
             emit_bus_event(agent, cron, streak)
+    if overdue:
+        detail = ", ".join(
+            "%s/%s (%s, %.1fd since %s)" % (a, c, "NEVER FIRED" if nf else "stalled", d,
+                                            "creation" if nf else "last fire")
+            for a, c, d, nf in overdue)
+        parts.append("%d OVERDUE — %s" % (len(overdue), detail))
+        for agent, cron, age_days, never_fired in overdue:
+            emit_overdue_event(agent, cron, age_days, never_fired)
+    if parts:
+        line = "[%s] cron-effectiveness-audit: %s" % (ts, "; ".join(parts))
     else:
-        line = "[%s] cron-effectiveness-audit: CLEAN (%d crons checked, all fires productive within %dmin)" % (
+        line = "[%s] cron-effectiveness-audit: CLEAN (%d crons checked, all fires productive within %dmin, none overdue)" % (
             ts, checked, WINDOW_MIN)
     log_line(line)
     if not quiet:
@@ -301,7 +391,45 @@ def self_test():
         assert broken_streak == 4, "broken streak should be 4, got %d" % broken_streak
         # the just-fired-but-window-open case is excluded: add a fire 10min ago, no event
         assert checked >= 3, "should have checked >=3 crons, got %d" % checked
-        print("self-test OK: flagged=%s checked=%d broken_streak=%d" % (flagged, checked, broken_streak))
+
+        # --- overdue check fixtures ---
+        def iso(dt):
+            return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        stale_crons = {"crons": [
+            # never fired, 7d interval, created 20d ago -> FLAG (the real-world bug)
+            {"name": "dead-weekly", "schedule": "7d", "enabled": True,
+             "created_at": iso(now - timedelta(days=20))},
+            # daily cron fired 2h ago -> clean
+            {"name": "fresh-daily", "schedule": "0 8 * * *", "enabled": True,
+             "created_at": iso(now - timedelta(days=60)),
+             "last_fired_at": iso(now - timedelta(hours=2))},
+            # daily cron stalled 5d -> FLAG
+            {"name": "stalled-daily", "schedule": "0 8 * * *", "enabled": True,
+             "created_at": iso(now - timedelta(days=60)),
+             "last_fired_at": iso(now - timedelta(days=5))},
+            # disabled + ancient -> clean (skipped)
+            {"name": "disabled-old", "schedule": "24h", "enabled": False,
+             "created_at": iso(now - timedelta(days=90))},
+            # month-restricted (seasonal) never fired -> clean (unjudgeable)
+            {"name": "tax-jan", "schedule": "0 8 5 1,2 *", "enabled": True,
+             "created_at": iso(now - timedelta(days=90))},
+        ]}
+        os.makedirs(os.path.join(state, "staleagent"), exist_ok=True)
+        with open(os.path.join(state, "staleagent", "crons.json"), "w", encoding="utf-8") as fh:
+            json.dump(stale_crons, fh)
+
+        overdue = audit_overdue(now)
+        oflag = {(a, c): nf for a, c, _, nf in overdue}
+        assert ("staleagent", "dead-weekly") in oflag and oflag[("staleagent", "dead-weekly")] is True, \
+            "never-fired 7d cron must flag as never_fired, got %s" % oflag
+        assert ("staleagent", "stalled-daily") in oflag and oflag[("staleagent", "stalled-daily")] is False, \
+            "stalled daily cron must flag as stalled, got %s" % oflag
+        assert ("staleagent", "fresh-daily") not in oflag, "fresh daily must NOT flag"
+        assert ("staleagent", "disabled-old") not in oflag, "disabled cron must NOT flag"
+        assert ("staleagent", "tax-jan") not in oflag, "month-restricted cron must NOT flag"
+
+        print("self-test OK: flagged=%s checked=%d broken_streak=%d overdue=%s" % (
+            flagged, checked, broken_streak, sorted(oflag)))
         return 0
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

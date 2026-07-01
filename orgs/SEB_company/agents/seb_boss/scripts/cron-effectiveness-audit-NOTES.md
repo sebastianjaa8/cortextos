@@ -59,3 +59,11 @@ or register a standalone cron (every 6h, offset off the :00 stampede):
       "Run scripts/cron-effectiveness-audit.py to flag crons firing without producing bus events."
 The script writes its summary line to .watchdog.log and emits one
 `bus log-event monitoring cron_effectiveness_gap` per flagged cron.
+
+## 2026-07-01 extension — overdue / never-fired detection (Fable free-rein pass)
+
+- Added `audit_overdue()`: reads every agent's crons.json directly; flags enabled crons whose last fire (or created_at if never fired) is >2x nominal period old. Emits `cron_overdue_gap` bus events + OVERDUE section in the .watchdog.log line.
+- Why: the fire-based audit is structurally blind to crons that NEVER fire. Root cause found in daemon cron-scheduler.ts — never-fired interval crons ("7d"/"14d") recompute nextFireAt from *now* on every daemon restart, so any daemon restarting more often than the interval means the cron never fires. Real victims: vault_keeper/weekly-lint-gap-finder (7d, 0 fires since 05-28), brand_writer/nanoneuro-biweekly-update (14d, 0 fires since 05-14). Both converted to calendar-anchored cron exprs (immune to the reset).
+- Period estimation for cron exprs is coarse by design: month-restricted → skip, DOM → 31d, DOW → 7d, else 1d. Sub-daily exprs collapse to 1d — only makes the 2x check more conservative.
+- ponytail: no fix to cortextos src (community repo, no-modify rule) — detection here + config-level workaround instead.
+- Self-test extended with 5 overdue fixtures (never-fired flag, stalled flag, fresh/disabled/seasonal clean).
