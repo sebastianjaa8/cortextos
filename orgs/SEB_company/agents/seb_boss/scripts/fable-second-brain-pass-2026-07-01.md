@@ -38,3 +38,9 @@ Running implementation notes (decisions / changes / tradeoffs / gotchas).
 - cortextos src interval-cron bug: no-modify rule. Documented root cause here + in NOTES; worth an upstream issue if Sebastian wants.
 - ~/.claude/CLAUDE.md stale claim ("morning-brief cron ... in config.json" — actually crons.json since migration): user-named-files-only rule → proposed in report, not edited.
 - Sunday-evening cron pile-up (17:00→23:00 has 9+ crons across agents): known herd-delay issue already absorbed by analyst 45min grace; rebalancing all of them = churn without evidence of breakage.
+
+## Second wave — vault-path mismatches in cron prompts (20:35Z)
+
+- 20:33Z — finding: email_triage morning+midday crons read "Knowledge/email-triage-protocol.md" and log to "Knowledge/email-triage-log.md" — neither exists. Actual: Knowledge/protocols/email-triage-protocol.md and Knowledge/_email-triage-log.md.
+- 20:33Z — finding: todoist_keeper daily-hygiene reads "Knowledge/todoist-protocol.md" (doesn't exist; actual Knowledge/protocols/todoist-protocol.md — and the prompt's "if protocol missing, draft proposal" branch means the agent may believe the protocol is missing) and logs to "Knowledge/todoist-keeper-log.md" (actual: Knowledge/tools/todoist-keeper-log.md, the path its own dup-detect cron uses correctly).
+- 20:35Z — change: all 3 cron prompts corrected via bus update-cron (paths only; workflow text untouched, "PATH FIXED 2026-07-01" markers inline). Obsidian CLI exit-code-always-0 quirk means these wrong reads likely failed silently for weeks.
