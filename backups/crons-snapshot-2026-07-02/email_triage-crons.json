@@ -1,0 +1,47 @@
+{
+  "updated_at": "2026-07-02T13:55:07.765Z",
+  "crons": [
+    {
+      "name": "heartbeat",
+      "prompt": "Read HEARTBEAT.md and follow its instructions. Update your heartbeat, check inbox, work on highest priority bus dispatch. NIGHT MODE: if local time 00:00-08:00 America/New_York, silent heartbeat (touch file, no Telegram, no active triage).",
+      "schedule": "4h",
+      "enabled": true,
+      "created_at": "2026-05-14T18:36:06.940Z",
+      "metadata": {
+        "migrated_from_config": true,
+        "original_type": "recurring"
+      },
+      "last_fire_attempted_at": "2026-07-02T13:55:07.742Z",
+      "last_fired_at": "2026-07-02T13:55:07.742Z",
+      "fire_count": 274
+    },
+    {
+      "name": "morning-triage",
+      "prompt": "Morning 6:30am ET full email triage. Sonnet 4.6 for classification. (1) Read vault Knowledge/protocols/email-triage-protocol.md via obsidian CLI - rule source for buckets + draft rules + auto-junk allow-list (PATH FIXED 2026-07-01: protocol lives under Knowledge/protocols/, not Knowledge/). (2) Pull unread Gmail via mcp__claude_ai_Gmail__search_threads with query 'is:unread in:inbox'. (3) Classify each into 5 buckets: Urgent / Needs Reply / FYI / Read Later / Junk. (4) Apply Gmail labels via mcp__claude_ai_Gmail__label_message / label_thread. (5) For NON-CLIENT Needs Reply: generate Gmail draft via mcp__claude_ai_Gmail__create_draft (NEVER send, match Sebastian's terse outbound tone). (6) For CLIENT Needs Reply (sender matches sebastian-brand SSOT per-client config): bus brand_writer with email content + thread context. (7) Auto-junk allow-list senders: trash via Gmail; everyone else label-only. (8) Update vault email-triage-preferences.md per-sender learnings (autonomous tier, obsidian CLI). (9) Append run log to vault Knowledge/_email-triage-log.md (leading underscore — actual filename). (10) Bus seb_boss with Urgent surface (max 5 1-line items, format: TRIAGE TIMESTAMP - counts U=N RN=N F=N RL=N J=N | drafts=N | learnings=N then URGENT list). NEVER bulk-junk >10 per session - escalate mass-wave. (11) CAREER TRACKER (task #17 - additive, tracking-only): from agent dir run `PYTHONIOENCODING=utf-8 python scripts/career_tracker.py run \"in:inbox\"` - detects recruiter/application/interview/offer/rejection emails (excludes job-alert digests, career newsletters, self Todoist reminders, marketing blasts) and upserts the Google Sheet 'Job Applications Tracker' on company+role key with status advance-only. NEVER sends/replies. Then `python scripts/career_tracker.py summary` for counts-by-status. Add a CAREER line to the seb_boss surface: CAREER detected=N | <status counts> | Sheet https://docs.google.com/spreadsheets/d/1aZLV7e0AkSeLxG0sesJGRbazDVMfw7BQVUJMS39lxL8/edit . resume-version stays blank (seb_boss backfills from cvtailor).",
+      "schedule": "30 6 * * *",
+      "enabled": true,
+      "created_at": "2026-05-14T18:36:06.940Z",
+      "metadata": {
+        "migrated_from_config": true,
+        "original_type": "recurring"
+      },
+      "last_fire_attempted_at": "2026-07-02T10:30:08.920Z",
+      "last_fired_at": "2026-07-02T10:30:08.920Z",
+      "fire_count": 49
+    },
+    {
+      "name": "midday-triage",
+      "prompt": "Midday 2pm ET light triage - fast-reply catch on inbound since morning pass. Haiku 4.5 for classification (cheaper, classification simpler since morning pass already handled overnight backlog). (1) Read vault Knowledge/protocols/email-triage-protocol.md via obsidian CLI (PATH FIXED 2026-07-01: protocol lives under Knowledge/protocols/). (2) Pull unread Gmail received after 9am ET today: mcp__claude_ai_Gmail__search_threads with query 'is:unread in:inbox newer_than:1d after:NINE_AM_TODAY_EPOCH'. (3) Same 5-bucket classification + labels as morning. (4) NON-CLIENT Needs Reply: generate Gmail draft. (5) CLIENT Needs Reply: bus brand_writer. (6) Auto-junk: allow-list trash + everyone else label-only. (7) Update preferences + append log to vault Knowledge/_email-triage-log.md (leading underscore — actual filename). (8) Bus seb_boss with Urgent surface ONLY if Urgent count >0 (skip surface if zero Urgent - quieter midday). Format: TRIAGE-MIDDAY TIMESTAMP - counts then URGENT list if any. Light pass = fewer cycles, faster response to fresh inbound. (9) CAREER TRACKER (task #17 - additive, tracking-only): run `PYTHONIOENCODING=utf-8 python scripts/career_tracker.py run \"in:inbox newer_than:1d\"` then `python scripts/career_tracker.py summary`; upserts Google Sheet 'Job Applications Tracker' (never sends). Add CAREER detected=N line + Sheet https://docs.google.com/spreadsheets/d/1aZLV7e0AkSeLxG0sesJGRbazDVMfw7BQVUJMS39lxL8/edit to surface if any.",
+      "schedule": "0 14 * * *",
+      "enabled": true,
+      "created_at": "2026-05-14T18:36:06.940Z",
+      "metadata": {
+        "migrated_from_config": true,
+        "original_type": "recurring"
+      },
+      "last_fire_attempted_at": "2026-07-01T18:00:01.448Z",
+      "last_fired_at": "2026-07-01T18:00:01.448Z",
+      "fire_count": 48
+    }
+  ]
+}

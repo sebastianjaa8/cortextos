@@ -1,0 +1,82 @@
+{
+  "updated_at": "2026-07-02T14:45:10.081Z",
+  "crons": [
+    {
+      "name": "heartbeat",
+      "prompt": "Read HEARTBEAT.md and follow its instructions. Update your heartbeat, check inbox, work on highest priority bus dispatch. OBSIDIAN DEAD-MAN (ARMED, Sebastian a1 lock 2026-06-04): every heartbeat, run: bash scripts/obsidian-deadman.sh --check (from your agent dir; script handles probe/state/restart/broadcast itself — armed flag present, it WILL kill+relaunch a confirmed-hung Obsidian). Report transition events (down->up, restart fired) in your heartbeat text; silent when up. NIGHT MODE: if local time 00:00-08:00 America/New_York, silent heartbeat (touch file, no Telegram, no active work unless cron-triggered weekly lint+gap-finder) — dead-man check STILL RUNS at night.",
+      "schedule": "2h",
+      "enabled": true,
+      "created_at": "2026-05-14T18:35:52.171Z",
+      "metadata": {
+        "migrated_from_config": true,
+        "original_type": "recurring"
+      },
+      "last_fire_attempted_at": "2026-07-02T13:55:09.282Z",
+      "last_fired_at": "2026-07-02T13:55:09.282Z",
+      "fire_count": 547
+    },
+    {
+      "name": "daily-note-lifecycle",
+      "prompt": "PRE-FLIGHT (context-save monitor, added 2026-06-22 task_1782168595846 — seb_boss GO): FIRST run `bash scripts/check-context-save.sh` from agent dir. It checks yesterday's vault Knowledge/_seb_boss-conversations/<date>.md; if MISSING/TRIVIAL or CLI-dead it buses seb_boss + logs context_save_gap_flag automatically. Report its one-line verdict in your run. Then: Run daily-note-lifecycle skill: route yesterday's Capture content (autonomous tier), archive single/multi-day notes >N days old (autonomous tier), monthly journal rollup on month boundary, generate yesterday's day summary. Use Haiku 4.5 for routine routing + archive. ALL writes via obsidian CLI — NEVER Write/Edit/Read tools on vault paths. Log [AUTO] entry in relevant Project Log.md after each write.",
+      "schedule": "24h",
+      "enabled": true,
+      "created_at": "2026-05-14T18:35:52.171Z",
+      "metadata": {
+        "migrated_from_config": true,
+        "original_type": "recurring"
+      },
+      "last_fire_attempted_at": "2026-07-02T13:52:09.247Z",
+      "last_fired_at": "2026-07-02T13:52:09.247Z",
+      "fire_count": 46
+    },
+    {
+      "name": "weekly-lint-gap-finder",
+      "prompt": "Sunday 11pm ET. Use Sonnet 4.6 for semantic synthesis. (1) Run lint skill: vault contradictions, stale claims, missing entity pages, data gaps, hook drift, project Log silent, decision-ledger past-due, Sebastian-input cost over budget -> write PROPOSE-ONLY findings to vault _AI_Inbox/lint-YYYY-MM-DD.md via obsidian CLI. (2) Run gap-finder skill: recurring manual tasks >=3x, repeat questions >=2x, client patterns not in sebastian-brand -> write findings to vault _AI_Inbox/gap-finder-lint-YYYY-MM-DD.md. GAP-FINDER POSTURE (Sebastian 5split lock 2026-06-04): AUTO-RESOLVE vault-internal knowledge fills (Knowledge/ pages, entity stubs, index fixes) directly + log [AUTO]; PROPOSE-ONLY for anything touching crons, configs, hooks, skills, or agent behavior. (3) Context.md staleness scan: obsidian files folder=Projects to list all Context.md paths. For each, obsidian read + parse frontmatter status: and updated:. If status=active AND updated >14d ago, read memory/context-staleness-state.json - if path absent from flags OR flags[path].last_flagged_updated_date != current updated value, bus seb_boss normal 'Context.md staleness: <path> updated <N> days ago.' and append/update flags[path]={last_flagged_updated_date: <current updated value>, last_flagged_at: <today UTC>}. If already flagged at same updated date, skip (idempotent). Write back state file at end. (4) Fleet-process-rules extraction (seb_boss GO 2026-06-05, AUTO posture, vault-internal knowledge fill per 5split): scan ../seb_boss/memory/*.md (last 7 days) for markers RULE: / NEW FLEET RULE / STANDING RULE. Dedup by rule-text against existing Knowledge/fleet-process-rules.md entries. Append new rules (date + source file + rule name + text) via scripts/vault-write.sh append + [AUTO] Log.md entry. (5) Bus seb_boss with summary: step 1+2 doc paths + step 3 flagged count + step 4 new-rule count. NEVER auto-apply cron/config/hook/skill changes.",
+      "schedule": "0 23 * * 0",
+      "enabled": true,
+      "created_at": "2026-05-28T13:42:46.588Z",
+      "description": "Sunday 11pm ET weekly lint + gap-finder (converted from 7d interval 2026-07-01: never-fired interval crons reset on daemon restart; cron-expr is calendar-anchored)"
+    },
+    {
+      "name": "karpathy-lint",
+      "prompt": "Run scripts/karpathy-lint.sh — Karpathy wiki health check. Find orphans, stale pages, broken links, missing entity pages. Report to seb_boss if findings.",
+      "schedule": "0 0 * * 0",
+      "enabled": true,
+      "created_at": "2026-06-25T00:59:48.494Z",
+      "last_fire_attempted_at": "2026-06-28T04:00:16.945Z",
+      "last_fired_at": "2026-06-28T04:00:16.945Z",
+      "fire_count": 1
+    },
+    {
+      "name": "karpathy-ingest-check",
+      "prompt": "Run scripts/karpathy-ingest-check.sh — check _Raw/ for unprocessed sources not yet in Knowledge/log.md. Surface to seb_boss if any found.",
+      "schedule": "30 7 * * *",
+      "enabled": true,
+      "created_at": "2026-06-25T00:59:49.111Z",
+      "last_fire_attempted_at": "2026-07-02T11:30:12.247Z",
+      "last_fired_at": "2026-07-02T11:30:12.247Z",
+      "fire_count": 8
+    },
+    {
+      "name": "obsidian-deadman",
+      "prompt": "Run scripts/obsidian-deadman.sh --check. Log result. If down>5min: notify seb_boss. On up-transition: broadcast to dependent agents via script. See scripts/obsidian-deadman-NOTES.md.",
+      "schedule": "0 */4 * * *",
+      "enabled": false,
+      "created_at": "2026-06-27T11:41:11.867Z",
+      "last_fire_attempted_at": "2026-07-01T20:00:05.219Z",
+      "last_fired_at": "2026-07-01T20:00:05.219Z",
+      "fire_count": 27,
+      "description": "DISABLED 2026-07-01: fully redundant — the 2h heartbeat cron already runs obsidian-deadman.sh --check every fire (incl. night mode). This 4h cron doubled the same check at full agent-session token cost."
+    },
+    {
+      "name": "obsidian-preempt",
+      "prompt": "Run scripts/obsidian-preempt-restart.sh --check. Log result.",
+      "schedule": "45 */2 * * *",
+      "enabled": true,
+      "created_at": "2026-06-30T12:10:33.342Z",
+      "last_fire_attempted_at": "2026-07-02T14:45:10.051Z",
+      "last_fired_at": "2026-07-02T14:45:10.051Z",
+      "fire_count": 26
+    }
+  ]
+}

@@ -1,0 +1,19 @@
+{
+  "updated_at": "2026-07-02T01:54:08.467Z",
+  "crons": [
+    {
+      "name": "heartbeat",
+      "prompt": "Read HEARTBEAT.md and follow its instructions. Update your heartbeat, check inbox for tasks dispatched by seb_boss, and work on your highest-priority ASSIGNED build task. Build silently — bus-report progress + completion to seb_boss (NEVER Telegram Sebastian directly). Keep an implementation-notes.md per work unit. NIGHT MODE (00:00-08:00 ET): keep BUILDING assigned tasks silently (heavy-push), no Telegram, no external-comms; bus-report to seb_boss only.",
+      "schedule": "4h",
+      "enabled": true,
+      "created_at": "2026-06-03T00:50:32.271Z",
+      "metadata": {
+        "migrated_from_config": true,
+        "original_type": "recurring"
+      },
+      "last_fire_attempted_at": "2026-07-02T01:54:08.380Z",
+      "last_fired_at": "2026-07-02T01:54:08.380Z",
+      "fire_count": 268
+    }
+  ]
+}

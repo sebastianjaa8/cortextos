@@ -1,0 +1,45 @@
+{
+  "updated_at": "2026-07-02T13:55:06.840Z",
+  "crons": [
+    {
+      "name": "workout-delivery",
+      "prompt": "5:15pm ET workout delivery (Mon-Fri). Map weekday->day-type (Mon=Legs/Tue=Push/Wed=Pull/Thu=Lower/Fri=Upper). Read your AGENTS.md + C:/Users/Sebas/dev/personal-coach/program/program-v1.md (ALL header rules incl weight-as-loaded, autonomy, progression, autoregulation, handles, cardio) + weekly-volume-model.md. Pull recent loads: python C:/Users/Sebas/dev/personal-coach/atlas_db.py recent 21. Compose today's session: warm-up, each exercise = sets x reps @ per-exercise weight-cue from his LAST logged load + handle (he never scrolls back), supersets grouped, cardio cue on Wed/Fri, leg/lower days LEAD with meniscus knee-check. Deliver to Sebastian via YOUR Telegram bot. Close 'reply your sets to log'. Log fire.",
+      "schedule": "15 17 * * 1-5",
+      "enabled": true,
+      "created_at": "2026-06-18T21:35:34.118Z",
+      "last_fire_attempted_at": "2026-07-01T21:15:02.609Z",
+      "last_fired_at": "2026-07-01T21:15:02.609Z",
+      "fire_count": 9
+    },
+    {
+      "name": "heartbeat",
+      "prompt": "Read HEARTBEAT.md and follow its instructions.",
+      "schedule": "4h",
+      "enabled": true,
+      "created_at": "2026-06-19T00:47:16.252Z",
+      "last_fire_attempted_at": "2026-07-02T13:55:06.825Z",
+      "last_fired_at": "2026-07-02T13:55:06.825Z",
+      "fire_count": 78
+    },
+    {
+      "name": "weekly-review",
+      "prompt": "Sunday weekly training review. BOOTSTRAP: read program-v1.md, weekly-volume-model.md, run atlas_db.py recent 21. Send Telegram digest (PRIMARY) + write vault record (obsidian CLI, Projects/Personal Coach weekly log). 3 BLOCKS: (1) DATA SNAPSHOT — sessions hit Mon-Fri vs planned, load/rep trends per lift (weight-as-loaded convention), response signals (progressing/stalling/knee symptoms), gaps (lagging muscle, missed days), left-side imbalance progress. (2) 1-3 PROPOSED next-week tweaks toward hypertrophy — NOT just load bumps: better exercise VARIATIONS, more stable machine versions, deliberate accessory VARIABILITY (rotate every few weeks), order changes (big-muscle-first default, arms-first when reason). Each with one-line why. Meniscus-safe, legs+chest priority, imbalance-fix guardrails apply. (3) ASK him two things: where he wants to FOCUS next + what he would like to improve. Coach drives the proposal; end with ONE clear decision prompt he steers. Park reply -> update program-v1.md + next-week plan from it. Log to .weekly-review.log.",
+      "schedule": "0 18 * * 0",
+      "enabled": true,
+      "created_at": "2026-06-19T05:04:07.158Z",
+      "last_fire_attempted_at": "2026-06-28T22:00:01.758Z",
+      "last_fired_at": "2026-06-28T22:00:01.758Z",
+      "fire_count": 2
+    },
+    {
+      "name": "weekly-review-check",
+      "prompt": "Check if Sunday weekly-review cron ran. Read stdout at ~/.cortextos/default/logs/atlas/stdout.log — get its mtime. If mtime is older than Sunday 22:00 UTC (6pm ET Sunday = start of review window): cortextos bus send-message seb_boss high 'atlas weekly-review may have silently failed — stdout last updated before the review window. Manual check needed.' Otherwise silent. Update heartbeat after check.",
+      "schedule": "0 12 * * 1",
+      "enabled": true,
+      "created_at": "2026-06-24T05:13:09.155Z",
+      "last_fire_attempted_at": "2026-06-29T16:00:26.199Z",
+      "last_fired_at": "2026-06-29T16:00:26.199Z",
+      "fire_count": 1
+    }
+  ]
+}
