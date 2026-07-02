@@ -175,10 +175,15 @@ export class FastChecker {
     let messageBlock = '';
     const ackIds: string[] = [];
 
-    // Process queued Telegram messages
+    // Process queued Telegram messages. Keep the shifted batch so a failed
+    // injection can put them back — before this, a shift()ed message whose
+    // injection failed was gone forever (message-loss window on every
+    // sessionRefresh: the checker keeps polling while the agent restarts).
     let hasTelegramMessage = false;
+    const telegramBatch: Array<{ formatted: string; ackIds: string[] }> = [];
     while (this.telegramMessages.length > 0) {
       const msg = this.telegramMessages.shift()!;
+      telegramBatch.push(msg);
       messageBlock += msg.formatted;
       hasTelegramMessage = true;
     }
@@ -192,8 +197,8 @@ export class FastChecker {
 
     // Inject if there's anything
     if (messageBlock) {
-      const injected = this.agent.injectMessage(messageBlock);
-      if (injected) {
+      const result = this.agent.injectMessageDetailed(messageBlock);
+      if (result.ok) {
         // ACK inbox messages
         for (const id of ackIds) {
           ackInbox(this.paths, id);
@@ -207,6 +212,27 @@ export class FastChecker {
         }
         // Cooldown after injection
         await sleep(5000);
+      } else if (result.code === 'NOT_RUNNING') {
+        // Agent is mid-restart (session refresh / crash recovery). Inbox
+        // messages recover via the 5-min inflight sweep, but Telegram
+        // messages have NO other recovery path — requeue them at the front
+        // so the next poll cycle retries in original order. Unbounded on
+        // purpose: messages are precious, the queue only grows with real
+        // inbound traffic. ponytail: if an agent HALTS permanently the queue
+        // holds messages until daemon restart — acceptable, they deliver then.
+        if (telegramBatch.length > 0) {
+          this.telegramMessages.unshift(...telegramBatch);
+        }
+        this.log(`Injection skipped (${result.message}) — requeued ${telegramBatch.length} Telegram message(s); ${ackIds.length} inbox message(s) recover via inflight sweep`);
+      } else {
+        // DEDUPED: this exact block was already injected once — dropping the
+        // requeue is correct (re-queueing would loop forever). ACK the inbox
+        // ids too: without the ack they bounce inbox↔inflight every 5 min and
+        // re-hit this dedup forever.
+        for (const id of ackIds) {
+          ackInbox(this.paths, id);
+        }
+        this.log(`Injection DEDUPED — dropping batch (${telegramBatch.length} Telegram, ${ackIds.length} inbox acked): ${result.message}`);
       }
     }
 

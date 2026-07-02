@@ -13,6 +13,7 @@ function createMockAgent(name = 'test-agent') {
     name,
     isBootstrapped: vi.fn().mockReturnValue(true),
     injectMessage: vi.fn().mockReturnValue(true),
+    injectMessageDetailed: vi.fn().mockReturnValue({ ok: true }),
     write: vi.fn(),
   } as any;
 }
@@ -270,6 +271,61 @@ describe('FastChecker', () => {
       const checker = new FastChecker(agent, paths, '/tmp/framework');
 
       expect(checker.isAgentActive()).toBe(false);
+    });
+  });
+
+  describe('pollCycle Telegram requeue (message-loss fix)', () => {
+    // Regression guard: pollCycle shift()ed queued Telegram messages off
+    // this.telegramMessages, and a failed injection (NOT_RUNNING during a
+    // sessionRefresh window) dropped them permanently. Inbox messages had
+    // the 5-min inflight sweep; Telegram messages had no recovery path.
+
+    it('requeues Telegram messages in order when the agent is NOT_RUNNING', async () => {
+      const agent = createMockAgent();
+      agent.injectMessageDetailed.mockReturnValue({
+        ok: false, code: 'NOT_RUNNING', message: 'agent restarting',
+      });
+      const checker = new FastChecker(agent, paths, '/tmp/framework');
+
+      checker.queueTelegramMessage('MSG-A\n');
+      checker.queueTelegramMessage('MSG-B\n');
+      await (checker as any).pollCycle();
+
+      // Batch back in the queue, original order preserved.
+      const queue = (checker as any).telegramMessages as Array<{ formatted: string }>;
+      expect(queue.map(m => m.formatted)).toEqual(['MSG-A\n', 'MSG-B\n']);
+
+      // Agent comes back: next cycle delivers the same block.
+      agent.injectMessageDetailed.mockReturnValue({ ok: true });
+      await (checker as any).pollCycle();
+      expect(queue).toHaveLength(0);
+      const delivered = agent.injectMessageDetailed.mock.calls.at(-1)![0] as string;
+      expect(delivered).toContain('MSG-A');
+      expect(delivered).toContain('MSG-B');
+    });
+
+    it('drops (does not requeue) a DEDUPED batch and acks inbox messages', async () => {
+      const agent = createMockAgent();
+      agent.injectMessageDetailed.mockReturnValue({
+        ok: false, code: 'DEDUPED', message: 'hash window hit',
+      });
+      const checker = new FastChecker(agent, paths, '/tmp/framework');
+
+      // Inbox message that will ride in the same block
+      const inboxMsg = {
+        id: 'msg-1', from: 'alice', to: 'test-agent', priority: 'normal',
+        timestamp: new Date().toISOString(), text: 'hello', reply_to: null,
+      };
+      writeFileSync(join(paths.inbox, '2-100-from-alice-abcde.json'), JSON.stringify(inboxMsg));
+
+      checker.queueTelegramMessage('MSG-DUP\n');
+      await (checker as any).pollCycle();
+
+      // Telegram batch dropped (re-queueing an already-injected block loops forever)
+      expect((checker as any).telegramMessages).toHaveLength(0);
+      // Inbox message acked (moved to processed) — otherwise it bounces
+      // inbox<->inflight every 5 min and re-hits the dedup forever.
+      expect(existsSync(join(paths.processed, '2-100-from-alice-abcde.json'))).toBe(true);
     });
   });
 
