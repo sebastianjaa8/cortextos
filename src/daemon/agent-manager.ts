@@ -233,7 +233,19 @@ export class AgentManager {
     const inRegistry = this.agents.has(name);
     if (op === 'start') {
       if (inRegistry) {
-        return { ok: false, code: 'DEDUPED', message: `start request for "${name}" deduped — agent already in registry (in-flight start or already running)` };
+        // Include the live registry state in the message. Operators reach
+        // for `cortextos start` when list-agents/dashboard shows "stopped" —
+        // but that "running" flag is heartbeat-freshness (<10 min), which
+        // reads stale under load while the process is alive (2026-07-02
+        // false-alarm: 5 healthy agents "stuck stopped" for 20+ min after a
+        // fleet restart while heartbeat crons caught up). A bare "deduped"
+        // reply looks like a wedged registry; stating pid/uptime shows the
+        // truth in the same breath.
+        const live = this.agents.get(name)!.process.getStatus();
+        const detail = live.status === 'running' && live.pid
+          ? `agent is RUNNING (pid ${live.pid}, up ${live.uptime ?? '?'}s) — no start needed. If list-agents showed it stopped, its heartbeat is stale, not the process; trust \`cortextos status\`.`
+          : `in-flight start or transitional state (${live.status})`;
+        return { ok: false, code: 'DEDUPED', message: `start request for "${name}" deduped — already in registry: ${detail}` };
       }
       return { ok: true };
     }
