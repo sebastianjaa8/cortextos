@@ -6,6 +6,7 @@ import { join } from 'path';
 import { homedir } from 'os';
 import { ensureDir } from '../utils/atomic.js';
 import { acquireLock, releaseLock } from '../utils/lock.js';
+import { stripBom } from '../utils/strip-bom.js';
 
 // Each fast-checker registers a process-level SIGUSR1 handler (see
 // fast-checker.ts:102). With >10 active agents the default Node listener cap
@@ -132,7 +133,10 @@ function getOperatorChatCreds(frameworkRoot: string): { chatId: string; botToken
         const envFile = join(agentsRoot, a.name, '.env');
         if (!existsSync(envFile)) continue;
         try {
-          const content = readFileSync(envFile, 'utf-8');
+          // stripBom: a BOM'd .env with BOT_TOKEN on line 1 (seb_boss today)
+          // fails /^KEY=/m and silently disqualifies the operator's own bot,
+          // routing the crash-loop alert to the wrong agent's bot or nowhere.
+          const content = stripBom(readFileSync(envFile, 'utf-8'));
           const tokenMatch = content.match(/^BOT_TOKEN=(.+)$/m);
           const chatMatch = content.match(/^CHAT_ID=(.+)$/m);
           if (!tokenMatch || !chatMatch) continue;

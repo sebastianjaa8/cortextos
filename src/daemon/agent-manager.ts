@@ -825,7 +825,8 @@ export class AgentManager {
         for (const entry of readdirSync(agentsDir)) {
           const otherEnvPath = join(agentsDir, entry, '.env');
           if (!existsSync(otherEnvPath)) continue;
-          const otherEnv = readFileSync(otherEnvPath, 'utf-8');
+          // stripBom: without it a BOM'd .env silently escapes this collision check
+          const otherEnv = stripBom(readFileSync(otherEnvPath, 'utf-8'));
           const match = otherEnv.match(/^BOT_TOKEN=(.+)$/m);
           const otherToken = match?.[1]?.trim();
           if (otherToken && otherToken === activityBotToken) {
