@@ -57,6 +57,28 @@ describe('OutputBuffer redaction', () => {
     expect(matches).toBe(3);
   });
 
+  it('Telegram bot tokens and sk- API keys are redacted (2026-07-02 sweep)', () => {
+    const buf = new OutputBuffer(1000, '/tmp/fake-stdout.log');
+    const botToken = '8788724873:AAHf3xW9yZ2kQ7mN4pR6sT8uV0wX1yZ3aB5';
+    const skKey = 'sk-ant-api03-abcdefghijklmnopqrstuvwxyz012345';
+    buf.push(`BOT_TOKEN=${botToken}\nexport ANTHROPIC_API_KEY=${skKey}\n`);
+
+    const written = String(appendFileSyncMock.mock.calls[0][1]);
+    expect(written).not.toContain(botToken);
+    expect(written).not.toContain(skKey);
+    expect(written).toContain('[REDACTED_BOT_TOKEN]');
+    expect(written).toContain('[REDACTED_API_KEY]');
+  });
+
+  it('PID-colon output and short sk- strings are NOT redacted (false-positive guard)', () => {
+    const buf = new OutputBuffer(1000, '/tmp/fake-stdout.log');
+    const benign = 'pid:12345 ratio 1234567:89 flag sk-test time 08:30:22\n';
+    buf.push(benign);
+
+    const written = String(appendFileSyncMock.mock.calls[0][1]);
+    expect(written).toBe(benign);
+  });
+
   it('non-JWT PTY data passes through unchanged (regression guard)', () => {
     const buf = new OutputBuffer(1000, '/tmp/fake-stdout.log');
     // TUI ANSI escapes, regular stdout, plausible-but-too-short alphanum.

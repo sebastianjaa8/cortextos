@@ -40,13 +40,32 @@
 const JWT_PATTERN = /eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g;
 
 /**
- * Redact JWT-shaped tokens from a PTY output chunk.
+ * Telegram bot token: numeric bot id (8-12 digits), a colon, then the
+ * 30+ char secret. Every agent .env in the fleet carries one; a plain
+ * `cat .env` or a debug echo in the agent's shell lands it in stdout.log
+ * forever without this. The digit-count floor avoids false positives on
+ * `PID:12345`-style output (real bot ids are 9-10 digits today).
+ */
+const TELEGRAM_BOT_TOKEN_PATTERN = /\b\d{8,12}:[A-Za-z0-9_-]{30,}/g;
+
+/**
+ * Anthropic / OpenAI style secret keys (`sk-ant-...`, `sk-proj-...`,
+ * `sk-...`). 20+ char tail keeps short false positives out.
+ */
+const SK_KEY_PATTERN = /\bsk-[A-Za-z0-9_-]{20,}/g;
+
+/**
+ * Redact secret-shaped tokens from a PTY output chunk.
  *
- * Replaces each JWT with the literal string `[REDACTED_JWT]` in-place.
+ * Replaces each match with a literal `[REDACTED_*]` marker in-place.
  * Non-token content (TUI ANSI escapes, regular stdout, shell prompts,
  * etc.) passes through unchanged. Safe to call on every PTY chunk — the
- * regex is stateless and scales linearly with input length.
+ * regexes are stateless and scale linearly with input length. Same
+ * chunk-boundary limitation as documented above applies to all patterns.
  */
 export function redactSecrets(data: string): string {
-  return data.replace(JWT_PATTERN, '[REDACTED_JWT]');
+  return data
+    .replace(JWT_PATTERN, '[REDACTED_JWT]')
+    .replace(TELEGRAM_BOT_TOKEN_PATTERN, '[REDACTED_BOT_TOKEN]')
+    .replace(SK_KEY_PATTERN, '[REDACTED_API_KEY]');
 }
