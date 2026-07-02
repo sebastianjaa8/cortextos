@@ -43,6 +43,21 @@ export class MessageDedup {
     return false;
   }
 
+  /**
+   * Remove a previously-recorded hash so an identical re-send is not
+   * dedup-rejected. Called when a submit verifiably FAILED (Enter never
+   * sent, or the verify loop saw zero output after all retries) — the
+   * content never reached the agent, so the dedup entry is poison: it
+   * would silently drop the retry of a lost message.
+   */
+  forget(content: string): void {
+    const hash = createHash('md5').update(content).digest('hex');
+    const idx = this.hashes.indexOf(hash);
+    if (idx !== -1) {
+      this.hashes.splice(idx, 1);
+    }
+  }
+
   clear(): void {
     this.hashes = [];
   }
@@ -60,6 +75,14 @@ export class MessageDedup {
 export interface InjectVerify {
   getOutputBytes: () => number;
   log?: (msg: string) => void;
+  /**
+   * Called when the submit verifiably failed: the Enter write threw (PTY
+   * torn down) or every Enter retry saw zero PTY output. Callers use this
+   * to un-poison dedup state so a re-send of the same content is not
+   * silently dropped (at-least-once over at-most-once — a false-negative
+   * here can at worst double-deliver, which is benign vs silent loss).
+   */
+  onFailed?: () => void;
 }
 
 // A submit repaint is thousands of bytes; idle-prompt noise is ~0.
@@ -140,7 +163,13 @@ export function injectMessage(
   };
 
   setTimeout(() => {
-    if (!sendEnter() || !verify) return;
+    if (!sendEnter()) {
+      // Enter never reached the PTY — the paste is stranded (or the PTY is
+      // gone entirely). Report failure so dedup state can be un-poisoned.
+      verify?.onFailed?.();
+      return;
+    }
+    if (!verify) return;
 
     // Verified-submit loop: if the PTY produced (almost) no output since
     // Enter, the composer still holds the paste — re-send Enter. A bare
@@ -153,11 +182,15 @@ export function injectMessage(
       if (grown >= SUBMIT_ACTIVITY_MIN_BYTES) return; // turn started
       if (attempt >= ENTER_RETRY_DELAYS_MS.length) {
         verify.log?.(`[inject] Enter retries exhausted (${grown}B output) — message may be stuck in composer`);
+        verify.onFailed?.();
         return;
       }
       verify.log?.(`[inject] no PTY output after Enter (${grown}B) — re-sending Enter (retry ${attempt + 1})`);
       baseline = verify.getOutputBytes();
-      if (!sendEnter()) return;
+      if (!sendEnter()) {
+        verify.onFailed?.();
+        return;
+      }
       attempt++;
       setTimeout(check, ENTER_RETRY_DELAYS_MS[Math.min(attempt, ENTER_RETRY_DELAYS_MS.length - 1)]);
     };

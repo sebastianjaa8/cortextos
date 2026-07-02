@@ -23,6 +23,21 @@ describe('MessageDedup', () => {
     expect(dedup.isDuplicate('msg1')).toBe(false); // no longer in cache
     expect(dedup.isDuplicate('msg4')).toBe(true); // still in cache
   });
+
+  it('forget() un-poisons a hash so an identical re-send passes', () => {
+    const dedup = new MessageDedup();
+    expect(dedup.isDuplicate('lost message')).toBe(false); // recorded
+    dedup.forget('lost message'); // submit failed — un-poison
+    expect(dedup.isDuplicate('lost message')).toBe(false); // re-send allowed
+    expect(dedup.isDuplicate('lost message')).toBe(true);  // normal dedup resumes
+  });
+
+  it('forget() on unknown content is a no-op', () => {
+    const dedup = new MessageDedup();
+    dedup.isDuplicate('other');
+    expect(() => dedup.forget('never seen')).not.toThrow();
+    expect(dedup.isDuplicate('other')).toBe(true);
+  });
 });
 
 describe('KEYS', () => {
@@ -154,6 +169,48 @@ describe('injectMessage — verified submit (Enter retry)', () => {
     vi.advanceTimersByTime(120000);
     expect(countEnters(writes)).toBe(4); // initial + 3 retries
     expect(logs.some(l => l.includes('retries exhausted'))).toBe(true);
+  });
+
+  it('fires onFailed when retries exhaust with zero output (dedup un-poisoning)', () => {
+    const write = () => { /* pty accepts writes but agent never repaints */ };
+    const onFailed = vi.fn();
+
+    injectMessage(write, 'msg', 300, {
+      getOutputBytes: () => 0,
+      onFailed,
+    });
+
+    vi.advanceTimersByTime(300);
+    expect(onFailed).not.toHaveBeenCalled(); // still retrying
+    vi.advanceTimersByTime(120000);
+    expect(onFailed).toHaveBeenCalledTimes(1);
+  });
+
+  it('fires onFailed when the deferred Enter write throws (PTY teardown)', () => {
+    let ptyAlive = true;
+    const write = (_: string) => {
+      if (!ptyAlive) throw new TypeError('null.write');
+    };
+    const onFailed = vi.fn();
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    injectMessage(write, 'msg', 300, { getOutputBytes: () => 0, onFailed });
+    ptyAlive = false;
+    vi.advanceTimersByTime(300);
+    expect(onFailed).toHaveBeenCalledTimes(1);
+    warnSpy.mockRestore();
+  });
+
+  it('does not fire onFailed on a successful verified submit', () => {
+    const write = () => { /* ok */ };
+    let outputBytes = 0;
+    const onFailed = vi.fn();
+
+    injectMessage(write, 'msg', 300, { getOutputBytes: () => outputBytes, onFailed });
+    vi.advanceTimersByTime(300);
+    outputBytes += 5000; // turn started
+    vi.advanceTimersByTime(120000);
+    expect(onFailed).not.toHaveBeenCalled();
   });
 
   it('scales the default enterDelay with content size', () => {
