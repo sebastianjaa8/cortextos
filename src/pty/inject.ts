@@ -49,6 +49,31 @@ export class MessageDedup {
 }
 
 /**
+ * Optional submit verification for injectMessage.
+ *
+ * getOutputBytes returns a monotonic count of PTY output bytes
+ * (OutputBuffer.getTotalBytes). A successful Enter submit always triggers a
+ * large repaint burst (spinner, status line, streamed response); a lost
+ * Enter leaves the pasted text sitting in the composer with near-zero
+ * output. Comparing the counter before/after Enter distinguishes the two.
+ */
+export interface InjectVerify {
+  getOutputBytes: () => number;
+  log?: (msg: string) => void;
+}
+
+// A submit repaint is thousands of bytes; idle-prompt noise is ~0.
+const SUBMIT_ACTIVITY_MIN_BYTES = 200;
+// Re-check delays after each Enter before concluding it was swallowed.
+// Wide windows on purpose: during fleet boot (13 sessions + their MCP
+// servers spawning at once) a submitted turn's repaint burst can lag the
+// Enter by 10s+ — the 2026-07-02 recovery showed 2.5s/6s windows logging
+// false "retries exhausted" on messages that had actually submitted.
+// Extra Enters on an already-submitted (empty) composer are no-ops, so
+// the only cost of a wide window is a delayed retry on a real miss.
+const ENTER_RETRY_DELAYS_MS = [4000, 10000, 20000];
+
+/**
  * Inject a message into a PTY process using bracketed paste mode.
  * Replaces tmux load-buffer + paste-buffer pattern.
  *
@@ -56,15 +81,30 @@ export class MessageDedup {
  * pasted text rather than typed input. This prevents special characters
  * from being interpreted as commands.
  *
+ * The Enter that submits the paste is UNRELIABLE at a fixed short delay:
+ * Claude Code renders large pastes as an async "[Pasted text #N]"
+ * placeholder, and under memory pressure placeholder registration can take
+ * longer than the delay — the Enter lands on an empty composer and is a
+ * no-op, leaving the message stranded unsubmitted (2026-07-01 incident:
+ * seb_boss composer accumulated stuck pastes for hours while short messages
+ * kept working). Two mitigations:
+ *   1. enterDelay scales with content size (default, when not overridden).
+ *   2. When `verify` is provided, PTY output is sampled after Enter; if the
+ *      screen stayed silent, Enter is re-sent (bounded retries).
+ *
  * @param write Function to write to the PTY (pty.write)
  * @param content The message content to inject
- * @param enterDelay Milliseconds to wait before sending Enter (default 300ms)
+ * @param enterDelay Milliseconds to wait before sending Enter
+ *                   (default: scaled to content size, 900–3000ms)
+ * @param verify Optional output-activity probe enabling Enter retries
  */
 export function injectMessage(
   write: (data: string) => void,
   content: string,
-  enterDelay: number = 300,
+  enterDelay?: number,
+  verify?: InjectVerify,
 ): void {
+  const delay = enterDelay ?? Math.min(3000, 900 + Math.floor(content.length / 2));
   // For very large messages, chunk the write to avoid overwhelming the PTY buffer
   const MAX_CHUNK = 4096;
 
@@ -88,14 +128,41 @@ export function injectMessage(
   // Root cause: PR #196 fixed three this.pty! callers in agent-process.ts
   // but missed worker-process.ts:93. This try/catch is the structural fix
   // that covers every present and future caller.
-  setTimeout(() => {
+  const sendEnter = (): boolean => {
     try {
       write(KEYS.ENTER);
+      return true;
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       console.warn(`[inject] deferred Enter failed (pty likely torn down): ${msg}`);
+      return false;
     }
-  }, enterDelay);
+  };
+
+  setTimeout(() => {
+    if (!sendEnter() || !verify) return;
+
+    // Verified-submit loop: if the PTY produced (almost) no output since
+    // Enter, the composer still holds the paste — re-send Enter. A bare
+    // Enter on an already-submitted (empty) composer is a no-op, so a
+    // false-negative retry is harmless.
+    let baseline = verify.getOutputBytes();
+    let attempt = 0;
+    const check = () => {
+      const grown = verify.getOutputBytes() - baseline;
+      if (grown >= SUBMIT_ACTIVITY_MIN_BYTES) return; // turn started
+      if (attempt >= ENTER_RETRY_DELAYS_MS.length) {
+        verify.log?.(`[inject] Enter retries exhausted (${grown}B output) — message may be stuck in composer`);
+        return;
+      }
+      verify.log?.(`[inject] no PTY output after Enter (${grown}B) — re-sending Enter (retry ${attempt + 1})`);
+      baseline = verify.getOutputBytes();
+      if (!sendEnter()) return;
+      attempt++;
+      setTimeout(check, ENTER_RETRY_DELAYS_MS[Math.min(attempt, ENTER_RETRY_DELAYS_MS.length - 1)]);
+    };
+    setTimeout(check, ENTER_RETRY_DELAYS_MS[0]);
+  }, delay);
 }
 
 /**

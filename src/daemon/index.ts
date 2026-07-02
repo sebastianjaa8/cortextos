@@ -381,6 +381,47 @@ if (require.main === module) {
   const daemon = new Daemon();
   daemon.start().catch(err => {
     console.error('[daemon] Fatal error:', err);
+
+    // Startup failures must feed the same crash-history + operator-alert
+    // machinery as runtime crashes. Before this, a duplicate-daemon lock
+    // conflict under PM2 autorestart looped "Fatal error → exit → respawn"
+    // silently — 17k+ restarts over a day with zero operator pages
+    // (2026-07-01 incident). The alert helper self-throttles via
+    // history.lastAlertAt (30-min cooldown), so the loop can't spam.
+    //
+    // Deliberately NOT handleFatal(): that writes .daemon-crashed markers
+    // for every agent, which would be false alarms here — on a lock
+    // conflict the fleet is alive and healthy under the daemon that holds
+    // the lock.
+    try {
+      const instanceId = process.env.CTX_INSTANCE_ID || 'default';
+      const ctxRoot = join(homedir(), '.cortextos', instanceId);
+      const frameworkRoot = process.env.CTX_FRAMEWORK_ROOT || '';
+      const errStr = err instanceof Error ? err.message : String(err);
+      const isLockConflict = /already running/i.test(errStr);
+      const history = recordCrash(ctxRoot, errStr);
+      if (shouldSendCrashLoopAlert(history)) {
+        const recent = countRecentCrashes(history);
+        const detail = isLockConflict
+          ? `Duplicate-daemon lock conflict: PM2 keeps respawning a daemon that dies against the instance lock held by pid ${readPidBestEffort(ctxRoot)}. ` +
+            `The fleet may still be running under that orphaned daemon, but PM2 no longer manages it. ` +
+            `Fix: pm2 stop cortextos-daemon, kill the orphan pid (and its process tree), then pm2 start.`
+          : errStr;
+        if (sendCrashLoopAlertBestEffort(frameworkRoot, recent, detail)) {
+          history.lastAlertAt = new Date().toISOString();
+          writeCrashHistory(ctxRoot, history);
+        }
+      }
+    } catch { /* alerting is best-effort — never mask the original failure */ }
+
     process.exit(1);
   });
+}
+
+function readPidBestEffort(ctxRoot: string): string {
+  try {
+    return readFileSync(join(ctxRoot, 'daemon.pid'), 'utf-8').trim() || 'unknown';
+  } catch {
+    return 'unknown';
+  }
 }

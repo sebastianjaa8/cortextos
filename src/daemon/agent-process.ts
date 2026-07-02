@@ -339,7 +339,11 @@ export class AgentProcess {
       return { ok: false, code: 'DEDUPED', message: `inject for "${this.name}" deduped — content matches MessageDedup hash window` };
     }
 
-    injectMessage((data) => this.pty?.write(data), content);
+    const buffer = this.pty.getOutputBuffer();
+    injectMessage((data) => this.pty?.write(data), content, undefined, {
+      getOutputBytes: () => buffer.getTotalBytes(),
+      log: (msg) => this.log(msg),
+    });
     return { ok: true };
   }
 

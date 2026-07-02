@@ -91,3 +91,79 @@ describe('injectMessage — deferred Enter crash safety', () => {
     expect(warnSpy).not.toHaveBeenCalled();
   });
 });
+
+describe('injectMessage — verified submit (Enter retry)', () => {
+  // Regression guard for the 2026-07-01 incident: Claude Code renders large
+  // pastes as an async "[Pasted text #N]" placeholder; under load the fixed
+  // enterDelay elapsed before placeholder registration, the Enter landed on
+  // an empty composer, and Telegram messages sat unsubmitted for hours.
+  beforeEach(() => { vi.useFakeTimers(); });
+  afterEach(() => { vi.useRealTimers(); });
+
+  const countEnters = (writes: string[]) => writes.filter(w => w === KEYS.ENTER).length;
+
+  it('re-sends Enter when PTY output stays silent after the first Enter', () => {
+    const writes: string[] = [];
+    const write = (data: string) => { writes.push(data); };
+    let outputBytes = 0;
+    const logs: string[] = [];
+
+    injectMessage(write, 'long research message', 300, {
+      getOutputBytes: () => outputBytes,
+      log: (m) => logs.push(m),
+    });
+
+    vi.advanceTimersByTime(300); // first Enter
+    expect(countEnters(writes)).toBe(1);
+
+    // No output growth → first retry at +4000ms
+    vi.advanceTimersByTime(4000);
+    expect(countEnters(writes)).toBe(2);
+    expect(logs.some(l => l.includes('re-sending Enter'))).toBe(true);
+
+    // Retry worked — big repaint burst. No further Enters.
+    outputBytes += 5000;
+    vi.advanceTimersByTime(120000);
+    expect(countEnters(writes)).toBe(2);
+  });
+
+  it('does not retry when the submit produced output', () => {
+    const writes: string[] = [];
+    const write = (data: string) => { writes.push(data); };
+    let outputBytes = 0;
+
+    injectMessage(write, 'hi', 300, { getOutputBytes: () => outputBytes });
+
+    vi.advanceTimersByTime(300); // Enter sent
+    outputBytes += 5000;         // turn started streaming
+    vi.advanceTimersByTime(120000);
+    expect(countEnters(writes)).toBe(1);
+  });
+
+  it('gives up after bounded retries and logs exhaustion', () => {
+    const writes: string[] = [];
+    const write = (data: string) => { writes.push(data); };
+    const logs: string[] = [];
+
+    injectMessage(write, 'msg', 300, {
+      getOutputBytes: () => 0,
+      log: (m) => logs.push(m),
+    });
+
+    vi.advanceTimersByTime(300);
+    vi.advanceTimersByTime(120000);
+    expect(countEnters(writes)).toBe(4); // initial + 3 retries
+    expect(logs.some(l => l.includes('retries exhausted'))).toBe(true);
+  });
+
+  it('scales the default enterDelay with content size', () => {
+    const writes: string[] = [];
+    const write = (data: string) => { writes.push(data); };
+
+    injectMessage(write, 'x'.repeat(2000)); // no explicit delay → 900 + 1000 = 1900ms
+    vi.advanceTimersByTime(899);
+    expect(countEnters(writes)).toBe(0);
+    vi.advanceTimersByTime(1100); // 1999ms total
+    expect(countEnters(writes)).toBe(1);
+  });
+});
