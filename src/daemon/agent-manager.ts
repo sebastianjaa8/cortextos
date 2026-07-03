@@ -6,6 +6,7 @@ import { WorkerProcess } from './worker-process.js';
 import { FastChecker } from './fast-checker.js';
 import { CronScheduler } from './cron-scheduler.js';
 import { migrateCronsForAgent } from './cron-migration.js';
+import { generateAgentKey } from '../bus/keys.js';
 import type { CronDefinition } from '../types/index.js';
 import { TelegramAPI } from '../telegram/api.js';
 import { TelegramPoller } from '../telegram/poller.js';
@@ -123,6 +124,13 @@ export class AgentManager {
     const instanceEnabled = this.readInstanceEnableList();
 
     for (const { name, dir, org, config } of agentDirs) {
+      // Backfill the per-agent bus signing key on boot (idempotent — key-file
+      // existence gates it). Catches agents missed by `bus provision-keys`.
+      try {
+        generateAgentKey(dir);
+      } catch (err) {
+        console.error(`[agent-manager] Failed to provision bus signing key for ${name}: ${(err as Error).message}`);
+      }
       // Per-agent config.json `enabled: false` (existing behavior, unchanged)
       if (config.enabled === false) {
         console.log(`[agent-manager] Skipping disabled agent: ${name} (per-agent config.json)`);
@@ -233,7 +241,19 @@ export class AgentManager {
     const inRegistry = this.agents.has(name);
     if (op === 'start') {
       if (inRegistry) {
-        return { ok: false, code: 'DEDUPED', message: `start request for "${name}" deduped — agent already in registry (in-flight start or already running)` };
+        // Include the live registry state in the message. Operators reach
+        // for `cortextos start` when list-agents/dashboard shows "stopped" —
+        // but that "running" flag is heartbeat-freshness (<10 min), which
+        // reads stale under load while the process is alive (2026-07-02
+        // false-alarm: 5 healthy agents "stuck stopped" for 20+ min after a
+        // fleet restart while heartbeat crons caught up). A bare "deduped"
+        // reply looks like a wedged registry; stating pid/uptime shows the
+        // truth in the same breath.
+        const live = this.agents.get(name)!.process.getStatus();
+        const detail = live.status === 'running' && live.pid
+          ? `agent is RUNNING (pid ${live.pid}, up ${live.uptime ?? '?'}s) — no start needed. If list-agents showed it stopped, its heartbeat is stale, not the process; trust \`cortextos status\`.`
+          : `in-flight start or transitional state (${live.status})`;
+        return { ok: false, code: 'DEDUPED', message: `start request for "${name}" deduped — already in registry: ${detail}` };
       }
       return { ok: true };
     }
@@ -660,7 +680,9 @@ export class AgentManager {
         // give up immediately because total runtime already exceeds 5min.
         const MAX_CONSECUTIVE_CONFLICT_MS = 5 * 60 * 1000;
         const LONG_RUN_RESET_MS = 60_000;
+        const MAX_AUTH_BACKOFF_MS = 10 * 60 * 1000;
         let consecutiveConflictStart: number | null = null;
+        let authFailCount = 0;
         while (true) {
           // Pre-check: agent may have been deleted from registry during
           // a previous sleep window. Skip the start() call entirely.
@@ -675,9 +697,31 @@ export class AgentManager {
           const runDuration = Date.now() - runStart;
           if (poller.lastExitReason === 'stopped-externally') return;
           if (!this.agents.has(name)) return;
-          // A poll session that ran for >LONG_RUN_RESET_MS proves the
-          // Conflict lock is no longer chronic — reset the retry budget.
-          if (runDuration > LONG_RUN_RESET_MS) consecutiveConflictStart = null;
+          // A poll session that ran for >LONG_RUN_RESET_MS proves the prior
+          // failure cleared — reset both retry budgets.
+          if (runDuration > LONG_RUN_RESET_MS) { consecutiveConflictStart = null; authFailCount = 0; }
+          // Auth failure (401): exponential backoff capped at 10min, alert
+          // operator ONCE. This stops the hot-loop that caused the 2026-06-22
+          // OOM (~1 error/sec → 95k errors → 785MB log → daemon killed). The
+          // token is captured at poller construction, so a genuinely bad token
+          // will keep failing — the backoff + alert hand it to the operator to
+          // fix the .env and restart, rather than flooding the log. Reset the
+          // Conflict budget too so stale 401 backoff time can't make a later
+          // 409 give up instantly.
+          if (poller.lastExitReason === 'auth-failed') {
+            consecutiveConflictStart = null;
+            authFailCount++;
+            const backoffMs = Math.min(30_000 * Math.pow(2, authFailCount - 1), MAX_AUTH_BACKOFF_MS);
+            if (authFailCount === 1 && telegramApi && chatId) {
+              telegramApi.sendMessage(
+                String(chatId),
+                `${name}: Telegram auth failed (401) — BOT_TOKEN may be invalid or unloaded. Backing off; check the agent .env if this persists.`,
+              ).catch(() => { /* best-effort */ });
+            }
+            log(`Telegram poller for ${name} auth-failed (401, attempt ${authFailCount}). Backing off ${Math.round(backoffMs / 1000)}s before retry.`);
+            await new Promise(r => setTimeout(r, backoffMs));
+            continue;
+          }
           if (consecutiveConflictStart === null) consecutiveConflictStart = Date.now();
           if (Date.now() - consecutiveConflictStart > MAX_CONSECUTIVE_CONFLICT_MS) {
             log(`Telegram poller for ${name} could not clear Conflict within 5min of consecutive failures — giving up. Inspect for duplicate bot instance.`);
@@ -789,7 +833,8 @@ export class AgentManager {
         for (const entry of readdirSync(agentsDir)) {
           const otherEnvPath = join(agentsDir, entry, '.env');
           if (!existsSync(otherEnvPath)) continue;
-          const otherEnv = readFileSync(otherEnvPath, 'utf-8');
+          // stripBom: without it a BOM'd .env silently escapes this collision check
+          const otherEnv = stripBom(readFileSync(otherEnvPath, 'utf-8'));
           const match = otherEnv.match(/^BOT_TOKEN=(.+)$/m);
           const otherToken = match?.[1]?.trim();
           if (otherToken && otherToken === activityBotToken) {

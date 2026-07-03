@@ -5,6 +5,8 @@ import { spawnSync } from 'child_process';
 import { join } from 'path';
 import { homedir } from 'os';
 import { ensureDir } from '../utils/atomic.js';
+import { acquireLock, releaseLock } from '../utils/lock.js';
+import { stripBom } from '../utils/strip-bom.js';
 
 // Each fast-checker registers a process-level SIGUSR1 handler (see
 // fast-checker.ts:102). With >10 active agents the default Node listener cap
@@ -131,7 +133,10 @@ function getOperatorChatCreds(frameworkRoot: string): { chatId: string; botToken
         const envFile = join(agentsRoot, a.name, '.env');
         if (!existsSync(envFile)) continue;
         try {
-          const content = readFileSync(envFile, 'utf-8');
+          // stripBom: a BOM'd .env with BOT_TOKEN on line 1 (seb_boss today)
+          // fails /^KEY=/m and silently disqualifies the operator's own bot,
+          // routing the crash-loop alert to the wrong agent's bot or nowhere.
+          const content = stripBom(readFileSync(envFile, 'utf-8'));
           const tokenMatch = content.match(/^BOT_TOKEN=(.+)$/m);
           const chatMatch = content.match(/^CHAT_ID=(.+)$/m);
           if (!tokenMatch || !chatMatch) continue;
@@ -217,11 +222,22 @@ function handleFatal(
  * cortextOS Daemon - single process managing all agents.
  * Run via `pm2 start ecosystem.config.js` or `cortextos ecosystem && pm2 start`.
  */
+export function acquireDaemonInstanceLock(ctxRoot: string): boolean {
+  const lockRoot = join(ctxRoot, '.daemon-instance');
+  ensureDir(lockRoot);
+  return acquireLock(lockRoot);
+}
+
+export function releaseDaemonInstanceLock(ctxRoot: string): void {
+  releaseLock(join(ctxRoot, '.daemon-instance'));
+}
+
 class Daemon {
   private agentManager: AgentManager | null = null;
   private ipcServer: IPCServer | null = null;
   private instanceId: string;
   private ctxRoot: string;
+  private lockHeld = false;
 
   constructor() {
     this.instanceId = process.env.CTX_INSTANCE_ID || 'default';
@@ -246,9 +262,14 @@ class Daemon {
       process.exit(1);
     }
 
+    ensureDir(this.ctxRoot);
+    if (!acquireDaemonInstanceLock(this.ctxRoot)) {
+      throw new Error(`Another cortextOS daemon is already running for instance "${this.instanceId}"`);
+    }
+    this.lockHeld = true;
+
     // Write PID file
     const pidFile = join(this.ctxRoot, 'daemon.pid');
-    ensureDir(this.ctxRoot);
     writeFileSync(pidFile, String(process.pid), 'utf-8');
     if (process.platform !== 'win32') {
       try {
@@ -286,6 +307,10 @@ class Daemon {
         const { unlinkSync } = require('fs');
         unlinkSync(pidFile);
       } catch { /* ignore */ }
+      if (this.lockHeld) {
+        releaseDaemonInstanceLock(this.ctxRoot);
+        this.lockHeld = false;
+      }
       process.exit(0);
     };
 
@@ -343,6 +368,10 @@ class Daemon {
         const { unlinkSync } = require('fs');
         unlinkSync(pidFile);
       } catch { /* ignore */ }
+      if (this.lockHeld) {
+        releaseDaemonInstanceLock(this.ctxRoot);
+        this.lockHeld = false;
+      }
     });
   }
 }
@@ -356,6 +385,47 @@ if (require.main === module) {
   const daemon = new Daemon();
   daemon.start().catch(err => {
     console.error('[daemon] Fatal error:', err);
+
+    // Startup failures must feed the same crash-history + operator-alert
+    // machinery as runtime crashes. Before this, a duplicate-daemon lock
+    // conflict under PM2 autorestart looped "Fatal error → exit → respawn"
+    // silently — 17k+ restarts over a day with zero operator pages
+    // (2026-07-01 incident). The alert helper self-throttles via
+    // history.lastAlertAt (30-min cooldown), so the loop can't spam.
+    //
+    // Deliberately NOT handleFatal(): that writes .daemon-crashed markers
+    // for every agent, which would be false alarms here — on a lock
+    // conflict the fleet is alive and healthy under the daemon that holds
+    // the lock.
+    try {
+      const instanceId = process.env.CTX_INSTANCE_ID || 'default';
+      const ctxRoot = join(homedir(), '.cortextos', instanceId);
+      const frameworkRoot = process.env.CTX_FRAMEWORK_ROOT || '';
+      const errStr = err instanceof Error ? err.message : String(err);
+      const isLockConflict = /already running/i.test(errStr);
+      const history = recordCrash(ctxRoot, errStr);
+      if (shouldSendCrashLoopAlert(history)) {
+        const recent = countRecentCrashes(history);
+        const detail = isLockConflict
+          ? `Duplicate-daemon lock conflict: PM2 keeps respawning a daemon that dies against the instance lock held by pid ${readPidBestEffort(ctxRoot)}. ` +
+            `The fleet may still be running under that orphaned daemon, but PM2 no longer manages it. ` +
+            `Fix: pm2 stop cortextos-daemon, kill the orphan pid (and its process tree), then pm2 start.`
+          : errStr;
+        if (sendCrashLoopAlertBestEffort(frameworkRoot, recent, detail)) {
+          history.lastAlertAt = new Date().toISOString();
+          writeCrashHistory(ctxRoot, history);
+        }
+      }
+    } catch { /* alerting is best-effort — never mask the original failure */ }
+
     process.exit(1);
   });
+}
+
+function readPidBestEffort(ctxRoot: string): string {
+  try {
+    return readFileSync(join(ctxRoot, 'daemon.pid'), 'utf-8').trim() || 'unknown';
+  } catch {
+    return 'unknown';
+  }
 }

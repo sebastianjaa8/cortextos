@@ -1,0 +1,44 @@
+{
+  "updated_at": "2026-07-02T13:55:08.972Z",
+  "crons": [
+    {
+      "name": "heartbeat",
+      "prompt": "Read HEARTBEAT.md and follow its instructions. Update your heartbeat, check inbox, work on highest priority bus dispatch (including email_triage pipeline action-item conversions). NIGHT MODE: if local time 00:00-08:00 America/New_York, silent heartbeat (touch file, no Telegram, no active work).",
+      "schedule": "4h",
+      "enabled": true,
+      "created_at": "2026-05-14T22:28:32.073Z",
+      "metadata": {
+        "migrated_from_config": true,
+        "original_type": "recurring"
+      },
+      "last_fire_attempted_at": "2026-07-02T13:55:08.955Z",
+      "last_fired_at": "2026-07-02T13:55:08.955Z",
+      "fire_count": 274
+    },
+    {
+      "name": "daily-hygiene",
+      "prompt": "Daily 5pm ET Todoist hygiene + auto-triage. Haiku 4.5 default. (1) Read vault Knowledge/protocols/todoist-protocol.md via obsidian CLI — rule source for per-project priority defaults, due-date rules, archive thresholds, sender->project mapping (PATH FIXED 2026-07-01: protocol lives under Knowledge/protocols/, not Knowledge/ — the protocol EXISTS, do not treat as missing). (2) Pull all open tasks via mcp__todoist__todoist_tasks_bulk_complete + filter API. (3) Apply protocol defaults: priority on no-priority tasks, due-date on no-due-date tasks. Never overwrite Sebastian-set values. (4) Apply project tags. Catch misfiled tasks (NanoNeuro in Personal, etc.) — move with notify-after bus seb_boss. (5) Cross-device sync verification via Todoist sync API. (6) Identify overdue >3 days + stale tasks (no activity >14d AND due-date past). (7) Update vault email-to-todoist-preferences.md + todoist-keeper-preferences.md autonomous-tier per protocol confirmation thresholds. (8) Append run log to vault Knowledge/tools/todoist-keeper-log.md (same file dup-detect uses). (9) Bus seb_boss with surface format: TODOIST TIMESTAMP — counts: total=N created=N updated=N archive-proposed=N overdue=N learnings=N then OVERDUE/ARCHIVE-PROPOSED lists. NEVER bulk-delete >5, NEVER auto-complete, NEVER modify project structure.",
+      "schedule": "0 17 * * *",
+      "enabled": true,
+      "created_at": "2026-05-14T22:28:32.073Z",
+      "metadata": {
+        "migrated_from_config": true,
+        "original_type": "recurring"
+      },
+      "last_fire_attempted_at": "2026-07-01T21:00:05.971Z",
+      "last_fired_at": "2026-07-01T21:00:05.971Z",
+      "fire_count": 48
+    },
+    {
+      "name": "dup-detect",
+      "prompt": "G3 daily Todoist duplicate detection — PROPOSE-ONLY, NEVER auto-merge (Sebastian approves all merges). Steps: (1) Pull ALL open Todoist tasks via mcp__todoist__todoist_task_get per-project (Work 6g3HrQ8M4jMxrc7w, NanoNeuro 6gFRjPmMqCqfCrvj, Personal 6g3HrFw4p5wm2cHR, To buy 6g3Hrc5fRQCwfw9x, Inbox 6g3HMg67wJGrg6fh); capture id, content, project_id. (2) Build a JSON array and write it via a python heredoc to an ABSOLUTE Windows path: C:\\Users\\Sebas\\AppData\\Local\\Temp\\td_tasks.json (do NOT use /tmp — MSYS resolves it inconsistently across python invocations -> FileNotFoundError). (3) Run: python \"C:\\Users\\Sebas\\cortextos\\orgs\\SEB_company\\agents\\todoist_keeper\\scripts\\dup_detect.py\" --in \"C:\\Users\\Sebas\\AppData\\Local\\Temp\\td_tasks.json\" (threshold 0.85 default). (4) If count>0: bus seb_boss PROPOSE-ONLY — each pair (a_id, b_id, similarity, both contents, same_project) for Sebastian merge approval; NEVER merge/delete yourself. If count==0: SILENT (no bus; run-log only). (5) Append 1-line run record to vault Knowledge/tools/todoist-keeper-log.md via obsidian CLI.",
+      "schedule": "30 6 * * *",
+      "enabled": true,
+      "created_at": "2026-06-02T12:35:31.312Z",
+      "description": "G3: daily fuzzy dup-detect, propose-only",
+      "last_fire_attempted_at": "2026-07-02T10:30:11.264Z",
+      "last_fired_at": "2026-07-02T10:30:11.264Z",
+      "fire_count": 30
+    }
+  ]
+}

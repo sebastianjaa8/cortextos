@@ -22,6 +22,7 @@ export class OutputBuffer {
   private maxChunks: number;
   private logPath: string | null;
   private bootstrapPattern: string;
+  private totalBytes = 0;
 
   constructor(maxChunks: number = 1000, logPath?: string, bootstrapPattern?: string) {
     this.maxChunks = maxChunks;
@@ -42,6 +43,7 @@ export class OutputBuffer {
    */
   push(data: string): void {
     const safe = redactSecrets(data);
+    this.totalBytes += safe.length;
 
     this.chunks.push(safe);
     if (this.chunks.length > this.maxChunks) {
@@ -62,6 +64,16 @@ export class OutputBuffer {
         // Ignore log write errors
       }
     }
+  }
+
+  /**
+   * Monotonic count of output bytes pushed since construction.
+   * Used by verified message injection (src/pty/inject.ts) to detect
+   * whether a submitted Enter actually started a turn (a submit always
+   * produces a burst of repaint output; a lost Enter produces silence).
+   */
+  getTotalBytes(): number {
+    return this.totalBytes;
   }
 
   /**

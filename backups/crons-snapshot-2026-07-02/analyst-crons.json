@@ -1,0 +1,112 @@
+{
+  "updated_at": "2026-07-02T15:30:09.005Z",
+  "crons": [
+    {
+      "name": "heartbeat",
+      "prompt": "Read HEARTBEAT.md and follow its instructions. Update your heartbeat, check inbox, then run light-touch fleet scan: cortextos bus read-all-heartbeats + check-stale-tasks + check-human-tasks. Auto-fix: restart agents with heartbeat >5h (cortextos restart <agent>), archive completed tasks >7d (cortextos bus archive-tasks), bus stale-GOALS.md agents a refresh-goals nudge. Escalate (bus seb_boss, NEVER auto-fix): crash loops >3/day, queue >50, daemon down, novel anomalies. NIGHT MODE: if local time 00:00-08:00 America/New_York, touch heartbeat file but skip scan + Telegram + auto-fix work.",
+      "schedule": "2h",
+      "enabled": true,
+      "created_at": "2026-05-14T18:28:31.079Z",
+      "metadata": {
+        "migrated_from_config": true,
+        "original_type": "recurring"
+      },
+      "last_fire_attempted_at": "2026-07-02T13:54:36.743Z",
+      "last_fired_at": "2026-07-02T13:54:36.743Z",
+      "fire_count": 981
+    },
+    {
+      "name": "auto-commit",
+      "prompt": "Read .claude/skills/local-version-control/SKILL.md and execute the daily version control workflow. Stage, review, and commit changes.",
+      "schedule": "24h",
+      "enabled": true,
+      "created_at": "2026-05-14T18:28:31.079Z",
+      "metadata": {
+        "migrated_from_config": true,
+        "original_type": "recurring"
+      },
+      "last_fire_attempted_at": "2026-07-02T13:51:36.690Z",
+      "last_fired_at": "2026-07-02T13:51:36.690Z",
+      "fire_count": 46
+    },
+    {
+      "name": "check-upstream",
+      "prompt": "Run upstream-guard first: bash /c/Users/Sebas/cortextos/orgs/SEB_company/agents/analyst/scripts/upstream-guard.sh. If output contains NO-UPDATES, log the result and STOP — do not run check-upstream (a merge would revert local commits). If output contains UPDATES-PENDING, then: Read .claude/skills/upstream-sync/SKILL.md and execute the upstream sync workflow.",
+      "schedule": "24h",
+      "enabled": true,
+      "created_at": "2026-05-14T18:28:31.079Z",
+      "metadata": {
+        "migrated_from_config": true,
+        "original_type": "recurring"
+      },
+      "last_fire_attempted_at": "2026-07-02T13:51:36.690Z",
+      "last_fired_at": "2026-07-02T13:51:36.690Z",
+      "fire_count": 46
+    },
+    {
+      "name": "catalog-browse",
+      "prompt": "Read .claude/skills/catalog-browse/SKILL.md and execute the catalog browse workflow. Check for new community skills and recommend useful ones.",
+      "schedule": "7d",
+      "enabled": true,
+      "created_at": "2026-05-14T18:28:31.079Z",
+      "metadata": {
+        "migrated_from_config": true,
+        "original_type": "recurring"
+      },
+      "last_fire_attempted_at": "2026-06-26T20:51:44.461Z",
+      "last_fired_at": "2026-06-26T20:51:44.461Z",
+      "fire_count": 5
+    },
+    {
+      "name": "weekly-fleet-summary",
+      "prompt": "Sunday 11pm ET weekly fleet summary. Use Sonnet 4.6 for semantic synthesis. Pull last 7d: bus traffic + task throughput + token spend + crash counts + heartbeat freshness. Produce structured summary: top 3 anomalies (severity + agent + recommended action), agent-of-week (best heartbeat + completion + ACK time), trend lines, open items needing seb_boss attention. Bus seb_boss with summary; seb_boss decides Telegram surface.",
+      "schedule": "0 23 * * 0",
+      "enabled": true,
+      "created_at": "2026-05-29T20:59:00.625Z",
+      "description": "Weekly fleet health + KPI summary, Sunday 11pm ET (tz-aware)",
+      "last_fire_attempted_at": "2026-06-29T03:00:06.721Z",
+      "last_fired_at": "2026-06-29T03:00:06.721Z",
+      "fire_count": 5
+    },
+    {
+      "name": "theta-wave",
+      "prompt": "THETA-WAVE weekly cycle (Wed 8pm ET). PATHS: agent home = C:/Users/Sebas/cortextos/orgs/SEB_company/agents/analyst — run 'cd' there first and use ABSOLUTE paths for all file checks (cron fires can land in a different cwd; a failed relative ls is NOT evidence a file is missing). Read .claude/skills/theta-wave/SKILL.md (under agent home) and run the cycle. Do NOT assume empty baseline — load current state first: cortextos bus list-experiments --agent analyst, plus experiments/learnings.md + experiments/surfaces/ under agent home. Pre-flight cap check: bash C:/Users/Sebas/cortextos/orgs/SEB_company/agents/analyst/scripts/token-scan.sh — proceed only if Max20x below 50 pct, else defer and bus seb_boss. Evaluate running experiments, score system_effectiveness, queue/launch next cycle per skill. Report to seb_boss via bus (never Telegram Sebastian).",
+      "schedule": "0 20 * * 3",
+      "enabled": true,
+      "created_at": "2026-06-04T20:38:15.190Z",
+      "last_fire_attempted_at": "2026-07-02T00:00:05.937Z",
+      "last_fired_at": "2026-07-02T00:00:05.937Z",
+      "fire_count": 3
+    },
+    {
+      "name": "autoresearch-pulse",
+      "prompt": "AUTORESEARCH pulse (every 3d). PATHS: agent home = C:/Users/Sebas/cortextos/orgs/SEB_company/agents/analyst — cd there first, use ABSOLUTE paths (failed relative ls is NOT evidence a file is missing). Read .claude/skills/autoresearch/SKILL.md under agent home. Then: cortextos bus list-experiments --agent analyst. For each RUNNING experiment: take a measurement, evaluate-experiment if threshold met, log verdict to experiments/learnings.md. If NO running experiments: review experiments/surfaces/ for queued cycle (e.g. cron-effectiveness-detection) and check its preconditions — start it if unblocked, else note why. Report verdicts/starts to seb_boss via bus (never Telegram Sebastian). Skip silently if night mode (00:00-08:00 ET) — defer to next fire.",
+      "schedule": "3d",
+      "enabled": true,
+      "created_at": "2026-06-05T00:25:03.371Z",
+      "last_fire_attempted_at": "2026-06-30T21:45:27.609Z",
+      "last_fired_at": "2026-06-30T21:45:27.609Z",
+      "fire_count": 8
+    },
+    {
+      "name": "theta-wave-pulse",
+      "prompt": "THETA-WAVE PULSE (constant background experimentation — Sebastian directive 2026-06-14, hub-and-spoke, analyst-owned). Every fire, run ONE lightweight improvement increment, do NOT run a full heavy review each time: (1) pick ONE hypothesis to improve a bot/system performance (rotate across agents + systems; pull candidates from fleet-health scan, agent experiment data, recent failures, tool-pick accuracy, tool-selection A/B); (2) run a SMALL experiment or A-B test, internal+reversible only; (3) log result to the running ledger at reports/theta-wave-experiments.md (analyst-LOCAL path — analyst owns it, NOT vault; vault hard-no for analyst) so progress compounds; (4) collect local self-experiment data other bots fed up. ESCALATE to seb_boss bus ONLY when a finding is decision-worthy (proposes a real change / needs priority call / needs approval) — then seb_boss runs the critical-partner theta-wave conversation. Otherwise stay silent + keep accumulating. GUARDRAILS: internal only, no external, nothing irreversible, no night approvals (queue for morning). Token-aware: keep each pulse small; if 5h window critically low, defer + log. This is the CONSTANT loop; the deeper full-fleet decision review happens when escalated or on the weekly theta-wave cron.",
+      "schedule": "0 12 * * *",
+      "enabled": true,
+      "created_at": "2026-06-14T04:36:35.878Z",
+      "last_fire_attempted_at": "2026-07-01T16:00:27.046Z",
+      "last_fired_at": "2026-07-01T16:00:27.046Z",
+      "fire_count": 61
+    },
+    {
+      "name": "wedge-detect",
+      "prompt": "Run scripts/wedge-detect.sh. If FLAG(s): verify the flagged agent is idle (stdout at prompt, not mid-run), then bus seb_boss the flag + recommend preempt-restart (restart = seb_boss approval, analyst does NOT auto-restart). If clean: SILENT, update heartbeat only. Runs in night mode too (wedges happen at night) but only bus seb_boss on an actual FLAG. Detection-only EXP-4 deliverable.",
+      "schedule": "*/30 * * * *",
+      "enabled": true,
+      "created_at": "2026-06-15T01:42:49.665Z",
+      "last_fire_attempted_at": "2026-07-02T15:30:08.968Z",
+      "last_fired_at": "2026-07-02T15:30:08.968Z",
+      "fire_count": 1549
+    }
+  ]
+}

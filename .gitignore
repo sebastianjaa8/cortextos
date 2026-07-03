@@ -17,7 +17,13 @@ orgs/
 
 # Secrets
 .env
+# .env backups (.env.pre-blank-bak, .env.bak-*) carry live bot tokens —
+# `.env` alone only matches the exact name, leaving backups one
+# `git add -A` away from being committed (2026-07-02 vuln sweep).
+.env.*
 !.env.example
+!.env.*.example
+!.env.local.example
 templates/*/.env
 .cortextos-env
 

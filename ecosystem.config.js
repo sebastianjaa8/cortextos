@@ -45,7 +45,13 @@ module.exports = {
       // reminder that unchecked auto-restart amplifies one bug into a
       // fleet-wide outage.
       max_restarts: 10,
-      restart_delay: 5000,
+      // Exponential backoff (5s → 15min cap) instead of a fixed 5s delay.
+      // With a fixed delay, a startup failure that exits "cleanly enough"
+      // to dodge max_restarts (e.g. the duplicate-daemon lock conflict of
+      // 2026-07-01) respawns ~10x/min forever — 17k restarts in a day.
+      // Backoff caps that at ~4/hour while still recovering fast from a
+      // one-off crash.
+      exp_backoff_restart_delay: 5000,
       autorestart: true,
     },
   ],

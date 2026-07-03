@@ -1,0 +1,79 @@
+{
+  "updated_at": "2026-07-02T11:56:23.850Z",
+  "crons": [
+    {
+      "name": "heartbeat",
+      "prompt": "Read HEARTBEAT.md and follow its instructions. Update your heartbeat, check inbox, and work on your highest priority task. NIGHT MODE: if local time is between 00:00 and 08:00 America/New_York, silent heartbeat (touch heartbeat file but no Telegram surfacing, no active drafting work).",
+      "schedule": "4h",
+      "enabled": true,
+      "created_at": "2026-05-14T18:28:17.195Z",
+      "metadata": {
+        "migrated_from_config": true,
+        "original_type": "recurring"
+      },
+      "last_fire_attempted_at": "2026-07-02T11:56:23.830Z",
+      "last_fired_at": "2026-07-02T11:56:23.830Z",
+      "fire_count": 1645
+    },
+    {
+      "name": "nanoneuro-biweekly-update",
+      "prompt": "CADENCE GUARD (added 2026-07-01): this cron now fires WEEKLY (Tue 10am ET) as a workaround for a scheduler quirk — never-fired interval crons ('14d') reset their timer on every daemon restart and this cron had NEVER fired since 2026-05-14. The biweekly cadence is enforced here instead: FIRST read vault Projects/NanoNeuroscience Data Platform/Log.md and find the date of the last biweekly client update sent. If it was sent fewer than 13 days ago, exit silently — do NOT draft. Otherwise proceed: Draft NanoNeuro biweekly client update. Invoke sebastian-brand skill FIRST for voice + per-client config. Read vault Projects/NanoNeuroscience Data Platform/Context.md + Log.md (last 14d) for what to surface. Pull git activity + Phase status from .planning/ROADMAP.md. Stage draft via mcp__claude_ai_Gmail__create_draft (Gmail-draft, NOT auto-send) + bus seb_boss with Telegram preview. Sebastian-hand on send.",
+      "schedule": "0 10 * * 2",
+      "enabled": true,
+      "created_at": "2026-05-14T18:28:17.195Z",
+      "metadata": {
+        "migrated_from_config": true,
+        "original_type": "recurring"
+      },
+      "description": "NanoNeuro biweekly draft — weekly fire + 13-day guard (was dead 14d interval)"
+    },
+    {
+      "name": "nightly-metrics",
+      "prompt": "Run nightly metrics collection: cortextos bus collect-metrics. Review the output and report any anomalies via Telegram to the orchestrator.",
+      "schedule": "24h",
+      "enabled": true,
+      "created_at": "2026-05-14T18:28:17.195Z",
+      "metadata": {
+        "migrated_from_config": true,
+        "original_type": "recurring"
+      },
+      "last_fire_attempted_at": "2026-07-01T15:55:27.016Z",
+      "last_fired_at": "2026-07-01T15:55:27.016Z",
+      "fire_count": 42
+    },
+    {
+      "name": "catalog-browse",
+      "prompt": "Read .claude/skills/catalog-browse/SKILL.md and execute the catalog browse workflow. Check for new community skills and recommend useful ones.",
+      "schedule": "7d",
+      "enabled": true,
+      "created_at": "2026-05-14T18:28:17.196Z",
+      "metadata": {
+        "migrated_from_config": true,
+        "original_type": "recurring"
+      },
+      "last_fire_attempted_at": "2026-06-30T03:05:49.459Z",
+      "last_fired_at": "2026-06-30T03:05:49.459Z",
+      "fire_count": 5
+    },
+    {
+      "name": "voice-card-weekly",
+      "prompt": "Day-mode only: run python skills/voice-feedback/scripts/aggregate_week.py for the current ISO week, then surface the resulting voice card (vault _AI_Inbox/voice-card-<week>.md) to seb_boss with a 2-line summary of proposed SSOT updates. PROPOSE-ONLY, never auto-edit sebastian-brand.",
+      "schedule": "0 18 * * 0",
+      "enabled": true,
+      "created_at": "2026-06-23T15:08:17.836Z",
+      "last_fire_attempted_at": "2026-06-28T22:00:01.062Z",
+      "last_fired_at": "2026-06-28T22:00:01.062Z",
+      "fire_count": 1
+    },
+    {
+      "name": "brand-voice-calibration",
+      "prompt": "G2 weekly voice calibration: run python /c/Users/Sebas/dev/brand-feedback-loop/brand_feedback.py weekly-scan 2>&1. If output shows pairs processed, bus seb_boss low with summary. If no pairs found, silent. Monday 3am UTC (Sunday night).",
+      "schedule": "0 3 * * 1",
+      "enabled": true,
+      "created_at": "2026-06-27T11:46:31.111Z",
+      "last_fire_attempted_at": "2026-06-29T07:00:10.562Z",
+      "last_fired_at": "2026-06-29T07:00:10.562Z",
+      "fire_count": 1
+    }
+  ]
+}

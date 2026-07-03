@@ -7,6 +7,7 @@ import { atomicWriteSync, ensureDir } from '../utils/atomic.js';
 import { acquireLock, releaseLock } from '../utils/lock.js';
 import { randomString } from '../utils/random.js';
 import { validateAgentName, validatePriority } from '../utils/validate.js';
+import { loadAgentKey } from './keys.js';
 
 // ---------------------------------------------------------------------------
 // Security (H10): HMAC-SHA256 message signing
@@ -67,7 +68,9 @@ export function sendMessage(
   const filename = `${pnum}-${epochMs}-from-${from}-${rand}.json`;
 
   // Security (H10): Sign message with HMAC-SHA256.
-  const signingKey = loadSigningKey(paths.ctxRoot);
+  // Prefer the sender's per-agent key (cryptographic attribution); fall back
+  // to the legacy shared key for unprovisioned senders (e.g. dashboard).
+  const signingKey = loadAgentKey(from) ?? loadSigningKey(paths.ctxRoot);
   const message: InboxMessage = {
     id: msgId,
     from,
@@ -126,9 +129,32 @@ export function checkInbox(paths: BusPaths): InboxMessage[] {
         const content = readFileSync(srcPath, 'utf-8');
         const msg: InboxMessage = JSON.parse(content);
 
-        // Security (H10): Verify HMAC signature if key is available and message has sig.
-        if (signingKey && msg.sig) {
-          const valid = hmacVerify(signingKey, signPayload(msg.id, msg.from, msg.to, msg.text), msg.sig);
+        // Security: Verify HMAC signature against the CLAIMED sender's
+        // per-agent key (attribution), falling back to the legacy shared key.
+        const payload = signPayload(msg.id, msg.from, msg.to, msg.text);
+        const senderKey = loadAgentKey(msg.from);
+        if (senderKey) {
+          if (msg.sig) {
+            if (!hmacVerify(senderKey, payload, msg.sig)) {
+              if (signingKey && hmacVerify(signingKey, payload, msg.sig)) {
+                // Pre-migration in-flight message signed with old shared key.
+                console.warn(`[bus/message] SECURITY: Message ${msg.id} from '${msg.from}' carries a legacy shared-key signature — accepted (transition)`);
+              } else {
+                console.error(`[bus/message] SECURITY: Message ${msg.id} from '${msg.from}' failed HMAC verification against sender's key — rejecting`);
+                const errDir = join(inbox, '.errors');
+                ensureDir(errDir);
+                try { renameSync(srcPath, join(errDir, file)); } catch { /* ignore */ }
+                continue;
+              }
+            }
+          } else {
+            // Sender has a key on file but message is unsigned — flag, don't
+            // hard-reject during rollout.
+            console.warn(`[bus/message] SECURITY: Unsigned message ${msg.id} from '${msg.from}' despite per-agent key on file — accepted with flag`);
+          }
+        } else if (signingKey && msg.sig) {
+          // No per-agent key for claimed sender — legacy shared-key path.
+          const valid = hmacVerify(signingKey, payload, msg.sig);
           if (!valid) {
             console.error(`[bus/message] SECURITY: Message ${msg.id} from '${msg.from}' failed HMAC verification — rejecting`);
             const errDir = join(inbox, '.errors');
@@ -136,9 +162,15 @@ export function checkInbox(paths: BusPaths): InboxMessage[] {
             try { renameSync(srcPath, join(errDir, file)); } catch { /* ignore */ }
             continue;
           }
+          // Valid shared-key sig but no per-agent key — unknown/unregistered
+          // sender (e.g. dashboard, or the 'cortextos' incident). Never silent.
+          console.warn(`[bus/message] SECURITY: Message ${msg.id} claims sender '${msg.from}' which has no per-agent key on file — accepted with flag (shared-key signature valid)`);
         } else if (signingKey && !msg.sig) {
           // Signing key exists but message has no sig — legacy message, log warning
-          console.warn(`[bus/message] WARNING: Unsigned message ${msg.id} from '${msg.from}' — accepted (legacy)`);
+          console.warn(`[bus/message] SECURITY: Unsigned message ${msg.id} from unregistered sender '${msg.from}' — accepted with flag (legacy)`);
+        } else if (!signingKey) {
+          // No keys anywhere (legacy install) — flag unknown sender, never silent.
+          console.warn(`[bus/message] SECURITY: Message ${msg.id} claims sender '${msg.from}' which has no key on file — accepted with flag (no signing configured)`);
         }
 
         // Move to inflight

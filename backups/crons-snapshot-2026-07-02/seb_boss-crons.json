@@ -1,0 +1,322 @@
+{
+  "updated_at": "2026-07-02T15:30:16.932Z",
+  "crons": [
+    {
+      "name": "morning-brief",
+      "prompt": "Read C:/Users/Sebas/cortextos/orgs/SEB_company/agents/seb_boss/scripts/cron-specs/morning-brief-spec.md then execute exactly as specified.",
+      "schedule": "0 7 * * *",
+      "enabled": true,
+      "created_at": "2026-05-17T16:25:25.431Z",
+      "metadata": {
+        "migrated_from_config": true,
+        "original_type": "recurring"
+      },
+      "last_fire_attempted_at": "2026-07-02T11:00:11.572Z",
+      "last_fired_at": "2026-07-02T11:00:11.572Z",
+      "fire_count": 46
+    },
+    {
+      "name": "heartbeat",
+      "prompt": "Read HEARTBEAT.md and follow its instructions. Update heartbeat, check inbox, work on highest priority task. Per fleet-wide heartbeat discipline 4h interval.",
+      "schedule": "0 */4 * * *",
+      "enabled": true,
+      "created_at": "2026-05-20T03:11:15.318Z",
+      "last_fire_attempted_at": "2026-07-02T12:00:12.467Z",
+      "last_fired_at": "2026-07-02T12:00:12.467Z",
+      "fire_count": 248
+    },
+    {
+      "name": "accenture-30day-checkin",
+      "prompt": "Accenture weekly check-in â€” Friday 12pm ET (16:00 UTC). Pull Todoist 'Work' project Accenture-prefixed tasks. Surface progress digest via Telegram to Sebastian: which tasks completed this week, which slipping, what's due next week, recommended priority for weekend study (Mon+Wed 7-9:30pm side-project block per Career calendar). Cross-ref Projects/Career/Log.md weekly entries. Per Sebastian directive 2026-05-22: hold him religious to Accenture goals + never let him forget.",
+      "schedule": "0 16 * * 5",
+      "enabled": true,
+      "created_at": "2026-05-22T20:39:24.044Z",
+      "last_fire_attempted_at": "2026-06-26T20:00:17.596Z",
+      "last_fired_at": "2026-06-26T20:00:17.596Z",
+      "fire_count": 5
+    },
+    {
+      "name": "weekly-rating-prompt",
+      "prompt": "Auto weekly-rating fire (replaces manual /rate-week invocation per Sebastian 2026-05-22 directive). Sunday 8pm ET (00:00 UTC Monday). Steps: (1) Read Knowledge/_quality-log.md rows from past 7 days. (2) If <3 qualifying docs â†’ skip silently, write [AUTO] log to Projects/Obsidian System/Log.md noting 'weekly-rating skip â€” N qualifying'. (3) If >=3 â†’ invoke /weekly-rating skill OR replicate logic: weighted-random pick 3 docs (50% lowest auto-scorecard, 30% high-stakes path matches Deliverables/client-emails/plans, 20% Codex divergence >2). (4) Format 1-line-per-doc rating prompt per skill spec. (5) cortextos bus send-telegram 8788724873 with rating prompt asking Sebastian to rate. (6) Park results â€” Sebastian replies inline via Telegram, seb_boss parses + appends to Knowledge/_human-ratings-log.md + diffs against auto-scorecard + logs >2-point divergences to Knowledge/_rubric-corrections.md. Don't wait passively â€” surface actively.",
+      "schedule": "15 20 * * 0",
+      "enabled": true,
+      "created_at": "2026-05-22T20:39:42.008Z",
+      "last_fire_attempted_at": "2026-06-29T04:00:09.907Z",
+      "last_fired_at": "2026-06-29T04:00:09.907Z",
+      "fire_count": 6,
+      "description": "Sun 8:15pm ET weekly-rating (was 0 0 * * 1 = midnight Mon, contradicting prompt's stated Sunday 8pm ET; fixed 2026-07-01, staggered :15 to avoid voice-weekly 8pm collision)"
+    },
+    {
+      "name": "eod-distillation",
+      "prompt": "EOD distillation â€” autonomous write, no confirm gate (fixed 2026-06-25). Steps: 1. Read Knowledge/_seb_boss-conversations/$(date +%Y-%m-%d).md (today transcript) + memory/$(date +%Y-%m-%d).md. 2. Extract: decisions locked today (with reason + discussion), project deltas, learnings about Sebastian, open holds. 3. Write section DIRECTLY to vault autonomously â€” no confirm gate: obsidian vault=\"Obsidian Vault\" append path=\"Knowledge/seb-boss-distilled-context.md\" content with today date header. 4. Telegram Sebastian a 4-line digest (decided / changed / open / tomorrow). Do NOT ask for confirmation before writing.",
+      "schedule": "30 23 * * *",
+      "enabled": true,
+      "created_at": "2026-06-02T02:12:54.850Z",
+      "last_fire_attempted_at": "2026-07-02T03:30:04.050Z",
+      "last_fired_at": "2026-07-02T03:30:04.050Z",
+      "fire_count": 31
+    },
+    {
+      "name": "voice-digest",
+      "prompt": "Daily curated-voice digest (#27 Phase-1). Run: cd /c/Users/Sebas/dev/marketing-orchestrator && python voice_monitor.py daily --config voices_feeds.json --state voice_monitor_state.json. If output shows new posts, Telegram Sebastian (8788724873) the digest (compact, links included). If 'No new posts', SILENT â€” no Telegram. Feed errors: silent unless persisting 3+ days.",
+      "schedule": "0 12 * * *",
+      "enabled": true,
+      "created_at": "2026-06-05T00:26:47.310Z",
+      "last_fire_attempted_at": "2026-07-01T16:00:29.506Z",
+      "last_fired_at": "2026-07-01T16:00:29.506Z",
+      "fire_count": 27
+    },
+    {
+      "name": "voice-weekly",
+      "prompt": "Sunday curated-voice engagement prompt (#27 Phase-1). Run: cd /c/Users/Sebas/dev/marketing-orchestrator && python voice_monitor.py weekly --config voices_feeds.json --state voice_weekly_state.json (NOTE: separate weekly state file = diff covers full week). Telegram Sebastian (8788724873) the engagement prompt. Quiet week = still send the 1-line quiet note (it is his Sunday review cue).",
+      "schedule": "0 20 * * 0",
+      "enabled": true,
+      "created_at": "2026-06-05T00:26:47.770Z",
+      "last_fire_attempted_at": "2026-06-29T00:00:06.151Z",
+      "last_fired_at": "2026-06-29T00:00:06.151Z",
+      "fire_count": 4
+    },
+    {
+      "name": "zois-bridge-monitor",
+      "prompt": "Daily 10am ET Zois-bridge health check (ongoing, keep indefinitely per Sebastian 2026-07-01 directive). Check S3 nanoneuro-instrument-files-prod landing/ reachable + IAM key valid + check for new objects since prior day + agent freshness; if uploads were flowing then STOPPED 24h+ on a workday with no offline-explanation, OR the agent looks stalled, Telegram Sebastian 8788724873: 'Zois bridge: <state>, fire self-heal? (Y/N)'. Healthy/quiet/weekend/plausibly-offline -> SILENT (log only). Self-heal patch is break-glass-ready.",
+      "schedule": "0 14 * * *",
+      "enabled": true,
+      "created_at": "2026-06-08T16:15:37.616Z",
+      "last_fire_attempted_at": "2026-07-01T18:00:01.800Z",
+      "last_fired_at": "2026-07-01T18:00:01.800Z",
+      "fire_count": 24
+    },
+    {
+      "name": "decision-ledger-review",
+      "prompt": "Run decision-ledger autopilot (READ-ONLY, never writes _decisions.csv = CC hard line): cd /c/Users/Sebas/dev/fable-personal-sandbox/decision-ledger-autopilot && python -m dledger --emit all --out out. Surfaces past-due + upcoming decision reviews; its output feeds the 7am brief Decisions-Due section. Ensure any past-due items reach the brief. Log only, no separate Telegram (brief carries it).",
+      "schedule": "50 6 * * *",
+      "enabled": true,
+      "created_at": "2026-06-14T15:39:56.583Z",
+      "last_fire_attempted_at": "2026-07-02T10:50:11.405Z",
+      "last_fired_at": "2026-07-02T10:50:11.405Z",
+      "fire_count": 18
+    },
+    {
+      "name": "flight-recorder",
+      "prompt": "Run Agent Flight Recorder watch: cd /c/Users/Sebas/dev/fable-personal-sandbox/agent-flight-recorder ; python -m flightrec ingest ; python -m flightrec crosscheck --hours 4 --md data/crosscheck-latest.md. If exit code 2 (HIGH findings): Telegram Sebastian a digest (max 3 lines: finding kind + agent + headline) + 'code C:/Users/Sebas/dev/fable-personal-sandbox/agent-flight-recorder/data/crosscheck-latest.md'. If exit 0: SILENT log-only. Findings are evidence pointers not verdicts: verify via 'python -m flightrec timeline --agent <agent>' before acting.",
+      "schedule": "15 */6 * * *",
+      "enabled": true,
+      "created_at": "2026-06-14T15:39:56.912Z",
+      "last_fire_attempted_at": "2026-07-02T10:15:10.864Z",
+      "last_fired_at": "2026-07-02T10:15:10.864Z",
+      "fire_count": 111
+    },
+    {
+      "name": "vault-log-rotator",
+      "prompt": "Vault log rotation. Run: cd /c/Users/Sebas/dev/fable-personal-sandbox/vault-log-rotator && python src/rotator.py --config config.json --apply --report-out docs/last-apply-report.md ; then Telegram Sebastian a 1-line summary ONLY if any target rotated (rows moved + archive path), silent if all noop.",
+      "schedule": "0 5 * * *",
+      "enabled": true,
+      "created_at": "2026-06-14T15:39:57.261Z",
+      "last_fire_attempted_at": "2026-07-02T09:00:09.560Z",
+      "last_fired_at": "2026-07-02T09:00:09.560Z",
+      "fire_count": 18
+    },
+    {
+      "name": "weekly-planning-ritual",
+      "prompt": "WEEKLY PLANNING RITUAL (anti-overdue system). Pull Sebastian Todoist backlog (no-date tasks, especially @build-menu + someday items) plus this coming weeks committed tasks. Telegram Sebastian (chat 8788724873) a short scannable digest: backlog count + the top 5-8 candidates by value, this weeks calendar load, and ask him to pick 3-5 backlog items to commit to real dates this week. This is THE planning ritual that prevents the dated-backlog overdue pattern. Keep it tight, one decision prompt at the end.",
+      "schedule": "0 19 * * 0",
+      "enabled": true,
+      "created_at": "2026-06-14T20:56:52.008Z",
+      "description": "Sun 7pm ET weekly planning: surface backlog, Sebastian commits 3-5 to the week",
+      "last_fire_attempted_at": "2026-06-28T23:00:05.212Z",
+      "last_fired_at": "2026-06-28T23:00:05.212Z",
+      "fire_count": 3
+    },
+    {
+      "name": "fleet-pulse",
+      "prompt": "Read C:/Users/Sebas/cortextos/orgs/SEB_company/agents/seb_boss/scripts/cron-specs/fleet-pulse-spec.md then execute exactly as specified.",
+      "schedule": "0 9 * * *",
+      "enabled": true,
+      "created_at": "2026-06-14T23:58:26.882Z",
+      "description": "Daily 9am ET fleet pulse + cron-fire/tool-run reliability digest",
+      "last_fire_attempted_at": "2026-07-02T13:00:13.521Z",
+      "last_fired_at": "2026-07-02T13:00:13.521Z",
+      "fire_count": 18
+    },
+    {
+      "name": "vault-search-refresh",
+      "prompt": "VAULT-SEARCH DAILY REFRESH (A1, local semantic index). Run: cd /c/Users/Sebas/dev/vault-search then VAULT_SEARCH_OFFLINE=1 .venv/Scripts/python.exe -m vault_search.cli refresh (incremental; only changed vault files re-embed). 100% local, zero outbound. On success, no Telegram (silent). If it errors (e.g. model cache missing, dep break), report to Sebastian once. Keeps the /search index fresh.",
+      "schedule": "0 4 * * *",
+      "enabled": true,
+      "created_at": "2026-06-15T00:19:36.268Z",
+      "description": "Daily 4am ET local vault-search incremental refresh",
+      "last_fire_attempted_at": "2026-07-02T08:00:08.570Z",
+      "last_fired_at": "2026-07-02T08:00:08.570Z",
+      "fire_count": 18
+    },
+    {
+      "name": "sunday-maintenance",
+      "prompt": "Sunday 9pm ET weekly maintenance â€” run all 3 steps IN ORDER, each independent (if one errors, log it + continue to the next). STEP A (dream): invoke /dream tier2 â€” Layer 2 weekly memory consolidation (in-session, no API key); consolidate the week's session miners into durable patterns. STEP B (portability): cd /c/Users/Sebas/dev/fable-personal-sandbox/vault-portability-exporter ; python -m vault_exporter export --config config.example.json --out C:/Users/Sebas/OneDrive/Documentos/07_Archive/personal-os-exports --zip ; then python -m vault_exporter verify <newest archive dir>; if verify NOT OK Telegram Sebastian 1-line failure, on success Telegram 1-line files+bytes+path. STEP C (improvement): weekly continuous-improvement loop â€” re-run setup-improvement-sweep Workflow (or scoped if little changed): fan analysts over fleet/NanoNeuro/career/second-brain/workflows/skills -> ranked roadmap -> AUTO-APPLY safe shortlist + surface NEEDS-SEBASTIAN via Telegram; review theta-wave results + promote winners; save roadmap to Knowledge/improvement-roadmap-<date>.md. Log each step to .sunday-maintenance.log.",
+      "schedule": "0 21 * * 0",
+      "enabled": true,
+      "created_at": "2026-06-15T22:55:29.667Z",
+      "last_fire_attempted_at": "2026-06-29T01:00:07.055Z",
+      "last_fired_at": "2026-06-29T01:00:07.055Z",
+      "fire_count": 2
+    },
+    {
+      "name": "overnight-opus-build",
+      "prompt": "Read C:/Users/Sebas/cortextos/orgs/SEB_company/agents/seb_boss/scripts/cron-specs/overnight-opus-build-spec.md then execute exactly as specified.",
+      "schedule": "0 5 * * *",
+      "enabled": true,
+      "created_at": "2026-06-19T04:04:44.114Z",
+      "last_fire_attempted_at": "2026-07-02T09:00:09.560Z",
+      "last_fired_at": "2026-07-02T09:00:09.560Z",
+      "fire_count": 14
+    },
+    {
+      "name": "skills-profile-nudge",
+      "prompt": "Weekly Friday skills-profile nudge (Sebastian: bucket mass-add reminder). STEP 1: read work/skills-profile-remaining.md REMAINING BUCKETS. If none left, Telegram Sebastian 8788724873 'Skills profile: all buckets sent â€” done.' then disable this cron (cortextos bus remove-cron seb_boss skills-profile-nudge) + stop. STEP 2 else: take TOP 1-2 remaining buckets, Telegram encouraging nudge + those buckets formatted '[Start MM/YYYY Â· X% bucket] skill, skill, ...' STEP 3: rewrite work/skills-profile-remaining.md removing the bucket(s) just sent (read-modify-write, keep header + DONE line).",
+      "schedule": "0 22 * * 5",
+      "enabled": true,
+      "created_at": "2026-06-23T02:47:33.212Z",
+      "last_fire_attempted_at": "2026-06-27T02:00:15.582Z",
+      "last_fired_at": "2026-06-27T02:00:15.582Z",
+      "fire_count": 1
+    },
+    {
+      "name": "mo-comment-finder",
+      "prompt": "Run the marketing-orchestrator comment-opportunity finder. cd ~/dev/marketing-orchestrator && python mo_drafts.py comment-finder --top 5. Read the brief. Pick the 1-2 MOST substantive in-lane posts and draft a short reply for each in Sebastian's voice using the sebastian-brand skill. HARD RULES: stay in lane (AI / agentic AI / Claude expertise / Sebastian's journey); NEVER reference client work (NanoNeuro / Monocacy / freelance) or Accenture / ATC content. Telegram Sebastian the drafts as suggestions (never auto-post). If the brief says no new posts, stay silent (no Telegram).",
+      "schedule": "0 9 * * 1,3,5",
+      "enabled": true,
+      "created_at": "2026-06-23T03:14:21.140Z",
+      "last_fire_attempted_at": "2026-07-01T13:00:26.057Z",
+      "last_fired_at": "2026-07-01T13:00:26.057Z",
+      "fire_count": 8
+    },
+    {
+      "name": "mo-linkedin-weekly",
+      "prompt": "Run the marketing-orchestrator LinkedIn weekly draft. cd ~/dev/marketing-orchestrator && python mo_drafts.py linkedin-weekly. Read the brief (week's wins from wins_log.md, cert progress, AI-news beat). Draft 1-2 LinkedIn post options in Sebastian's voice using the sebastian-brand skill + LinkedIn positioning (VP-of-Consulting / AI-solutions-and-automation, comma over em-dash, AI primary). HARD RULES: stay in lane (AI / agentic / Claude / journey); NEVER reference client work or Accenture / ATC content. Telegram Sebastian the draft(s) for review (never auto-post).",
+      "schedule": "0 17 * * 0",
+      "enabled": true,
+      "created_at": "2026-06-23T03:14:24.503Z",
+      "last_fire_attempted_at": "2026-06-28T21:00:03.495Z",
+      "last_fired_at": "2026-06-28T21:00:03.495Z",
+      "fire_count": 1
+    },
+    {
+      "name": "tax-collect-monthly",
+      "prompt": "Run: python3 C:/Users/Sebas/dev/tax-doc-collector/scan.py. Relay the summary line.",
+      "schedule": "0 6 1 * *",
+      "enabled": true,
+      "created_at": "2026-06-23T03:19:16.532Z",
+      "last_fire_attempted_at": "2026-07-01T10:00:22.473Z",
+      "last_fired_at": "2026-07-01T10:00:22.473Z",
+      "fire_count": 1
+    },
+    {
+      "name": "tax-prep-digest",
+      "prompt": "Run: python3 C:/Users/Sebas/dev/tax-doc-collector/digest.py. Telegram the summary to Sebastian.",
+      "schedule": "0 8 5 1,2 *",
+      "enabled": true,
+      "created_at": "2026-06-23T03:19:17.180Z"
+    },
+    {
+      "name": "h8-weekly-review",
+      "prompt": "cd ~/dev/workflow-hunter && python -m src.main --h8. Read the output. Telegram Sebastian the H8 review prompt asking: wins this week / lesson / next-3-priorities. Save response to vault Sessions/weekly-reviews/ via obsidian CLI when Sebastian replies.",
+      "schedule": "30 20 * * 0",
+      "enabled": true,
+      "created_at": "2026-06-23T03:22:39.000Z",
+      "last_fire_attempted_at": "2026-06-29T04:00:09.907Z",
+      "last_fired_at": "2026-06-29T04:00:09.907Z",
+      "fire_count": 1,
+      "description": "Sun 8:30pm ET H8 weekly review (was 0 0 * * 1 = midnight Mon Telegram, violating 00:00-08:00 night-hold; moved 2026-07-01)"
+    },
+    {
+      "name": "d1-decision-ledger",
+      "prompt": "Run the D1 decision-ledger generator over today's chat. Gather the day's decision-relevant exchanges into a temp file, then: cd ~/dev/decision-ledger-generator && python dledger_gen.py scan --in <tmpfile>. For each candidate, fill the <AGENT:...> fields (scope kebab-tag, <=160 char reason, falsifiable expected_outcome) from the chat context. Telegram Sebastian each drafted row for approve+commit (y=commit / n=skip / edit). On approval, commit the row to Knowledge/_decisions.csv (CC/Sebastian write path â€” the tool never writes it). If no candidates, stay silent.",
+      "schedule": "0 21 * * *",
+      "enabled": true,
+      "created_at": "2026-06-23T03:23:24.160Z",
+      "last_fire_attempted_at": "2026-07-02T01:00:10.548Z",
+      "last_fired_at": "2026-07-02T01:00:10.548Z",
+      "fire_count": 9
+    },
+    {
+      "name": "h9-weekly-grocery",
+      "prompt": "Run the weekly grocery plan: cd ~/dev/kitchen-assistant && python kitchen.py grocery --meals 5 --min-protein 30. Format the meals + store-grouped shopping list and Telegram Sebastian as this week's suggested grocery run (Publix/Aldi/Sam's). He can reply to swap meals.",
+      "schedule": "0 10 * * 0",
+      "enabled": false,
+      "created_at": "2026-06-23T03:27:49.599Z",
+      "last_fire_attempted_at": "2026-06-28T14:00:26.923Z",
+      "last_fired_at": "2026-06-28T14:00:26.923Z",
+      "fire_count": 1,
+      "description": "DISABLED 2026-07-01: superseded by chef agent's sunday-grocery cron (Sun 8am ET, fridge.json-aware). Two grocery Telegrams every Sunday otherwise. Re-enable if chef is retired."
+    },
+    {
+      "name": "boot-liveness-check",
+      "prompt": "Run boot-liveness-check.sh: cd /c/Users/Sebas/cortextos/orgs/SEB_company/agents/analyst && bash scripts/boot-liveness-check.sh. Silent unless SESSION-DEAD-MASKED or FAIL.",
+      "schedule": "0 */4 * * *",
+      "enabled": false,
+      "created_at": "2026-06-23T06:53:47.724Z",
+      "last_fire_attempted_at": "2026-06-25T12:00:05.485Z",
+      "last_fired_at": "2026-06-25T12:00:05.485Z",
+      "fire_count": 14
+    },
+    {
+      "name": "liveness-poke-live",
+      "prompt": "Run liveness-poke LIVE (Sebastian-approved 2026-06-23): cd /c/Users/Sebas/cortextos/orgs/SEB_company/agents/analyst && bash scripts/liveness-poke.sh --live. Acts on Signal B WEDGE-CONFIRMED and Signal C MASKED-DEAD-SUSPECT (both wired as of 2026-06-24). Guards: HB-restamp verify, host-suspend defer, 15min cooldown, breaker >2/60min escalate, atomic lock, escalate-not-blind-kill. Signal C restarts surface bus message to seb_boss. Surface any restart to Sebastian via seb_boss.",
+      "schedule": "*/30 * * * *",
+      "enabled": false,
+      "created_at": "2026-06-23T13:08:52.230Z",
+      "last_fire_attempted_at": "2026-06-25T12:00:05.485Z",
+      "last_fired_at": "2026-06-25T12:00:05.485Z",
+      "fire_count": 94
+    },
+    {
+      "name": "poke-unconfirmed-check",
+      "prompt": "Check for stale restart-unconfirmed poke entries: bash /c/Users/Sebas/cortextos/orgs/SEB_company/agents/seb_boss/scripts/check-poke-unconfirmed.sh. Silent if all clear. Buses seb_boss high if any restart-unconfirmed entry <2h old has agent HB still not advanced.",
+      "schedule": "0 */2 * * *",
+      "enabled": false,
+      "created_at": "2026-06-24T05:14:47.407Z",
+      "last_fire_attempted_at": "2026-06-25T12:00:05.485Z",
+      "last_fired_at": "2026-06-25T12:00:05.485Z",
+      "fire_count": 16
+    },
+    {
+      "name": "unified-watchdog",
+      "prompt": "UNIFIED FLEET WATCHDOG (consolidated 2026-06-25, runs every 30min). EVERY 30min: (1) liveness-poke LIVE: cd /c/Users/Sebas/cortextos/orgs/SEB_company/agents/analyst && bash scripts/liveness-poke.sh --live. Silent unless finding. (2) poke-unconfirmed: bash /c/Users/Sebas/cortextos/orgs/SEB_company/agents/seb_boss/scripts/check-poke-unconfirmed.sh. Silent if clear. (3) chain-watcher: scan fleet HBs for stalled-chain patterns; if match + task absent, CREATE task + send-message. Day-mode PASS 2: agents silent >2h. EVERY 2hr (fires where floor(min/30) mod 4 == 0): boot-liveness: bash scripts/boot-liveness-check.sh. EVERY 6hr (hour mod 6 == 0 AND min==0): agent-audit: verify each agent had cron fires in expected window; Telegram table if gap (exclude codex_runner). ALL steps silent if all-clear. Major findings only to Telegram. Log to .watchdog.log.",
+      "schedule": "*/30 * * * *",
+      "enabled": true,
+      "created_at": "2026-06-25T12:04:14.794Z",
+      "last_fire_attempted_at": "2026-07-02T15:30:16.893Z",
+      "last_fired_at": "2026-07-02T15:30:16.893Z",
+      "fire_count": 315
+    },
+    {
+      "name": "job-watcher-daily",
+      "prompt": "JOB-WATCHER Mon/Tue/Wed/Thu 7:30am ET â€” cd /c/Users/Sebas/dev/job-search-system && python3 -m src.main --once 2>&1 | head -50. Bus seb_boss with digest if new roles found.",
+      "schedule": "30 7 * * 1,2,3,4",
+      "enabled": true,
+      "created_at": "2026-06-27T21:51:24.909Z",
+      "last_fire_attempted_at": "2026-07-02T11:30:12.027Z",
+      "last_fired_at": "2026-07-02T11:30:12.027Z",
+      "fire_count": 4
+    },
+    {
+      "name": "eod-decisions",
+      "prompt": "EOD open-decisions ping. Check bus inbox for any messages tagged open-decision or pending-approval from last 24h. If any exist, Telegram 8788724873: 'Open tonight: [N] items need your input — check inbox.' Silent if none.",
+      "schedule": "0 22 * * *",
+      "enabled": true,
+      "created_at": "2026-06-29T22:43:15.251Z",
+      "last_fire_attempted_at": "2026-07-02T02:00:11.913Z",
+      "last_fired_at": "2026-07-02T02:00:11.913Z",
+      "fire_count": 3
+    },
+    {
+      "name": "cron-effectiveness",
+      "prompt": "Run cron-effectiveness audit (every 6hr). Execute: python3 /c/Users/Sebas/cortextos/orgs/SEB_company/agents/seb_boss/scripts/cron-effectiveness-audit.py --quiet. Findings go to .watchdog.log + bus log-event. If gaps found, bus send-message seb_boss high with summary. Silent if clean.",
+      "schedule": "30 */6 * * *",
+      "enabled": true,
+      "created_at": "2026-06-30T02:01:24.043Z",
+      "last_fire_attempted_at": "2026-07-02T10:30:11.073Z",
+      "last_fired_at": "2026-07-02T10:30:11.073Z",
+      "fire_count": 10
+    }
+  ]
+}

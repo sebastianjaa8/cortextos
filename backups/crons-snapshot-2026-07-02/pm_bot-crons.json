@@ -1,0 +1,110 @@
+{
+  "updated_at": "2026-07-02T14:30:09.269Z",
+  "crons": [
+    {
+      "name": "heartbeat",
+      "prompt": "Read HEARTBEAT.md and follow its instructions. Update your heartbeat, check inbox, work on highest-priority task.",
+      "schedule": "4h",
+      "enabled": true,
+      "created_at": "2026-05-20T01:26:33.391Z",
+      "metadata": {
+        "migrated_from_config": true,
+        "original_type": "recurring"
+      },
+      "last_fire_attempted_at": "2026-07-02T13:55:08.642Z",
+      "last_fired_at": "2026-07-02T13:55:08.642Z",
+      "fire_count": 245
+    },
+    {
+      "name": "weekly-idea-digest",
+      "prompt": "Emit weekly idea digest to seb_boss. Read ideas-pending.md, count ideas by theme, send ONE bus message: '[pm_bot weekly-digest] N ideas across M themes pending review. File: orgs/SEB_company/agents/pm_bot/ideas-pending.md'. Then append digest-sent timestamp to file.",
+      "schedule": "0 22 * * 0",
+      "enabled": true,
+      "created_at": "2026-05-21T22:45:11.416Z",
+      "last_fire_attempted_at": "2026-06-29T02:00:24.135Z",
+      "last_fired_at": "2026-06-29T02:00:24.135Z",
+      "fire_count": 6
+    },
+    {
+      "name": "pm-gap-finder-review",
+      "prompt": "Read HEARTBEAT.md and run pm-gap-finder-review pulse: cross-reference latest vault-gap-report with completed bus tasks last 30d. Surface top-5 completed-but-undocumented items to seb_boss. Fires regardless of night/day mode.",
+      "schedule": "0 4 */3 * *",
+      "enabled": true,
+      "created_at": "2026-05-28T01:41:43.561Z",
+      "last_fire_attempted_at": "2026-07-01T08:00:19.650Z",
+      "last_fired_at": "2026-07-01T08:00:19.650Z",
+      "fire_count": 13
+    },
+    {
+      "name": "pm-task-audit",
+      "prompt": "Hourly task-discipline audit — fires every hour day-mode (skip night 00:00-08:00 ET). Per Sebastian 2026-05-19 22:10Z directive.\n\nWORKFLOW:\n1) Read seb_boss memory/today's file + seb_boss raw transcript vault file for recent activity (last 1hr)\n2) Cross-reference against bus task DB — was there any seb_boss work unit (>10min OR multi-step OR Sebastian-input) that doesn't have a corresponding bus task?\n3) If missed task-tracking detected, bus seb_boss with structured suggestion: '[pm_bot task-audit] HH:MMZ MISSED — work unit detected without task: <description>. Propose retro task title: <X>. Approve y/n?'\n4) Cap 3 suggestions per audit fire (avoid flood)\n5) NEVER create task on seb_boss's behalf — only suggest via bus\n6) seb_boss decides + creates retro task if approved\n7) Idempotent: track audited time-range, don't re-suggest same work unit\n\nPHANTOM SWEEP (run every audit fire):\n8) Scan full task DB for any task where completed_at IS SET but status != completed/cancelled. For each phantom found: auto-fix via 'cortextos bus update-task <id> completed'. Read-back verify status flipped. Report count to seb_boss if >0 fixed: '[pm_bot phantom-fix] HH:MMZ — fixed N phantom tasks: <id-list>'. Silent if 0.\n\nNEVER directly Telegram Sebastian. Always bus seb_boss.",
+      "schedule": "0 */4 * * *",
+      "enabled": true,
+      "created_at": "2026-06-03T15:33:41.418Z",
+      "last_fire_attempted_at": "2026-07-02T12:00:10.592Z",
+      "last_fired_at": "2026-07-02T12:00:10.592Z",
+      "fire_count": 471
+    },
+    {
+      "name": "pm-task-sync",
+      "prompt": "Read HEARTBEAT.md and run pm-task-sync. Full Todoist + vault Projects/*/Context.md sync check + full bus task DB cross-reference. Output SYNC block to seb_boss. ALSO: scan bus task DB for any task with title containing 'fable' or 'fable-overnight' updated in last 24h (status completed or in_progress) + any 'review pass' or 'review-pass' task for fable branch. Compose 2-line Fable build summary: commits count, CODE-GATE status, review-pass task status, Playwright/QA gate status. Append to SYNC block to seb_boss so it folds into 7am morning brief Telegram. If no fable task activity in last 24h, omit the Fable section silently.",
+      "schedule": "30 10 * * *",
+      "enabled": true,
+      "created_at": "2026-06-11T02:39:38.251Z",
+      "last_fire_attempted_at": "2026-07-02T14:30:09.251Z",
+      "last_fired_at": "2026-07-02T14:30:09.251Z",
+      "fire_count": 22
+    },
+    {
+      "name": "fable-proposal-sweep",
+      "prompt": "Run fable-proposal stale-sweep (weekly, Monday 10:00 UTC). Scan vault _AI_Inbox/fable-proposals/ for proposal files older than 7 days with no matching bus task.\n\nWORKFLOW:\n1) List files: obsidian vault=\"Obsidian Vault\" files path=\"_AI_Inbox/fable-proposals/\"\n2) For each file: extract date from filename (YYYY-MM-DD pattern). If file date < today minus 7 days, it is stale.\n3) For stale files: check bus task DB (cortextos bus list-tasks --format json) for any pending/in_progress task whose title contains keywords from the filename (e.g. 'sow-forge', 'lims-deploy', 'invariant', etc.).\n4) Files with NO matching bus task = flagged stale.\n5) If stale proposals found: bus seb_boss single message '[pm_bot fable-proposal-sweep] N stale proposals (>7d, no matching bus task): <filenames>. Oldest: <name> (<N>d old). Review: create task, archive, or delete.'\n6) Silent if zero stale proposals.",
+      "schedule": "0 10 * * 1",
+      "enabled": true,
+      "created_at": "2026-06-11T18:43:12.470Z",
+      "last_fire_attempted_at": "2026-06-29T14:00:24.282Z",
+      "last_fired_at": "2026-06-29T14:00:24.282Z",
+      "fire_count": 3
+    },
+    {
+      "name": "pm-pulse",
+      "prompt": "Read HEARTBEAT.md and run pm-pulse. Cross-reference Todoist + vault Projects + bus tasks. Includes T-48h gate: scan Todoist for tasks labeled biweekly/recurring/client-deliverable due within 48h with no brand_writer draft task — FINDING if gap. Surface 0-3 FINDING blocks to seb_boss via bus only if real signal. Skip silently if zero. Day mode only.\n\nENGINE-LOG SUPPLEMENT (conditional): Read seb_boss latest heartbeat text. If HB text contains any of: cron-paced, engine, paused, wave, fable — read tail of vault Knowledge/fable-engine-log.md via: obsidian vault=\"Obsidian Vault\" read path=\"Knowledge/fable-engine-log.md\" then take last 15 lines. Look for wave-completion entries (DONE/BUILT/SHIPPED/COMPLETE/PAUSED/TAPER keywords). If engine-log shows a wave completion within the last 3 hours, do NOT fire a builder-launch FINDING for zero task-DB activity — Fable engine waves run as Task-subagents inside seb_boss session and are invisible to bus task DB and HBs. Use engine-log data to supplement task-DB view.\n\nHB-DELIVERY STATUS CHECK: After reading seb_boss HB text, scan for delivery verbs (DONE/DELIVERED/shipped/emailed/built/completed/sent) appearing in the same clause as a task_XXXXX reference (format: task_[digits] or task_[digits]_[digits]). For each match: fetch task status via `cortextos bus list-tasks --format json`. If status is 'pending' or 'not_started', immediately bus seb_boss: '[pm_bot status-check] HH:MMZ — task_XXXXXX still <status> but HB says delivered. Update to in_progress or completed?' Skip if already in_progress/completed/cancelled. Cap at 2 checks per pulse.\n\nAWAITING-SEBASTIAN TASK-GAP CHECK: After reading seb_boss HB text, scan for 'Awaiting Sebastian' or 'Awaiting his' phrases where the following context describes multi-step work (walk-through, approval, decision round, green-light, merge, batch-approve, execute). If found: check bus task DB (`cortextos bus list-tasks --format json`) for any active (pending/in_progress) task whose title keywords match the described work. If NO matching active task: fire ONE FINDING: '[FINDING] Awaiting-Sebastian work with no bus task: <brief description from HB>. Propose: <title>. Create y/n?' Cap 1 per pulse. Idempotency: append 'awaiting-gap-flagged: <short snippet>' to daily memory after firing; skip if same snippet already in memory this session.\n\nCAREER-LOG AUTO-APPEND: After reading seb_boss HB text, detect WORK-POSITIONING deliverables — Accenture work artifacts that build Sebastian's professional standing. QUALIFIES: technical proposals, org-chart analysis/reframes, feedback systems, professional work outputs for named Accenture colleagues or internal clients. Does NOT qualify: personal logistics, apartment/housing, personal email drafts, personal admin, personal favors. If a qualifying deliverable is detected AND appears new (not seen in prior pulse): append one-liner to vault via `obsidian vault=\"Obsidian Vault\" append path=\"Projects/Career/Log.md\" content=\"\\n- YYYY-MM-DD: [AUTO] <brief description>\"`. Silent if nothing qualifies or HB unchanged.\n\nT-48H VAULT FALLBACK (when Todoist gate blind): When T-48h Todoist gate is unavailable (MCP down OR token absent), fall back to vault for NanoNeuro only (Monocacy biweekly discontinued 2026-04-22 — do not check):\n1. Run: obsidian vault=\"Obsidian Vault\" read path=\"Projects/NanoNeuroscience Data Platform/Context.md\" — scan for last biweekly/report sent date\n2. Compute days since last NanoNeuro biweekly (cadence = 14 days). If next due within 48h: fire FINDING '[FINDING] NanoNeuro biweekly due within 48h (last sent: <date>, next due: <date>). vault-fallback (Todoist down) — verify manually before acting.' NEVER auto-send.\n3. Log Todoist outage status to daily memory each pulse: note down-since time and running duration.\n4. If current UTC time is between 10:00-12:00Z AND Todoist still blind: add flag to any outgoing bus message: 'Todoist MCP still down at 7am ET window — morning brief depends on it.'\n\nSESSION-RECAP BANKING + MONDAY PRE-MEETING FINDING: Each pulse, search vault for today's SESSION-RECAP: obsidian vault=\"Obsidian Vault\" search query=\"SESSION-RECAP-YYYY-MM-DD\" (substitute today's actual date). If found: read it, extract OPEN ITEMS section, overwrite daily memory 'SESSION-RECAP open items' entry with latest (file may update during the day). On Monday pulses when current UTC is 13:00-14:00Z AND banked open items exist AND daily memory does NOT already contain 'monday-reminder-fired': fire ONE FINDING to seb_boss: '[FINDING] Monday pre-meeting — open items from SESSION-RECAP: [list]. Verify before Juana/Kyle meetings.' Then append 'monday-reminder-fired: true' to daily memory to prevent re-fire that day. Always read the LATEST SESSION-RECAP (open items can shift as session continues).",
+      "schedule": "21 */2 * * *",
+      "enabled": true,
+      "created_at": "2026-06-13T00:41:09.240Z",
+      "last_fire_attempted_at": "2026-07-02T14:21:09.109Z",
+      "last_fired_at": "2026-07-02T14:21:09.109Z",
+      "fire_count": 578
+    },
+    {
+      "name": "workflow-hunter-daily",
+      "prompt": "WORKFLOW-HUNTER DAILY (must ALWAYS run, never stale, per Sebastian). cd /c/Users/Sebas/dev/workflow-hunter then run: prefer .venv/Scripts/python -m src.main --run, else python -m src.main --run. It scans sources, correlates repeated patterns, emits a ranked propose-only digest (NEVER auto-builds). Route the digest to seb_boss via: cortextos bus send-message seb_boss normal '<digest>' so seb_boss relays to Sebastian. If it errors, report to seb_boss. Keep firing daily without fail.",
+      "schedule": "0 9 * * *",
+      "enabled": true,
+      "created_at": "2026-06-14T23:52:23.776Z",
+      "description": "Daily 9am ET workflow-pattern scan -> seb_boss relay",
+      "last_fire_attempted_at": "2026-07-02T13:00:11.814Z",
+      "last_fired_at": "2026-07-02T13:00:11.814Z",
+      "fire_count": 18
+    },
+    {
+      "name": "daily-task-digest",
+      "prompt": "Daily task digest — fires 22:30 ET (02:30 UTC next day). pm_bot owns this (Sonnet, cheaper than seb_boss Opus). Per Sebastian 2026-05-19 22:10Z directive. WORKFLOW: 1) Run: cortextos bus list-tasks --format json — get completed tasks for prior calendar day in ET (updated_at on prior date). 2) Group by assignee, format as EOD DIGEST YYYY-MM-DD / <agent>: N / - <titles>. 3) Append to vault Knowledge/_daily-task-log/YYYY-MM-DD.md (direct filesystem write). 4) Bus seb_boss HIGH: '[pm_bot daily-digest] <digest_text>' — request Telegram relay. 5) seb_boss Telegrams Sebastian. 6) Log event + write memory. NIGHT HOLD RULE: this cron fires at 22:30 ET (day mode). No night hold needed. NEVER Telegram Sebastian directly.",
+      "schedule": "30 22 * * *",
+      "enabled": true,
+      "created_at": "2026-06-18T18:46:01.051Z",
+      "last_fire_attempted_at": "2026-07-02T02:30:29.549Z",
+      "last_fired_at": "2026-07-02T02:30:29.549Z",
+      "fire_count": 14
+    },
+    {
+      "name": "workflow-hunter",
+      "prompt": "cd ~/dev/workflow-hunter && python -m src.main --weekly. Read out/ dir. Relay newest digest to vault _AI_Inbox/ via obsidian CLI (append path=_AI_Inbox/workflow-hunter-<date>.md content=...). Telegram seb_boss a 2-line brief of top patterns found.",
+      "schedule": "0 7 * * 1",
+      "enabled": true,
+      "created_at": "2026-06-23T03:22:38.684Z",
+      "last_fire_attempted_at": "2026-06-29T11:00:02.815Z",
+      "last_fired_at": "2026-06-29T11:00:02.815Z",
+      "fire_count": 1
+    }
+  ]
+}

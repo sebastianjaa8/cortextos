@@ -23,6 +23,21 @@ describe('MessageDedup', () => {
     expect(dedup.isDuplicate('msg1')).toBe(false); // no longer in cache
     expect(dedup.isDuplicate('msg4')).toBe(true); // still in cache
   });
+
+  it('forget() un-poisons a hash so an identical re-send passes', () => {
+    const dedup = new MessageDedup();
+    expect(dedup.isDuplicate('lost message')).toBe(false); // recorded
+    dedup.forget('lost message'); // submit failed — un-poison
+    expect(dedup.isDuplicate('lost message')).toBe(false); // re-send allowed
+    expect(dedup.isDuplicate('lost message')).toBe(true);  // normal dedup resumes
+  });
+
+  it('forget() on unknown content is a no-op', () => {
+    const dedup = new MessageDedup();
+    dedup.isDuplicate('other');
+    expect(() => dedup.forget('never seen')).not.toThrow();
+    expect(dedup.isDuplicate('other')).toBe(true);
+  });
 });
 
 describe('KEYS', () => {
@@ -89,5 +104,123 @@ describe('injectMessage — deferred Enter crash safety', () => {
     expect(writes.length).toBe(writesBeforeTimer + 1);
     expect(writes[writes.length - 1]).toBe(KEYS.ENTER);
     expect(warnSpy).not.toHaveBeenCalled();
+  });
+});
+
+describe('injectMessage — verified submit (Enter retry)', () => {
+  // Regression guard for the 2026-07-01 incident: Claude Code renders large
+  // pastes as an async "[Pasted text #N]" placeholder; under load the fixed
+  // enterDelay elapsed before placeholder registration, the Enter landed on
+  // an empty composer, and Telegram messages sat unsubmitted for hours.
+  beforeEach(() => { vi.useFakeTimers(); });
+  afterEach(() => { vi.useRealTimers(); });
+
+  const countEnters = (writes: string[]) => writes.filter(w => w === KEYS.ENTER).length;
+
+  it('re-sends Enter when PTY output stays silent after the first Enter', () => {
+    const writes: string[] = [];
+    const write = (data: string) => { writes.push(data); };
+    let outputBytes = 0;
+    const logs: string[] = [];
+
+    injectMessage(write, 'long research message', 300, {
+      getOutputBytes: () => outputBytes,
+      log: (m) => logs.push(m),
+    });
+
+    vi.advanceTimersByTime(300); // first Enter
+    expect(countEnters(writes)).toBe(1);
+
+    // No output growth → first retry at +4000ms
+    vi.advanceTimersByTime(4000);
+    expect(countEnters(writes)).toBe(2);
+    expect(logs.some(l => l.includes('re-sending Enter'))).toBe(true);
+
+    // Retry worked — big repaint burst. No further Enters.
+    outputBytes += 5000;
+    vi.advanceTimersByTime(120000);
+    expect(countEnters(writes)).toBe(2);
+  });
+
+  it('does not retry when the submit produced output', () => {
+    const writes: string[] = [];
+    const write = (data: string) => { writes.push(data); };
+    let outputBytes = 0;
+
+    injectMessage(write, 'hi', 300, { getOutputBytes: () => outputBytes });
+
+    vi.advanceTimersByTime(300); // Enter sent
+    outputBytes += 5000;         // turn started streaming
+    vi.advanceTimersByTime(120000);
+    expect(countEnters(writes)).toBe(1);
+  });
+
+  it('gives up after bounded retries and logs exhaustion', () => {
+    const writes: string[] = [];
+    const write = (data: string) => { writes.push(data); };
+    const logs: string[] = [];
+
+    injectMessage(write, 'msg', 300, {
+      getOutputBytes: () => 0,
+      log: (m) => logs.push(m),
+    });
+
+    vi.advanceTimersByTime(300);
+    vi.advanceTimersByTime(120000);
+    expect(countEnters(writes)).toBe(4); // initial + 3 retries
+    expect(logs.some(l => l.includes('retries exhausted'))).toBe(true);
+  });
+
+  it('fires onFailed when retries exhaust with zero output (dedup un-poisoning)', () => {
+    const write = () => { /* pty accepts writes but agent never repaints */ };
+    const onFailed = vi.fn();
+
+    injectMessage(write, 'msg', 300, {
+      getOutputBytes: () => 0,
+      onFailed,
+    });
+
+    vi.advanceTimersByTime(300);
+    expect(onFailed).not.toHaveBeenCalled(); // still retrying
+    vi.advanceTimersByTime(120000);
+    expect(onFailed).toHaveBeenCalledTimes(1);
+  });
+
+  it('fires onFailed when the deferred Enter write throws (PTY teardown)', () => {
+    let ptyAlive = true;
+    const write = (_: string) => {
+      if (!ptyAlive) throw new TypeError('null.write');
+    };
+    const onFailed = vi.fn();
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    injectMessage(write, 'msg', 300, { getOutputBytes: () => 0, onFailed });
+    ptyAlive = false;
+    vi.advanceTimersByTime(300);
+    expect(onFailed).toHaveBeenCalledTimes(1);
+    warnSpy.mockRestore();
+  });
+
+  it('does not fire onFailed on a successful verified submit', () => {
+    const write = () => { /* ok */ };
+    let outputBytes = 0;
+    const onFailed = vi.fn();
+
+    injectMessage(write, 'msg', 300, { getOutputBytes: () => outputBytes, onFailed });
+    vi.advanceTimersByTime(300);
+    outputBytes += 5000; // turn started
+    vi.advanceTimersByTime(120000);
+    expect(onFailed).not.toHaveBeenCalled();
+  });
+
+  it('scales the default enterDelay with content size', () => {
+    const writes: string[] = [];
+    const write = (data: string) => { writes.push(data); };
+
+    injectMessage(write, 'x'.repeat(2000)); // no explicit delay → 900 + 1000 = 1900ms
+    vi.advanceTimersByTime(899);
+    expect(countEnters(writes)).toBe(0);
+    vi.advanceTimersByTime(1100); // 1999ms total
+    expect(countEnters(writes)).toBe(1);
   });
 });

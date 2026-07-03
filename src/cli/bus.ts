@@ -19,8 +19,11 @@ import { addCron, removeCron, readCrons, updateCron as updateCronDef, getCronByN
 import { nextFireFromCron } from '../daemon/cron-scheduler.js';
 import { queryKnowledgeBase, ingestKnowledgeBase, ensureKBDirs } from '../bus/knowledge-base.js';
 import { checkUsageApi, refreshOAuthToken, rotateOAuth, loadAccounts, ALERT_5H, ALERT_7D } from '../bus/oauth.js';
+import { listAgents } from '../bus/agents.js';
+import { generateAgentKey, KEY_FILENAME } from '../bus/keys.js';
 import { resolvePaths } from '../utils/paths.js';
 import { resolveEnv } from '../utils/env.js';
+import { stripBom } from '../utils/strip-bom.js';
 import { IPCClient } from '../daemon/ipc-server.js';
 import { TelegramAPI } from '../telegram/api.js';
 import { logOutboundMessage, cacheLastSent } from '../telegram/logging.js';
@@ -970,7 +973,8 @@ busCommand
       const { join } = require('path');
       const agentEnv = join(env.agentDir, '.env');
       if (existsSync(agentEnv)) {
-        const content = readFileSync(agentEnv, 'utf-8');
+        // stripBom: a BOM'd .env with BOT_TOKEN on line 1 breaks /^KEY=/m (2026-05-16 class)
+        const content = stripBom(readFileSync(agentEnv, 'utf-8'));
         const match = content.match(/^BOT_TOKEN=(.+)$/m);
         if (match && match[1].trim()) botToken = match[1].trim();
       }
@@ -1048,7 +1052,8 @@ busCommand
       const { join } = require('path');
       const agentEnv = join(env.agentDir, '.env');
       if (existsSync(agentEnv)) {
-        const content = readFileSync(agentEnv, 'utf-8');
+        // stripBom: a BOM'd .env with BOT_TOKEN on line 1 breaks /^KEY=/m (2026-05-16 class)
+        const content = stripBom(readFileSync(agentEnv, 'utf-8'));
         const match = content.match(/^BOT_TOKEN=(.+)$/m);
         if (match && match[1].trim()) botToken = match[1].trim();
       }
@@ -1303,7 +1308,7 @@ busCommand
       const { readFileSync, existsSync } = require('fs');
       const agentEnv = require('path').join(env.agentDir, '.env');
       if (existsSync(agentEnv)) {
-        const match = readFileSync(agentEnv, 'utf-8').match(/^BOT_TOKEN=(.+)$/m);
+        const match = stripBom(readFileSync(agentEnv, 'utf-8')).match(/^BOT_TOKEN=(.+)$/m);
         if (match?.[1]?.trim()) botToken = match[1].trim();
       }
     }
@@ -1342,7 +1347,7 @@ busCommand
       const { readFileSync, existsSync } = require('fs');
       const agentEnv = require('path').join(env.agentDir, '.env');
       if (existsSync(agentEnv)) {
-        const match = readFileSync(agentEnv, 'utf-8').match(/^BOT_TOKEN=(.+)$/m);
+        const match = stripBom(readFileSync(agentEnv, 'utf-8')).match(/^BOT_TOKEN=(.+)$/m);
         if (match?.[1]?.trim()) botToken = match[1].trim();
       }
     }
@@ -2538,6 +2543,38 @@ busCommand
   });
 
 busCommand
+  .command('provision-keys')
+  .description('Provision per-agent bus signing keys for all registered agents (idempotent — existing keys are never rotated)')
+  .action(() => {
+    const env = resolveEnv();
+    if (!env.frameworkRoot) {
+      console.error('CTX_FRAMEWORK_ROOT is required for provision-keys');
+      process.exit(1);
+    }
+    let created = 0;
+    let skipped = 0;
+    for (const agent of listAgents(env.ctxRoot)) {
+      const agentDir = join(env.frameworkRoot, 'orgs', agent.org, 'agents', agent.name);
+      // Stale enabled-agents.json entries (no dir on disk) and pseudo-agents
+      // like 'dashboard' have no agent directory — never provision those.
+      if (!agent.org || !existsSync(agentDir)) {
+        console.log(`skipped ${agent.name} (no agent directory)`);
+        continue;
+      }
+      const existed = existsSync(join(agentDir, KEY_FILENAME));
+      generateAgentKey(agentDir);
+      if (existed) {
+        skipped++;
+        console.log(`skipped ${agent.name} (key exists)`);
+      } else {
+        created++;
+        console.log(`created ${agent.name}`);
+      }
+    }
+    console.log(`Done: ${created} created, ${skipped} already provisioned`);
+  });
+
+busCommand
   .command('list-oauth-accounts')
   .description('List all OAuth accounts and their utilization')
   .action((opts: Record<string, unknown>) => {
@@ -2594,7 +2631,7 @@ busCommand
       const agentDir = process.env.CTX_AGENT_DIR || process.cwd();
       const envPath = join(agentDir, '.env');
       if (existsSync(envPath)) {
-        const envContent = readFileSync(envPath, 'utf-8');
+        const envContent = stripBom(readFileSync(envPath, 'utf-8'));
         const botTokenMatch = envContent.match(/^BOT_TOKEN=(.+)$/m);
         const chatIdMatch = envContent.match(/^CHAT_ID=(.+)$/m);
         if (botTokenMatch && chatIdMatch) {

@@ -339,7 +339,20 @@ export class AgentProcess {
       return { ok: false, code: 'DEDUPED', message: `inject for "${this.name}" deduped — content matches MessageDedup hash window` };
     }
 
-    injectMessage((data) => this.pty?.write(data), content);
+    const buffer = this.pty.getOutputBuffer();
+    injectMessage((data) => this.pty?.write(data), content, undefined, {
+      getOutputBytes: () => buffer.getTotalBytes(),
+      log: (msg) => this.log(msg),
+      // Dedup un-poisoning: the hash above was recorded BEFORE the async
+      // Enter landed. If the submit verifiably failed (Enter write threw, or
+      // all verify retries saw zero output — the 2026-07-01/02 Enter-swallow
+      // class), forget the hash so a re-send of the identical content is not
+      // silently DEDUPED into permanent message loss.
+      onFailed: () => {
+        this.log('Inject submit failed — forgetting dedup hash so a re-send can go through');
+        this.dedup.forget(content);
+      },
+    });
     return { ok: true };
   }
 
