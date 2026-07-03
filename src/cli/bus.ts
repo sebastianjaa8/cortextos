@@ -22,7 +22,7 @@ import { checkUsageApi, refreshOAuthToken, rotateOAuth, loadAccounts, ALERT_5H, 
 import { listAgents } from '../bus/agents.js';
 import { generateAgentKey, KEY_FILENAME } from '../bus/keys.js';
 import { resolvePaths } from '../utils/paths.js';
-import { resolveEnv } from '../utils/env.js';
+import { resolveEnv, resolveTargetAgentDir } from '../utils/env.js';
 import { stripBom } from '../utils/strip-bom.js';
 import { IPCClient } from '../daemon/ipc-server.js';
 import { TelegramAPI } from '../telegram/api.js';
@@ -816,7 +816,24 @@ busCommand
   .option('--cycle <name>', 'Cycle name')
   .action((action: string, agent: string, opts: { metric?: string; metricType?: string; surface?: string; direction?: string; window?: string; measurement?: string; loopInterval?: string; enabled?: string; cycle?: string }) => {
     const env = resolveEnv();
-    const agentDir = env.agentDir || process.cwd();
+    // Cycles live in the TARGET agent's experiments/config.json — the file
+    // the autoresearch skill reads in that agent's session. Writing to the
+    // caller's dir instead silently created a second registry the target
+    // never reads.
+    let agentDir: string | null = null;
+    try {
+      agentDir = resolveTargetAgentDir(env, agent);
+    } catch (err) {
+      console.error((err as Error).message);
+      process.exit(1);
+    }
+    if (!agentDir && agent === env.agentName) {
+      agentDir = env.agentDir || process.cwd();
+    }
+    if (!agentDir) {
+      console.error(`Cannot resolve agent directory for '${agent}'. Cycles are stored in the target agent's experiments/config.json — check the agent name.`);
+      process.exit(1);
+    }
     if (opts.direction && opts.direction !== 'higher' && opts.direction !== 'lower') {
       console.error(`Invalid --direction '${opts.direction}'. Must be 'higher' or 'lower'`);
       process.exit(1);

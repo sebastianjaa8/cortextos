@@ -43,8 +43,6 @@ const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
 class MockCodexServer {
   constructor(options = {}) {
     this.socketPath = options.socketPath;
-    this.host = options.host || '127.0.0.1';
-    this.port = options.port;
     this.skills = options.skills || [];
     this.tokenUsage = options.tokenUsage || {
       cachedInputTokens: 0,
@@ -67,27 +65,16 @@ class MockCodexServer {
 
   async listen() {
     if (this.server) return;
-    if (this.socketPath) {
-      try { await unlink(this.socketPath); } catch { /* ok */ }
-    }
+    try { await unlink(this.socketPath); } catch { /* ok */ }
 
     const server = net.createServer((socket) => this._handleConnection(socket));
     this.server = server;
     await new Promise((resolve, reject) => {
       server.once('error', reject);
-      const onListen = () => {
+      server.listen(this.socketPath, () => {
         server.off('error', reject);
-        const address = server.address();
-        if (address && typeof address === 'object') {
-          this.port = address.port;
-        }
         resolve();
-      };
-      if (this.socketPath) {
-        server.listen(this.socketPath, onListen);
-      } else {
-        server.listen(this.port || 0, this.host, onListen);
-      }
+      });
     });
   }
 
@@ -102,9 +89,7 @@ class MockCodexServer {
       this.server = null;
       await new Promise((resolve) => server.close(() => resolve()));
     }
-    if (this.socketPath) {
-      try { await unlink(this.socketPath); } catch { /* ok */ }
-    }
+    try { await unlink(this.socketPath); } catch { /* ok */ }
   }
 
   /** Force the next inbound request (any method) to respond with a JSON-RPC error. */
@@ -359,36 +344,25 @@ if (require.main === module) {
     process.exit(1);
   }
   let socketPath = null;
-  let host = '127.0.0.1';
-  let port = null;
   for (let i = 1; i < args.length; i += 1) {
     if (args[i] === '--listen' && args[i + 1]) {
       const value = args[i + 1];
-      if (value.startsWith('ws://')) {
-        const url = new URL(value);
-        host = url.hostname;
-        port = Number(url.port);
-      } else {
-        const match = value.match(/^unix:\/\/(?:\.\/)?(.+)$/);
-        socketPath = match ? match[1] : value;
-      }
+      const match = value.match(/^unix:\/\/(?:\.\/)?(.+)$/);
+      socketPath = match ? match[1] : value;
       i += 1;
     }
   }
-  if (!socketPath && !port) {
-    console.error('mock-codex: --listen unix://./<socket> or ws://host:port is required');
+  if (!socketPath) {
+    console.error('mock-codex: --listen unix://./<socket> is required');
     process.exit(1);
   }
   const cwd = process.cwd();
   const path = require('path');
-  const resolved = socketPath
-    ? (path.isAbsolute(socketPath) ? socketPath : path.join(cwd, socketPath))
-    : null;
+  const resolved = path.isAbsolute(socketPath) ? socketPath : path.join(cwd, socketPath);
 
-  const server = new MockCodexServer({ socketPath: resolved, host, port });
+  const server = new MockCodexServer({ socketPath: resolved });
   server.listen().then(() => {
-    const endpoint = resolved || `ws://${host}:${server.port}`;
-    process.stdout.write(`[codex-app-server] ready socket=${endpoint}\n`);
+    process.stdout.write(`[codex-app-server] ready socket=${resolved}\n`);
   }).catch((err) => {
     console.error(`mock-codex: listen failed: ${err.message}`);
     process.exit(1);

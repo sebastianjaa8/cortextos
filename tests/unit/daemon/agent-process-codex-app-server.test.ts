@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { join } from 'path';
 
 let capturedOnExit: ((exitCode: number, signal?: number) => void) | null = null;
 
@@ -141,7 +142,7 @@ describe('AgentProcess codex-app-server runtime', () => {
     expect(sendMessage).toHaveBeenCalledWith('12345', 'Agent codex-app-agent is back online');
   });
 
-  it('skips back-online Telegram on handoff restart (issue #392)', async () => {
+  it('sends planned-restart msg1 but skips generic back-online Telegram on handoff restart', async () => {
     // Simulate handoff doc marker present at .handoff-doc-path so
     // consumeHandoffBlock() returns a non-empty fragment, marking the spawn
     // as a handoff restart that should suppress the daemon-direct ping.
@@ -163,7 +164,10 @@ describe('AgentProcess codex-app-server runtime', () => {
 
     const prompt = mockCodexAppServerPty.spawn.mock.calls[0]?.[1] ?? '';
     expect(prompt).toContain('CONTEXT HANDOFF');
-    expect(sendMessage).not.toHaveBeenCalled();
+    expect(sendMessage).toHaveBeenCalledWith('12345', '🔄 codex-app-agent restarted (planned): no reason given');
+    expect(sendMessage).not.toHaveBeenCalledWith('12345', 'Agent codex-app-agent is back online');
+    expect(sendMessage).not.toHaveBeenCalledWith('12345', 'Agent codex-app-agent is back online (context handoff)');
+    expect(sendMessage).toHaveBeenCalledTimes(1);
   });
 
   it('does not send daemon-direct back-online Telegram for claude-code runtime (issue #392)', async () => {
@@ -204,7 +208,7 @@ describe('AgentProcess codex-app-server runtime', () => {
     // exit_code=0 in a crash loop (2026-05-09, 05-14, 05-16). The runtime gate
     // means: codex-app-server checks ITS OWN thread state file, never the
     // Claude conversation dir.
-    const codexThreadPath = '/tmp/test-ctx/state/codex-app-agent/codex-app-server-thread.json';
+    const codexThreadPath = join('/tmp/test-ctx', 'state', 'codex-app-agent', 'codex-app-server-thread.json');
 
     // Stale Claude JSONL present but no codex-app-server thread state → fresh.
     fsMocks.existsSync.mockImplementation((path: string) => {
@@ -228,4 +232,3 @@ describe('AgentProcess codex-app-server runtime', () => {
     expect(mockCodexAppServerPty.spawn).toHaveBeenLastCalledWith('continue', expect.any(String));
   });
 });
-

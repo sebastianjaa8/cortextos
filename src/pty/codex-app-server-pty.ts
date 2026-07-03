@@ -1,8 +1,7 @@
 import { appendFileSync, existsSync, readFileSync, unlinkSync, writeFileSync } from 'fs';
-import { join, delimiter, isAbsolute } from 'path';
-import { homedir, platform } from 'os';
+import { join } from 'path';
+import { homedir } from 'os';
 import { randomBytes } from 'crypto';
-import { Socket, createConnection } from 'net';
 import type { AgentConfig, CtxEnv } from '../types/index.js';
 import { OutputBuffer } from './output-buffer.js';
 import type { TelegramAPI } from '../telegram/api.js';
@@ -40,13 +39,6 @@ interface SocketPointer {
   fallback: boolean;
   reason?: string;
   updatedAt: string;
-}
-
-type AppServerTransport = 'unix' | 'ws';
-
-interface CodexCommand {
-  file: string;
-  argsPrefix: string[];
 }
 
 interface ThreadResponse {
@@ -104,6 +96,7 @@ const LOCAL_SLASH_COMMANDS = new Set(['goal']);
 export class CodexAppServerPTY {
   private _alive = false;
   private _executing = false;
+  private _activeTurnId: string | null = null;
   private _writeBuffer = '';
   private _turnQueue: unknown[][] = [];
   private _turnCompletion: {
@@ -123,7 +116,6 @@ export class CodexAppServerPTY {
   private _socketPath: string;
   private _socketListenArg: string;
   private _socketCwd: string;
-  private _socketTransport: AppServerTransport;
   private _threadStatePath: string;
   private _socketPointerPath: string;
   private _threadId: string | null = null;
@@ -142,7 +134,6 @@ export class CodexAppServerPTY {
     this._socketPath = socket.path;
     this._socketListenArg = socket.listenArg;
     this._socketCwd = socket.cwd;
-    this._socketTransport = socket.transport;
     this._outputBuffer = new OutputBuffer(1000, logPath, BOOTSTRAP_PATTERN);
   }
 
@@ -192,6 +183,7 @@ export class CodexAppServerPTY {
 
   kill(): void {
     this._alive = false;
+    this._activeTurnId = null;
     this._turnQueue = [];
     this.rejectTurnCompletion(new Error('Codex app-server stopped'));
     if (this._rpc) {
@@ -399,48 +391,6 @@ export class CodexAppServerPTY {
     return { type: 'set', objective };
   }
 
-  private resolveCodexCommand(): CodexCommand {
-    const explicit = process.env.CODEX_BINARY;
-    if (explicit && existsSync(explicit)) return { file: explicit, argsPrefix: [] };
-
-    const isWin = platform() === 'win32';
-    if (isWin) {
-      const codexJs = this.resolveWindowsCodexJs();
-      if (codexJs) return { file: process.execPath, argsPrefix: [codexJs] };
-    }
-
-    const candidates = isWin ? ['codex.cmd', 'codex.exe', 'codex.bat', 'codex'] : ['codex'];
-
-    const pathDirs = (process.env.PATH || '').split(delimiter).filter(Boolean);
-    for (const dir of pathDirs) {
-      for (const name of candidates) {
-        const full = join(dir, name);
-        if (existsSync(full)) return { file: full, argsPrefix: [] };
-      }
-    }
-
-    if (isWin) {
-      const fallback = join(homedir(), 'AppData', 'Roaming', 'npm', 'codex.cmd');
-      if (existsSync(fallback)) return { file: fallback, argsPrefix: [] };
-    }
-
-    return { file: 'codex', argsPrefix: [] };
-  }
-
-  private resolveWindowsCodexJs(): string | null {
-    const explicit = process.env.CODEX_JS;
-    if (explicit && existsSync(explicit)) return explicit;
-
-    const pathDirs = (process.env.PATH || '').split(delimiter).filter(Boolean);
-    for (const dir of pathDirs) {
-      const candidate = join(dir, 'node_modules', '@openai', 'codex', 'bin', 'codex.js');
-      if (existsSync(candidate)) return candidate;
-    }
-
-    const fallback = join(homedir(), 'AppData', 'Roaming', 'npm', 'node_modules', '@openai', 'codex', 'bin', 'codex.js');
-    return existsSync(fallback) ? fallback : null;
-  }
-
   private async startAppServerWithRetry(): Promise<void> {
     const delays = [1000, 4000, 16000];
     let lastErr: unknown;
@@ -471,12 +421,7 @@ export class CodexAppServerPTY {
       }
 
       const spawnFn = this._spawnFn!;
-      const codexCommand = this.resolveCodexCommand();
-      if (!isAbsolute(codexCommand.file)) {
-        this._outputBuffer.push(`[codex-app-server] WARNING: codex binary not resolved to absolute path, spawn may fail. Got: ${codexCommand.file}\n`);
-      }
-      const pty = spawnFn(codexCommand.file, [
-        ...codexCommand.argsPrefix,
+      const pty = spawnFn('codex', [
         'app-server',
         '--enable', 'goals',
         '--listen', this._socketListenArg,
@@ -510,11 +455,10 @@ export class CodexAppServerPTY {
   private async waitForSocket(timeoutMs = 10000): Promise<void> {
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
-      if (this._socketTransport === 'unix' && existsSync(this._socketPath)) return;
-      if (this._socketTransport === 'ws' && await this.canConnectWebSocket()) return;
+      if (existsSync(this._socketPath)) return;
       await sleep(100);
     }
-    throw new Error(`Timed out waiting for app-server listener: ${this._socketPath}`);
+    throw new Error(`Timed out waiting for app-server socket: ${this._socketPath}`);
   }
 
   private async connectRpc(): Promise<void> {
@@ -536,25 +480,25 @@ export class CodexAppServerPTY {
   }
 
   private async startOrResumeThread(mode: 'fresh' | 'continue'): Promise<void> {
-    const persisted = this.readThreadState();
-    if (persisted) {
-      try {
-        const resumed = await this.request<ThreadResponse>('thread/resume', {
-          threadId: persisted.threadId,
-          cwd: this._cwd,
-          ...THREAD_PERMISSION_OVERRIDES,
-          config: { features: { goals: true } },
-          excludeTurns: true,
-          persistExtendedHistory: true,
-        });
-        this.setThreadId(resumed.result?.thread.id || persisted.threadId);
-        return;
-      } catch (err) {
-        this._outputBuffer.push(`[codex-app-server] persisted resume failed: ${err}\n`);
-      }
-    }
-
     if (mode === 'continue') {
+      const persisted = this.readThreadState();
+      if (persisted) {
+        try {
+          const resumed = await this.request<ThreadResponse>('thread/resume', {
+            threadId: persisted.threadId,
+            cwd: this._cwd,
+            ...THREAD_PERMISSION_OVERRIDES,
+            config: { features: { goals: true } },
+            excludeTurns: true,
+            persistExtendedHistory: true,
+          });
+          this.setThreadId(resumed.result?.thread.id || persisted.threadId);
+          return;
+        } catch (err) {
+          this._outputBuffer.push(`[codex-app-server] persisted resume failed: ${err}\n`);
+        }
+      }
+
       const latest = await this.findLatestThreadForCwd();
       if (latest) {
         const resumed = await this.request<ThreadResponse>('thread/resume', {
@@ -592,7 +536,46 @@ export class CodexAppServerPTY {
     return response.result?.data?.[0]?.id || null;
   }
 
+  /**
+   * Mid-turn parity with the Claude PTY-injection path: while a turn is
+   * executing, try `turn/steer` so the message lands in the active turn at the
+   * next model step instead of waiting for turn/completed. Any steer rejection
+   * (ExpectedTurnMismatch = turn just ended, ActiveTurnNotSteerable =
+   * review/compact, NoActiveTurn, transport error) falls back to the queue, so
+   * no message is ever lost. CODEX_STEER_DISABLED=1 reverts to pure queueing.
+   */
   private queueTurn(input: unknown[]): void {
+    if (this._executing && this._activeTurnId && process.env.CODEX_STEER_DISABLED !== '1') {
+      this.steerActiveTurn(input).catch((err) => {
+        this._outputBuffer.push(`[codex-app-server] steer path failed: ${err}\n`);
+      });
+      return;
+    }
+    this.enqueueTurn(input);
+  }
+
+  private async steerActiveTurn(input: unknown[]): Promise<void> {
+    const expectedTurnId = this._activeTurnId;
+    if (!this._threadId || !expectedTurnId) {
+      this.enqueueTurn(input);
+      return;
+    }
+    try {
+      await this.request('turn/steer', {
+        threadId: this._threadId,
+        expectedTurnId,
+        input,
+      });
+      this._outputBuffer.push(`[codex-app-server] steered active turn ${expectedTurnId}\n`);
+    } catch (err) {
+      // Do not retry steer here: the rejection may be a non-steerable turn
+      // (review/compact). Queueing guarantees delivery right after it ends.
+      this._outputBuffer.push(`[codex-app-server] steer rejected, queueing: ${err}\n`);
+      this.enqueueTurn(input);
+    }
+  }
+
+  private enqueueTurn(input: unknown[]): void {
     this._turnQueue.push(input);
     if (!this._executing) {
       this.drainQueue().catch((err) => {
@@ -717,10 +700,14 @@ export class CodexAppServerPTY {
         }
         break;
       case 'turn/started':
+        if (isRecord(params.turn) && typeof params.turn.id === 'string') {
+          this._activeTurnId = params.turn.id;
+        }
         this.maybeFireTyping();
         this._outputBuffer.push('[codex-app-server] turn started\n');
         break;
       case 'turn/completed':
+        this._activeTurnId = null;
         this.writeIdleFlag();
         this._outputBuffer.push('[codex-app-server] turn completed\n');
         this.resolveTurnCompletion();
@@ -750,6 +737,7 @@ export class CodexAppServerPTY {
         this._outputBuffer.push('[goal] cleared\n');
         break;
       case 'error':
+        this._activeTurnId = null;
         this._outputBuffer.push(`[codex-app-server] error: ${JSON.stringify(params)}\n`);
         this.rejectTurnCompletion(new Error(JSON.stringify(params)));
         break;
@@ -841,34 +829,38 @@ export class CodexAppServerPTY {
    * monitor. Writes atomically; failures are non-fatal (observability only).
    *
    * Mapping (per codex schema ThreadTokenUsageUpdatedNotification):
-   *   - used_percentage = total.totalTokens / cap * 100  (clamped to [0, 100])
+   *   - used_percentage = last.totalTokens / cap * 100  (clamped to [0, 100])
    *   - context_window_size = modelContextWindow ?? config.codex_context_cap ?? 256000
-   *   - exceeds_200k_tokens = total.totalTokens > 200000
-   *   - current_usage.{input,output,cache_read} from total.{input,output,cachedInput}Tokens
+   *   - exceeds_200k_tokens = last.totalTokens > 200000
+   *   - current_usage.{input,output,cache_read} from last.{input,output,cachedInput}Tokens
    *   - session_id = current threadId
+   *
+   * `total` is lifetime cumulative across the app-server thread and can grow far
+   * beyond the active model window. Context handoff must use the current window
+   * occupancy (`last`) so long-lived threads do not report false 100%.
    */
   private writeContextStatus(params: Record<string, unknown>): void {
     const tokenUsage = isRecord(params.tokenUsage) ? params.tokenUsage : null;
     if (!tokenUsage) return;
-    const total = isRecord(tokenUsage.total) ? tokenUsage.total : null;
-    if (!total) return;
-    const totalTokens = typeof total.totalTokens === 'number' ? total.totalTokens : null;
-    if (totalTokens === null) return;
+    const current = isRecord(tokenUsage.last) ? tokenUsage.last : null;
+    const currentTokens = current && typeof current.totalTokens === 'number' ? current.totalTokens : null;
 
     const modelContextWindow = typeof tokenUsage.modelContextWindow === 'number'
       ? tokenUsage.modelContextWindow
       : null;
     const cap = modelContextWindow ?? this._config.codex_context_cap ?? 256000;
-    const usedPct = cap > 0 ? Math.min(100, (totalTokens / cap) * 100) : null;
+    const usedPct = cap > 0 && currentTokens !== null
+      ? Math.min(100, (currentTokens / cap) * 100)
+      : null;
 
-    const inputTokens = typeof total.inputTokens === 'number' ? total.inputTokens : 0;
-    const outputTokens = typeof total.outputTokens === 'number' ? total.outputTokens : 0;
-    const cachedInputTokens = typeof total.cachedInputTokens === 'number' ? total.cachedInputTokens : 0;
+    const inputTokens = current && typeof current.inputTokens === 'number' ? current.inputTokens : 0;
+    const outputTokens = current && typeof current.outputTokens === 'number' ? current.outputTokens : 0;
+    const cachedInputTokens = current && typeof current.cachedInputTokens === 'number' ? current.cachedInputTokens : 0;
 
     const payload = JSON.stringify({
       used_percentage: usedPct,
       context_window_size: cap,
-      exceeds_200k_tokens: totalTokens > 200000,
+      exceeds_200k_tokens: currentTokens !== null ? currentTokens > 200000 : false,
       current_usage: {
         input_tokens: inputTokens,
         output_tokens: outputTokens,
@@ -931,16 +923,10 @@ export class CodexAppServerPTY {
     }
   }
 
-  private resolveSocketPath(): { path: string; listenArg: string; cwd: string; transport: AppServerTransport } {
-    if (platform() === 'win32') {
-      const port = 47000 + (randomBytes(2).readUInt16BE(0) % 10000);
-      const endpoint = `ws://127.0.0.1:${port}`;
-      return { path: endpoint, listenArg: endpoint, cwd: this._stateDir, transport: 'ws' };
-    }
-
+  private resolveSocketPath(): { path: string; listenArg: string; cwd: string } {
     const defaultPath = join(this._stateDir, SOCKET_BASENAME);
     if (Buffer.byteLength(defaultPath) < SOCKET_PATH_WARN_BYTES) {
-      return { path: defaultPath, listenArg: `unix://./${SOCKET_BASENAME}`, cwd: this._stateDir, transport: 'unix' };
+      return { path: defaultPath, listenArg: `unix://./${SOCKET_BASENAME}`, cwd: this._stateDir };
     }
 
     const fallbackBasename = `cas-${randomBytes(4).toString('hex')}.sock`;
@@ -957,37 +943,15 @@ export class CodexAppServerPTY {
     } catch {
       // Non-fatal; spawn will still use fallback path.
     }
-    return { path: fallback, listenArg: `unix://./${fallbackBasename}`, cwd: '/tmp', transport: 'unix' };
+    return { path: fallback, listenArg: `unix://./${fallbackBasename}`, cwd: '/tmp' };
   }
 
   private removeSocket(): void {
-    if (this._socketTransport !== 'unix') return;
     try {
       if (existsSync(this._socketPath)) unlinkSync(this._socketPath);
     } catch {
       // Ignore stale socket cleanup failures.
     }
-  }
-
-  private canConnectWebSocket(): Promise<boolean> {
-    return new Promise((resolve) => {
-      const url = new URL(this._socketPath);
-      const socket: Socket = createConnection({
-        host: url.hostname,
-        port: Number(url.port),
-      });
-      let settled = false;
-      const finish = (ready: boolean) => {
-        if (settled) return;
-        settled = true;
-        socket.removeAllListeners();
-        socket.destroy();
-        resolve(ready);
-      };
-      socket.once('connect', () => finish(true));
-      socket.once('error', () => finish(false));
-      socket.setTimeout(100, () => finish(false));
-    });
   }
 
   private cleanupSpawnAttempt(): void {
@@ -1022,15 +986,7 @@ export class CodexAppServerPTY {
   private buildEnv(): Record<string, string> {
     const env: Record<string, string> = {};
 
-    const keepVars = [
-      'PATH', 'HOME', 'USER', 'SHELL', 'TERM', 'LANG', 'LC_ALL',
-      'TMPDIR', 'TEMP', 'TMP',
-      'NODE_PATH', 'COMSPEC', 'USERPROFILE',
-      'SystemDrive', 'SystemRoot', 'windir',
-      'APPDATA', 'LOCALAPPDATA', 'ProgramData', 'ALLUSERSPROFILE',
-      'ProgramFiles', 'ProgramFiles(x86)', 'ProgramW6432',
-      'HOMEDRIVE', 'HOMEPATH', 'PUBLIC',
-    ];
+    const keepVars = ['PATH', 'HOME', 'USER', 'SHELL', 'TERM', 'LANG', 'LC_ALL', 'TMPDIR'];
     for (const key of keepVars) {
       if (process.env[key]) env[key] = process.env[key]!;
     }
@@ -1052,10 +1008,6 @@ export class CodexAppServerPTY {
     if (this._config.timezone) {
       env['CTX_TIMEZONE'] = this._config.timezone;
       env['TZ'] = this._config.timezone;
-    }
-    if (platform() === 'win32') {
-      if (!env['LANG']) env['LANG'] = 'en_US.UTF-8';
-      if (!env['LC_ALL']) env['LC_ALL'] = 'en_US.UTF-8';
     }
 
     return env;

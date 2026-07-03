@@ -32,13 +32,12 @@ interface PendingRequest {
 }
 
 /**
- * Minimal WebSocket JSON-RPC client for Codex app-server.
+ * Minimal WebSocket-over-Unix JSON-RPC client.
  *
- * Codex app-server's `unix://` and `ws://` transports are WebSocket-framed.
- * The JSON-RPC payloads inside text frames are newline-delimited, matching
- * the stdio transport after the WebSocket layer is removed. This helper
- * intentionally uses Node built-ins only so the app-server adapter adds no
- * runtime deps.
+ * Codex app-server's `unix://` transport is WebSocket-framed. The JSON-RPC
+ * payloads inside text frames are newline-delimited, matching the stdio
+ * transport after the WebSocket layer is removed. This helper intentionally
+ * uses Node built-ins only so the app-server adapter adds no runtime deps.
  */
 export class WsUnixJsonRpcClient {
   private socket: Socket | null = null;
@@ -47,22 +46,21 @@ export class WsUnixJsonRpcClient {
   private pending = new Map<number | string, PendingRequest>();
   private handlers: MessageHandler[] = [];
 
-  constructor(private readonly endpoint: string) {}
+  constructor(private readonly socketPath: string) {}
 
   async connect(): Promise<void> {
     if (this.socket) return;
 
-    const socket = this.createSocket();
+    const socket = createConnection(this.socketPath);
     await new Promise<void>((resolve, reject) => {
       socket.once('connect', resolve);
       socket.once('error', reject);
     });
 
     const key = randomBytes(16).toString('base64');
-    const { path, host } = this.websocketRequestTarget();
     socket.write([
-      `GET ${path} HTTP/1.1`,
-      `Host: ${host}`,
+      'GET / HTTP/1.1',
+      'Host: localhost',
       'Upgrade: websocket',
       'Connection: Upgrade',
       `Sec-WebSocket-Key: ${key}`,
@@ -90,7 +88,7 @@ export class WsUnixJsonRpcClient {
     socket.on('data', (chunk) => this.parseFrames(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
     socket.on('error', (err) => this.rejectAll(err));
     socket.on('close', () => {
-      this.rejectAll(new Error('WebSocket socket closed'));
+      this.rejectAll(new Error('WebSocket Unix socket closed'));
       this.socket = null;
     });
 
@@ -109,7 +107,7 @@ export class WsUnixJsonRpcClient {
         socket.destroy();
       }
     }
-    this.rejectAll(new Error('WebSocket socket closed'));
+    this.rejectAll(new Error('WebSocket Unix socket closed'));
   }
 
   onMessage(handler: MessageHandler): () => void {
@@ -121,7 +119,7 @@ export class WsUnixJsonRpcClient {
 
   request<T = unknown>(method: string, params?: unknown, timeoutMs = 30000): Promise<JsonRpcResponse<T>> {
     if (!this.socket || this.socket.destroyed) {
-      return Promise.reject(new Error('WebSocket socket is not connected'));
+      return Promise.reject(new Error('WebSocket Unix socket is not connected'));
     }
 
     const id = this.nextId++;
@@ -154,29 +152,9 @@ export class WsUnixJsonRpcClient {
 
   private send(message: JsonRpcMessage): void {
     if (!this.socket || this.socket.destroyed) {
-      throw new Error('WebSocket socket is not connected');
+      throw new Error('WebSocket Unix socket is not connected');
     }
     this.socket.write(this.encodeFrame(`${JSON.stringify(message)}\n`));
-  }
-
-  private createSocket(): Socket {
-    if (!this.endpoint.startsWith('ws://')) {
-      return createConnection(this.endpoint);
-    }
-    const url = new URL(this.endpoint);
-    return createConnection({
-      host: url.hostname,
-      port: Number(url.port),
-    });
-  }
-
-  private websocketRequestTarget(): { path: string; host: string } {
-    if (!this.endpoint.startsWith('ws://')) {
-      return { path: '/', host: 'localhost' };
-    }
-    const url = new URL(this.endpoint);
-    const path = `${url.pathname || '/'}${url.search}`;
-    return { path, host: url.port ? `${url.hostname}:${url.port}` : url.hostname };
   }
 
   private readHandshake(socket: Socket): Promise<{ header: string; leftover: Buffer }> {

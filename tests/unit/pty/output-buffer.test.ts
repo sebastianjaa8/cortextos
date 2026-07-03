@@ -135,4 +135,18 @@ describe('OutputBuffer redaction', () => {
     expect(written).toContain(shortTokenLike);
     expect(written).not.toContain('[REDACTED_JWT]');
   });
+
+  // getTotalBytes() backs inject.ts's verified-submit Enter retry (2026-07-01/02
+  // fix): the injector polls it to detect whether a submitted turn produced any
+  // PTY output. If this tracker regresses, the retry loop silently stops working.
+  it('getTotalBytes() accumulates raw pushed byte length across chunks', () => {
+    const buf = new OutputBuffer(1000, '/tmp/fake-stdout.log');
+    expect(buf.getTotalBytes()).toBe(0);
+
+    buf.push('hello');
+    expect(buf.getTotalBytes()).toBe(5);
+
+    buf.push(' world');
+    expect(buf.getTotalBytes()).toBe(11);
+  });
 });

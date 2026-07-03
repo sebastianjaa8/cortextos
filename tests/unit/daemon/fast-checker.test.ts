@@ -775,6 +775,21 @@ describe('FastChecker', () => {
       expect(result).toContain('=== TELEGRAM PHOTO from Alice (chat_id:999) ===');
       expect(result).toContain('local_file: /tmp/photo.jpg');
     });
+
+    it('preserves reply context for media messages', () => {
+      const result = FastChecker.formatTelegramPhotoMessage(
+        'Alice',
+        '999',
+        'what is this?',
+        '/tmp/photo.jpg',
+        'Code review done — full HTML breakdown attached.\n[document: hermes-review.html]',
+      );
+
+      expect(result).toContain('[Replying to: "Code review done — full HTML breakdown attached.\n[document: hermes-review.html]"]');
+      expect(result).toContain('caption:');
+      expect(result).toContain('what is this?');
+      expect(result).toContain('local_file: /tmp/photo.jpg');
+    });
   });
 
   describe('formatTelegramDocumentMessage', () => {
@@ -962,6 +977,108 @@ describe('FastChecker', () => {
       expect(agent.injectMessage).toHaveBeenCalledTimes(1);
       const injected = agent.injectMessage.mock.calls[0][0] as string;
       expect(injected).toContain('````');
+    });
+  });
+
+  // Truth table for the context-handoff observe-only-when-unset policy.
+  // ponytail: MERGE-DECISION (upstream-sync-2026-07-03) — upstream ships default-ON
+  // (60% handoff / 30% warn) with an opt-out via ctx_handoff_threshold <= 0. This fork
+  // kept the pre-merge behavior instead: with ctx_handoff_threshold unset,
+  // checkContextStatus returns before ANY action (warn or handoff), regardless of
+  // reported context %. Setting ctx_handoff_threshold explicitly opts an agent in and
+  // is honored at whatever value is configured (see fast-checker.ts getCtxThresholds()
+  // MERGE-DECISION comment for the full rationale — none of the 14 live
+  // orgs/*/agents/*/config.json set this key today).
+  describe('context-handoff observe-only-when-unset default (fork policy)', () => {
+    // Agent mock with the surface getCtxThresholds/checkContextStatus touch.
+    // getConfig() returns a stable reference so getCtxThresholds can mutate it
+    // from config.json the same way the real AgentProcess does.
+    function makeCtxAgent(name = 'ctx-agent') {
+      const config: any = {};
+      return {
+        name,
+        isBootstrapped: vi.fn().mockReturnValue(true),
+        injectMessage: vi.fn().mockReturnValue(true),
+        write: vi.fn(),
+        getAgentDir: () => testDir,
+        getConfig: () => config,
+        getOutputBuffer: () => ({ getRecent: () => '' }),
+        sessionRefresh: vi.fn().mockResolvedValue(undefined),
+      } as any;
+    }
+
+    function writeConfig(cfg: Record<string, unknown>) {
+      writeFileSync(join(testDir, 'config.json'), JSON.stringify(cfg), 'utf-8');
+    }
+
+    function writeCtxStatus(pct: number) {
+      writeFileSync(
+        join(paths.stateDir, 'context_status.json'),
+        JSON.stringify({ used_percentage: pct, exceeds_200k_tokens: false, written_at: new Date().toISOString() }),
+        'utf-8',
+      );
+    }
+
+    function injected(agent: any): string[] {
+      return agent.injectMessage.mock.calls.map((c: any[]) => c[0] as string);
+    }
+
+    it('unset threshold: getCtxThresholds still computes fallback values (warn 70 / handoff 80)', () => {
+      const agent = makeCtxAgent();
+      const checker = new FastChecker(agent, paths, '/tmp/framework');
+      writeConfig({});
+      expect((checker as any).getCtxThresholds()).toEqual({ warn: 70, handoff: 80 });
+    });
+
+    it('unset threshold: checkContextStatus never acts, even at 100% usage (observe-only)', async () => {
+      const agent = makeCtxAgent();
+      const checker = new FastChecker(agent, paths, '/tmp/framework');
+      writeConfig({});
+      writeCtxStatus(100);
+      await (checker as any).checkContextStatus();
+      expect(agent.injectMessage).not.toHaveBeenCalled();
+      expect((checker as any).ctxHandoffFiredAt).toBe(0);
+    });
+
+    it('explicit threshold opts an agent in and is honored', async () => {
+      const agent = makeCtxAgent();
+      const checker = new FastChecker(agent, paths, '/tmp/framework');
+      writeConfig({ ctx_handoff_threshold: 50 });
+      writeCtxStatus(55);
+      await (checker as any).checkContextStatus();
+      expect(injected(agent).some(m => m.includes('CONTEXT HANDOFF REQUIRED'))).toBe(true);
+      expect((checker as any).ctxHandoffFiredAt).toBeGreaterThan(0);
+    });
+
+    it('explicit threshold: just below it warns (not handoff) and names the trigger', async () => {
+      const agent = makeCtxAgent();
+      const checker = new FastChecker(agent, paths, '/tmp/framework');
+      writeConfig({ ctx_handoff_threshold: 50, ctx_warning_threshold: 40 });
+      writeCtxStatus(49);
+      await (checker as any).checkContextStatus();
+      const msgs = injected(agent);
+      expect(msgs.some(m => m.includes('CONTEXT HANDOFF REQUIRED'))).toBe(false);
+      expect(msgs.some(m => m.includes('Handoff triggers at 50%'))).toBe(true);
+      expect((checker as any).ctxHandoffFiredAt).toBe(0);
+    });
+
+    it('cooperative-restart loop backstop trips the breaker after repeated handoff fires', async () => {
+      // Treadmill simulation: a runtime that does not reset context on the handoff
+      // restart re-crosses the threshold every cycle. Each cycle is a fresh session
+      // (ctxHandoffFiredAt back to 0) but the persisted handoff-fire window accumulates.
+      // The first two fires hand off normally (a benign 1-2 settle); the third trips the
+      // circuit breaker (30min pause) instead of handing off again, so the loop self-limits.
+      const agent = makeCtxAgent();
+      const checker = new FastChecker(agent, paths, '/tmp/framework');
+      writeConfig({ ctx_handoff_threshold: 60 });
+      for (let i = 0; i < 3; i++) {
+        writeCtxStatus(70);
+        (checker as any).ctxHandoffFiredAt = 0; // simulate the fresh session re-crossing
+        await (checker as any).checkContextStatus();
+      }
+      const handoffPrompts = injected(agent).filter(m => m.includes('CONTEXT HANDOFF REQUIRED'));
+      expect(handoffPrompts.length).toBe(2); // 3rd fire tripped the breaker instead of handing off
+      expect((checker as any).ctxCircuitBrokenAt).not.toBeNull();
     });
   });
 });
