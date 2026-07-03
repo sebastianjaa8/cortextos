@@ -4,6 +4,7 @@ import { join, resolve } from 'path';
 import { homedir } from 'os';
 import { OrgContext } from '../types';
 import { validateAgentName, validateOrgName } from '../utils/validate';
+import { generateAgentKey } from '../bus/keys';
 
 const VALID_RUNTIMES = ['claude-code', 'hermes', 'codex-app-server'] as const;
 type RuntimeKind = typeof VALID_RUNTIMES[number];
@@ -177,6 +178,14 @@ export const addAgentCommand = new Command('add-agent')
       } catch (err) {
         console.error(`Warning: failed to set runtime field in config.json: ${(err as Error).message}`);
       }
+    }
+
+    // Generate the per-agent bus signing key at registration (idempotent —
+    // key-file existence is the marker, so template-copied keys are kept).
+    try {
+      generateAgentKey(agentDir);
+    } catch (err) {
+      console.error(`Warning: failed to generate bus signing key: ${(err as Error).message}`);
     }
 
     // Create .env placeholder with helpful comments

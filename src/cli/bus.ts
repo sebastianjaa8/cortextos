@@ -19,6 +19,8 @@ import { addCron, removeCron, readCrons, updateCron as updateCronDef, getCronByN
 import { nextFireFromCron } from '../daemon/cron-scheduler.js';
 import { queryKnowledgeBase, ingestKnowledgeBase, ensureKBDirs } from '../bus/knowledge-base.js';
 import { checkUsageApi, refreshOAuthToken, rotateOAuth, loadAccounts, ALERT_5H, ALERT_7D } from '../bus/oauth.js';
+import { listAgents } from '../bus/agents.js';
+import { generateAgentKey, KEY_FILENAME } from '../bus/keys.js';
 import { resolvePaths } from '../utils/paths.js';
 import { resolveEnv } from '../utils/env.js';
 import { stripBom } from '../utils/strip-bom.js';
@@ -2538,6 +2540,38 @@ busCommand
       console.error(`Error: ${err}`);
       process.exit(1);
     }
+  });
+
+busCommand
+  .command('provision-keys')
+  .description('Provision per-agent bus signing keys for all registered agents (idempotent — existing keys are never rotated)')
+  .action(() => {
+    const env = resolveEnv();
+    if (!env.frameworkRoot) {
+      console.error('CTX_FRAMEWORK_ROOT is required for provision-keys');
+      process.exit(1);
+    }
+    let created = 0;
+    let skipped = 0;
+    for (const agent of listAgents(env.ctxRoot)) {
+      const agentDir = join(env.frameworkRoot, 'orgs', agent.org, 'agents', agent.name);
+      // Stale enabled-agents.json entries (no dir on disk) and pseudo-agents
+      // like 'dashboard' have no agent directory — never provision those.
+      if (!agent.org || !existsSync(agentDir)) {
+        console.log(`skipped ${agent.name} (no agent directory)`);
+        continue;
+      }
+      const existed = existsSync(join(agentDir, KEY_FILENAME));
+      generateAgentKey(agentDir);
+      if (existed) {
+        skipped++;
+        console.log(`skipped ${agent.name} (key exists)`);
+      } else {
+        created++;
+        console.log(`created ${agent.name}`);
+      }
+    }
+    console.log(`Done: ${created} created, ${skipped} already provisioned`);
   });
 
 busCommand

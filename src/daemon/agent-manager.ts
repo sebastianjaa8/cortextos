@@ -6,6 +6,7 @@ import { WorkerProcess } from './worker-process.js';
 import { FastChecker } from './fast-checker.js';
 import { CronScheduler } from './cron-scheduler.js';
 import { migrateCronsForAgent } from './cron-migration.js';
+import { generateAgentKey } from '../bus/keys.js';
 import type { CronDefinition } from '../types/index.js';
 import { TelegramAPI } from '../telegram/api.js';
 import { TelegramPoller } from '../telegram/poller.js';
@@ -123,6 +124,13 @@ export class AgentManager {
     const instanceEnabled = this.readInstanceEnableList();
 
     for (const { name, dir, org, config } of agentDirs) {
+      // Backfill the per-agent bus signing key on boot (idempotent — key-file
+      // existence gates it). Catches agents missed by `bus provision-keys`.
+      try {
+        generateAgentKey(dir);
+      } catch (err) {
+        console.error(`[agent-manager] Failed to provision bus signing key for ${name}: ${(err as Error).message}`);
+      }
       // Per-agent config.json `enabled: false` (existing behavior, unchanged)
       if (config.enabled === false) {
         console.log(`[agent-manager] Skipping disabled agent: ${name} (per-agent config.json)`);
