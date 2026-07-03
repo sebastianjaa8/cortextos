@@ -20,7 +20,7 @@ import { validateAgentName } from '../utils/validate.js';
 // needed for that — deliberately out of scope.
 // ---------------------------------------------------------------------------
 
-const KEY_FILENAME = 'bus-signing-key';
+export const KEY_FILENAME = 'bus-signing-key';
 
 // ponytail: per-process cache — checkInbox polls every cycle for 14 agents;
 // negative results are cached too, so a key provisioned mid-process needs a
