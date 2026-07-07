@@ -381,6 +381,132 @@ export class AgentProcess {
     return this.injectMessageDetailed(content).ok;
   }
 
+  // ---------------------------------------------------------------------------
+  // Queued (turn-boundary-aware) injection — root fix for the mid-turn
+  // silent-drop class (2026-07-06 theta-wave-pulse incident).
+  // ---------------------------------------------------------------------------
+  //
+  // Root cause of "cron logged status=fired but the prompt never surfaced":
+  // injectMessage() is fire-and-forget bracketed-paste + delayed Enter. When
+  // the injection lands while the session is MID-TURN (PTY actively streaming
+  // output), two failures compound:
+  //   1. The paste/Enter is not landing at an idle composer and can be
+  //      silently swallowed by the TUI — the prompt never becomes a user
+  //      message in the conversation.
+  //   2. The verified-submit probe (inject.ts InjectVerify) is blind to the
+  //      loss: it detects a submit by "PTY output grew after Enter", but
+  //      mid-turn output is growing anyway, so verification false-passes and
+  //      no Enter retry ever fires. Supervisor-signal ≠ substrate-truth.
+  // The daemon then records status=fired in cron-execution.log → silent drop.
+  //
+  // Fix: cron prompts (non-interactive, delay-tolerant) are queued and drained
+  // ONE at a time at a turn boundary — when PTY output has been quiet for a
+  // full drain window. This also serializes near-simultaneous cron fires
+  // (the 17:01Z stampede) into one-prompt-per-turn instead of a bundled batch.
+  // Interactive paths (Telegram steering, bus notify) keep the immediate
+  // injectMessageDetailed() path — mid-turn steering is a feature there.
+  //
+  // ponytail: known ceiling — "quiet PTY" is a proxy for "turn boundary". A
+  // long-running silent tool call (e.g. a 5-minute Bash command) looks quiet
+  // and the prompt will inject mid-turn, which is exactly the status-quo-ante
+  // behavior (Claude Code queues composer input during tool exec). The 100%
+  // fix is end-to-end delivery verification against the conversation JSONL;
+  // upgrade to that if drops recur despite this queue.
+
+  private pendingInjections: Array<{ content: string; enqueuedAt: number }> = [];
+  private drainTimer: ReturnType<typeof setInterval> | null = null;
+  /** getTotalBytes() sample from the previous drain tick; -1 = no baseline. */
+  private drainLastBytes = -1;
+
+  /** How often the drain loop samples PTY output activity. */
+  private static readonly DRAIN_TICK_MS = 5_000;
+  /** Output growth below this per tick counts as "quiet" (idle repaint noise floor — matches inject.ts SUBMIT_ACTIVITY_MIN_BYTES). */
+  private static readonly DRAIN_QUIET_MAX_BYTES = 200;
+  /** Safety valve: after this long queued, inject even mid-turn (status-quo-ante behavior) so a marathon turn cannot starve crons forever. */
+  private static readonly DRAIN_MAX_WAIT_MS = 15 * 60_000;
+  /** Bounded queue: beyond this, drop the OLDEST entry (crons are periodic — the next fire re-delivers fresher state). */
+  private static readonly DRAIN_MAX_QUEUE = 40;
+
+  /**
+   * Queue a message for injection at the next turn boundary.
+   *
+   * Used by the daemon CronScheduler onFire path. Returns ok immediately on
+   * enqueue; actual PTY delivery happens from the drain loop once the session
+   * output has been quiet for a full tick (~5-10s when idle). The queue
+   * survives stop()/start() — a cron prompt queued during a restart window is
+   * delivered into the fresh session (its salt carries the original fire time).
+   */
+  injectMessageQueued(content: string): { ok: true; queued: true } | { ok: false; code: 'NOT_RUNNING'; message: string } {
+    if (!this.pty || this.status !== 'running') {
+      return { ok: false, code: 'NOT_RUNNING', message: `agent "${this.name}" is registered but not running (status: ${this.status})` };
+    }
+    this.pendingInjections.push({ content, enqueuedAt: Date.now() });
+    if (this.pendingInjections.length > AgentProcess.DRAIN_MAX_QUEUE) {
+      const dropped = this.pendingInjections.shift();
+      this.log(`Inject queue overflow (>${AgentProcess.DRAIN_MAX_QUEUE}) — dropped oldest queued prompt: ${(dropped?.content ?? '').slice(0, 80)}`);
+    }
+    this.ensureDrainTimer();
+    return { ok: true, queued: true };
+  }
+
+  private ensureDrainTimer(): void {
+    if (this.drainTimer !== null) return;
+    this.drainLastBytes = -1;
+    this.drainTimer = setInterval(() => this.drainTick(), AgentProcess.DRAIN_TICK_MS);
+    // Never hold the daemon process open just for a drain loop.
+    this.drainTimer.unref?.();
+  }
+
+  private drainTick(): void {
+    if (this.pendingInjections.length === 0) {
+      if (this.drainTimer !== null) {
+        clearInterval(this.drainTimer);
+        this.drainTimer = null;
+      }
+      this.drainLastBytes = -1;
+      return;
+    }
+    // Not deliverable right now (stopped / restarting / mid-boot). Reset the
+    // baseline so a byte count from a previous PTY can never fake "quiet".
+    if (!this.pty || this.status !== 'running' || this.stopping) {
+      this.drainLastBytes = -1;
+      return;
+    }
+    const buffer = this.pty.getOutputBuffer();
+    if (!buffer.isBootstrapped()) {
+      this.drainLastBytes = -1;
+      return;
+    }
+
+    const bytes = buffer.getTotalBytes();
+    const prev = this.drainLastBytes;
+    this.drainLastBytes = bytes;
+    const head = this.pendingInjections[0];
+    const overdue = Date.now() - head.enqueuedAt >= AgentProcess.DRAIN_MAX_WAIT_MS;
+    if (!overdue) {
+      // Require one full quiet window as evidence of a turn boundary.
+      // prev === -1: no baseline yet. bytes < prev: counter reset (new PTY).
+      if (prev === -1 || bytes < prev) return;
+      if (bytes - prev >= AgentProcess.DRAIN_QUIET_MAX_BYTES) return; // mid-turn
+    }
+
+    this.pendingInjections.shift();
+    const waitedS = Math.round((Date.now() - head.enqueuedAt) / 1000);
+    const res = this.injectMessageDetailed(head.content);
+    if (res.ok) {
+      this.log(
+        `Drained queued inject after ${waitedS}s ` +
+        `${overdue ? '(max-wait valve — injecting mid-turn)' : '(turn boundary)'} — ` +
+        `${this.pendingInjections.length} still queued`
+      );
+    } else {
+      this.log(`Queued inject failed after ${waitedS}s wait: ${res.message}`);
+    }
+    // The delivered prompt starts its own turn — force a fresh baseline so the
+    // next queued item waits for THAT turn to finish.
+    this.drainLastBytes = -1;
+  }
+
   /**
    * Check if the agent has bootstrapped (ready for messages).
    */
