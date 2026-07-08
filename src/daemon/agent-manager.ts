@@ -1157,6 +1157,23 @@ export class AgentManager {
   }
 
   /**
+   * Queue text for injection at the agent's next turn boundary.
+   *
+   * Cron-prompt delivery path (theta-wave-pulse silent-drop fix): instead of
+   * pasting into a possibly mid-turn PTY (where the paste can be swallowed and
+   * the output-growth submit-verify false-passes), the prompt is queued inside
+   * AgentProcess and drained one-at-a-time when PTY output goes quiet.
+   * Interactive paths (Telegram, bus notify) intentionally keep injectAgent().
+   */
+  injectAgentQueued(agentName: string, text: string): { ok: true; queued: true } | { ok: false; code: 'NOT_FOUND' | 'NOT_RUNNING'; message: string } {
+    const entry = this.agents.get(agentName);
+    if (!entry) {
+      return { ok: false, code: 'NOT_FOUND', message: `agent "${agentName}" not in registry` };
+    }
+    return entry.process.injectMessageQueued(text);
+  }
+
+  /**
    * Signal the CronScheduler for an agent to re-read crons.json.
    *
    * Called by the IPC server after a `bus add-cron` / `bus remove-cron` write so
@@ -1235,9 +1252,13 @@ export class AgentManager {
       // dedup-rejected and treated as a dispatch failure.
       const firedAt = new Date().toISOString();
       const injection = `[CRON FIRED ${firedAt}] ${cron.name}: ${prompt}`;
-      const injected = this.injectAgent(agentName, injection);
-      if (!injected) {
-        throw new Error(`injectAgent returned false for agent "${agentName}" — agent may not be running`);
+      // Turn-boundary-aware delivery: queue instead of firing into a possibly
+      // mid-turn PTY (2026-07-06 theta-wave-pulse silent-drop root fix).
+      // NOTE: status=fired in cron-execution.log now means "accepted for
+      // delivery" — actual PTY injection happens at the next quiet window.
+      const injected = this.injectAgentQueued(agentName, injection);
+      if (!injected.ok) {
+        throw new Error(`injectAgentQueued failed for agent "${agentName}" (${injected.code}) — agent may not be running`);
       }
     };
 
