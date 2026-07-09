@@ -58,6 +58,7 @@ WINDOWS-IMPLEMENTATION-PLAN.md
 WINDOWS-SUPPORT-INVESTIGATION.md
 BRAINDUMP*.md
 AGENTS.md
+!templates/**/AGENTS.md
 dashboard/screenshots/
 dashboard/test-*.py
 # Surface-poll runtime state (added 2026-05-22 pre-rebase)

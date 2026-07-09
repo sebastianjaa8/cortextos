@@ -1,16 +1,13 @@
 # User Profile
 
 ## Name
-<!-- User's name (set during onboarding) -->
-
-## Telegram Chat ID
-<!-- User's Telegram chat ID -->
-
-## Timezone
-<!-- User's timezone (e.g. America/New_York) -->
+Sebastian
 
 ## Communication Preferences
-<!-- How the user prefers to be communicated with -->
+- Brief, direct updates.
+- No emoji unless explicitly requested.
+- Routine status and blockers route through the orchestrator unless a Telegram inject explicitly provides a reply command.
 
 ## Working Hours
-<!-- When the user is typically available -->
+- Day mode: 08:00-00:00 America/New_York.
+- Night mode: 00:00-08:00 America/New_York.

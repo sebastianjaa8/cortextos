@@ -5,6 +5,7 @@ import { homedir } from 'os';
 import { OrgContext } from '../types';
 import { validateAgentName, validateOrgName } from '../utils/validate';
 import { generateAgentKey } from '../bus/keys';
+import { normalizeOrgName } from '../utils/org';
 
 const VALID_RUNTIMES = ['claude-code', 'hermes', 'codex-app-server', 'opencode'] as const;
 type RuntimeKind = typeof VALID_RUNTIMES[number];
@@ -15,6 +16,7 @@ type RuntimeKind = typeof VALID_RUNTIMES[number];
 // codex agent — degrading on first boot. Reject the combo until codex
 // variants exist (PR 11+).
 const NON_CODEX_TEMPLATES = ['orchestrator', 'analyst', 'm2c1-worker', 'hermes'] as const;
+const LEGACY_ORG_NAME_REGEX = /^[A-Za-z0-9_-]+$/;
 
 export const addAgentCommand = new Command('add-agent')
   .argument('<name>', 'Agent name')
@@ -75,19 +77,22 @@ export const addAgentCommand = new Command('add-agent')
       process.exit(1);
     }
 
-    // Mirror the BUG-041 fix above for the resolved org name.
-    // Mixed-case orgs pass through add-agent today (whether supplied via --org or
-    // auto-detected from the orgs/ directory), get committed to disk, and then
-    // break every `cortextos bus *` invocation at runtime because env.ts strictly
-    // validates CTX_ORG. The dashboard API also rejects them with HTTP 400.
-    // Canonical rule: src/utils/validate.ts:validateOrgName (/^[a-z0-9_-]+$/).
+    // Mirror the BUG-041 fix above for new org names, while preserving legacy
+    // org directories whose canonical on-disk casing is already mixed-case.
+    // resolveEnv() accepts those legacy names safely; creating new mixed-case
+    // orgs still belongs behind init/setup validation.
+    const canonicalOrg = normalizeOrgName(projectRoot, org);
+    const canonicalOrgExists = existsSync(join(projectRoot, 'orgs', canonicalOrg));
     try {
-      validateOrgName(org);
+      validateOrgName(canonicalOrg);
     } catch (err) {
-      console.error(`Error: ${(err as Error).message}`);
-      console.error(`Org names must match /^[a-z0-9_-]+$/ (lowercase letters, numbers, underscores, hyphens).`);
-      process.exit(1);
+      if (!canonicalOrgExists || !LEGACY_ORG_NAME_REGEX.test(canonicalOrg)) {
+        console.error(`Error: ${(err as Error).message}`);
+        console.error(`Org names must match /^[a-z0-9_-]+$/ (lowercase letters, numbers, underscores, hyphens).`);
+        process.exit(1);
+      }
     }
+    org = canonicalOrg;
 
     const agentDir = join(projectRoot, 'orgs', org, 'agents', name);
     if (existsSync(agentDir)) {

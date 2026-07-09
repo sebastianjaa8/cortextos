@@ -16,6 +16,9 @@
  * the caller gets a clear error before any filesystem state is touched.
  */
 import { describe, it, expect, vi, afterEach } from 'vitest';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'fs';
+import { join } from 'path';
+import { tmpdir } from 'os';
 import { addAgentCommand } from '../../../src/cli/add-agent';
 
 describe('BUG-041: add-agent agent name validation', () => {
@@ -96,14 +99,28 @@ describe('BUG-041: add-agent agent name validation', () => {
 
 /**
  * Issue #407 regression test: `cortextos add-agent` must reject invalid
- * --org values for the same reasons it rejects invalid agent names —
- * mixed-case orgs pass scaffolding but then break every `cortextos bus *`
- * invocation at runtime (env.ts strictly validates CTX_ORG) and every
- * dashboard add-agent attempt (POST /api/agents returns HTTP 400).
+ * new --org values while still accepting legacy mixed-case org directories
+ * whose canonical on-disk names are already used by a live fleet.
  */
 describe('issue #407: add-agent --org name validation', () => {
+  let tempRoot: string | null = null;
+  let tempHome: string | null = null;
+  let originalHome: string | undefined;
+  let originalCwd: string | undefined;
+  let originalFrameworkRoot: string | undefined;
+
   afterEach(() => {
+    const touchedEnv = tempRoot !== null || tempHome !== null;
     vi.restoreAllMocks();
+    if (tempRoot) rmSync(tempRoot, { recursive: true, force: true });
+    if (tempHome) rmSync(tempHome, { recursive: true, force: true });
+    tempRoot = null;
+    tempHome = null;
+    if (touchedEnv) {
+      if (originalHome === undefined) delete process.env.HOME; else process.env.HOME = originalHome;
+      if (originalCwd === undefined) delete process.env.CTX_PROJECT_ROOT; else process.env.CTX_PROJECT_ROOT = originalCwd;
+      if (originalFrameworkRoot === undefined) delete process.env.CTX_FRAMEWORK_ROOT; else process.env.CTX_FRAMEWORK_ROOT = originalFrameworkRoot;
+    }
   });
 
   it('rejects --org teamStupid (camelCase) before any filesystem write', async () => {
@@ -154,5 +171,53 @@ describe('issue #407: add-agent --org name validation', () => {
     ).rejects.toThrow(/__TEST_PROCESS_EXIT_1__/);
 
     expect(exitSpy).toHaveBeenCalledWith(1);
+  });
+
+  it('accepts an existing mixed-case org directory using canonical on-disk casing', async () => {
+    tempRoot = mkdtempSync(join(tmpdir(), 'issue407-org-'));
+    tempHome = mkdtempSync(join(tmpdir(), 'issue407-home-'));
+    originalHome = process.env.HOME;
+    originalCwd = process.env.CTX_PROJECT_ROOT;
+    originalFrameworkRoot = process.env.CTX_FRAMEWORK_ROOT;
+
+    process.env.HOME = tempHome;
+    process.env.CTX_FRAMEWORK_ROOT = tempRoot;
+    process.env.CTX_PROJECT_ROOT = tempRoot;
+
+    const realTemplates = join(__dirname, '..', '..', '..', 'templates');
+    symlinkSync(realTemplates, join(tempRoot, 'templates'), 'dir');
+
+    mkdirSync(join(tempRoot, 'orgs', 'SEB_company', 'agents'), { recursive: true });
+    writeFileSync(
+      join(tempRoot, 'orgs', 'SEB_company', 'context.json'),
+      JSON.stringify({
+        name: 'SEB_company',
+        timezone: 'America/New_York',
+        orchestrator: 'seb_boss',
+      }),
+    );
+
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    await addAgentCommand.parseAsync([
+      'node', 'cli', 'hermes', '--template', 'hermes', '--runtime', 'hermes',
+      '--org', 'seb_company', '--instance', 'issue407-test',
+    ]);
+
+    const agentDir = join(tempRoot, 'orgs', 'SEB_company', 'agents', 'hermes');
+    expect(existsSync(agentDir)).toBe(true);
+
+    const cfg = JSON.parse(readFileSync(join(agentDir, 'config.json'), 'utf-8'));
+    expect(cfg.agent_name).toBe('hermes');
+    expect(cfg.runtime).toBe('hermes');
+    expect(cfg).not.toHaveProperty('model');
+
+    for (const f of ['AGENTS.md', 'TOOLS.md', 'ONBOARDING.md', 'SYSTEM.md',
+                     'IDENTITY.md', 'USER.md', 'GOALS.md', 'HEARTBEAT.md',
+                     'GUARDRAILS.md', 'MEMORY.md', 'SOUL.md',
+                     'config.json', 'goals.json']) {
+      expect(existsSync(join(agentDir, f))).toBe(true);
+    }
   });
 });

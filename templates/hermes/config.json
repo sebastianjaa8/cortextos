@@ -23,7 +23,6 @@
       "prompt": "Read HEARTBEAT.md and follow its instructions. Update your heartbeat, check inbox, and work on your highest priority task."
     }
   ],
-  "model": "{{model}}",
   "ctx_warning_threshold": 60,
   "ctx_handoff_threshold": 70
 }
