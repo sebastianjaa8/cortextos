@@ -1,7 +1,9 @@
 import { appendFileSync, existsSync, readFileSync, unlinkSync, writeFileSync } from 'fs';
-import { join } from 'path';
+import { dirname, join, delimiter } from 'path';
 import { homedir } from 'os';
 import { randomBytes } from 'crypto';
+import { spawn as spawnChildProcess, spawnSync, type ChildProcess } from 'child_process';
+import { createConnection } from 'net';
 import type { AgentConfig, CtxEnv } from '../types/index.js';
 import { OutputBuffer } from './output-buffer.js';
 import type { TelegramAPI } from '../telegram/api.js';
@@ -10,23 +12,22 @@ import { resolvePaths } from '../utils/paths.js';
 import { logEvent } from '../bus/event.js';
 import { WsUnixJsonRpcClient, type JsonRpcResponse } from '../utils/ws-unix-client.js';
 
-interface IPty {
-  pid: number;
-  write(data: string): void;
-  onData(callback: (data: string) => void): { dispose(): void };
-  onExit(callback: (e: { exitCode: number; signal?: number }) => void): { dispose(): void };
-  kill(signal?: string): void;
+type RpcEndpoint = string | { host: string; port: number };
+type AppServerTransport = 'unix' | 'tcp';
+
+interface SocketResolution {
+  path: string;
+  listenArg: string;
+  cwd: string;
+  rpcEndpoint: RpcEndpoint;
+  transport: AppServerTransport;
 }
 
-interface IPtySpawnOptions {
-  name?: string;
-  cols?: number;
-  rows?: number;
-  cwd?: string;
-  env?: Record<string, string>;
+interface CodexLaunch {
+  command: string;
+  args: string[];
+  shell: boolean;
 }
-
-type SpawnFn = (file: string, args: string[], options: IPtySpawnOptions) => IPty;
 
 interface ThreadState {
   threadId: string;
@@ -88,10 +89,10 @@ const LOCAL_SLASH_COMMANDS = new Set(['goal']);
  * Codex app-server PTY adapter for cortextOS.
  *
  * Uses a persistent `codex app-server` process and speaks JSON-RPC over the
- * app-server's WebSocket-framed Unix socket transport. The approved default
- * socket is `$CTX_ROOT/state/<agent>/codex.sock`; if that resolved path is
- * longer than the conservative 100-byte Unix socket threshold, the adapter
- * falls back to `/tmp/cas-<short-uuid>.sock` and writes a state-dir pointer.
+ * app-server's WebSocket transport. Windows uses a loopback `ws://127.0.0.1`
+ * listener because Codex 0.143 does not bind `unix://` sockets reliably under
+ * a Node parent. Other platforms use `$CTX_ROOT/state/<agent>/codex.sock`; if
+ * that path is too long, the adapter falls back to `/tmp/cas-<short-uuid>.sock`.
  */
 export class CodexAppServerPTY {
   private _alive = false;
@@ -104,10 +105,9 @@ export class CodexAppServerPTY {
     reject: (err: Error) => void;
     timer: ReturnType<typeof setTimeout>;
   } | null = null;
-  private _spawnFn: SpawnFn | null = null;
-  private _appServerPty: IPty | null = null;
+  private _appServerProcess: ChildProcess | null = null;
   private _rpc: WsUnixJsonRpcClient | null = null;
-  private _onExitHandler: ((exitCode: number, signal?: number) => void) | null = null;
+  private _onExitHandler: ((exitCode: number, signal?: NodeJS.Signals | number) => void) | null = null;
   private _outputBuffer: OutputBuffer;
   private _env: CtxEnv;
   private _config: AgentConfig;
@@ -116,6 +116,8 @@ export class CodexAppServerPTY {
   private _socketPath: string;
   private _socketListenArg: string;
   private _socketCwd: string;
+  private _rpcEndpoint: RpcEndpoint;
+  private _transport: AppServerTransport;
   private _threadStatePath: string;
   private _socketPointerPath: string;
   private _threadId: string | null = null;
@@ -134,6 +136,8 @@ export class CodexAppServerPTY {
     this._socketPath = socket.path;
     this._socketListenArg = socket.listenArg;
     this._socketCwd = socket.cwd;
+    this._rpcEndpoint = socket.rpcEndpoint;
+    this._transport = socket.transport;
     this._outputBuffer = new OutputBuffer(1000, logPath, BOOTSTRAP_PATTERN);
   }
 
@@ -190,14 +194,7 @@ export class CodexAppServerPTY {
       this._rpc.close();
       this._rpc = null;
     }
-    if (this._appServerPty) {
-      try {
-        this._appServerPty.kill();
-      } catch {
-        // Ignore shutdown errors.
-      }
-      this._appServerPty = null;
-    }
+    this.stopAppServerProcess();
     this.removeSocket();
     this._onExitHandler?.(0, undefined);
     this._onExitHandler = null;
@@ -208,10 +205,10 @@ export class CodexAppServerPTY {
   }
 
   getPid(): number | null {
-    return this._appServerPty?.pid ?? null;
+    return this._appServerProcess?.pid ?? null;
   }
 
-  onExit(handler: (exitCode: number, signal?: number) => void): void {
+  onExit(handler: (exitCode: number, signal?: NodeJS.Signals | number) => void): void {
     this._onExitHandler = handler;
   }
 
@@ -413,56 +410,129 @@ export class CodexAppServerPTY {
     throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
   }
 
+  /**
+   * Resolve the concrete Codex shim on Windows so child_process can launch the
+   * same command path that an interactive shell would find on PATH.
+   */
+  private resolveCodexCommand(env: Record<string, string>): string {
+    if (process.platform !== 'win32') return 'codex';
+    const pathVar = env['PATH'] || process.env['PATH'] || '';
+    for (const dir of pathVar.split(delimiter)) {
+      if (!dir) continue;
+      for (const ext of ['.cmd', '.exe', '.bat']) {
+        const candidate = join(dir, `codex${ext}`);
+        if (existsSync(candidate)) return candidate;
+      }
+    }
+    return 'codex';
+  }
+
+  private resolveCodexLaunch(env: Record<string, string>, args: string[]): CodexLaunch {
+    const command = this.resolveCodexCommand(env);
+    if (process.platform !== 'win32') return { command, args, shell: false };
+
+    if (/\.(cmd|bat)$/i.test(command)) {
+      const codexJs = join(dirname(command), 'node_modules', '@openai', 'codex', 'bin', 'codex.js');
+      if (existsSync(codexJs)) {
+        return { command: process.execPath, args: [codexJs, ...args], shell: false };
+      }
+    }
+
+    if (/\.exe$/i.test(command)) return { command, args, shell: false };
+    return { command, args, shell: true };
+  }
+
   private startAppServer(): Promise<void> {
     return new Promise<void>((resolve, reject) => {
-      if (!this._spawnFn) {
-        const nodePty = require('node-pty');
-        this._spawnFn = nodePty.spawn;
-      }
-
-      const spawnFn = this._spawnFn!;
-      const pty = spawnFn('codex', [
+      const env = this.buildEnv();
+      const args = [
         'app-server',
         '--enable', 'goals',
         '--listen', this._socketListenArg,
-      ], {
-        name: 'xterm-256color',
-        cols: 200,
-        rows: 50,
+      ];
+      const launch = this.resolveCodexLaunch(env, args);
+      const child = spawnChildProcess(launch.command, launch.args, {
         cwd: this._socketCwd,
-        env: this.buildEnv(),
+        env,
+        shell: launch.shell,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true,
       });
 
-      this._appServerPty = pty;
-      pty.onData((data) => {
+      let settled = false;
+      const rejectOnce = (err: Error) => {
+        if (settled) return;
+        settled = true;
+        reject(err);
+      };
+
+      this._appServerProcess = child;
+      const handleOutput = (chunk: Buffer | string) => {
+        const data = chunk.toString();
         this._outputBuffer.push(data);
         if (data.includes('Error:')) {
-          reject(new Error(data.trim()));
+          rejectOnce(new Error(data.trim()));
         }
+      };
+      child.stdout?.on('data', handleOutput);
+      child.stderr?.on('data', handleOutput);
+      child.on('error', (err) => {
+        rejectOnce(err);
       });
-      pty.onExit(({ exitCode, signal }) => {
-        if (this._appServerPty !== pty) return;
-        this._appServerPty = null;
+      child.on('exit', (exitCode, signal) => {
+        if (this._appServerProcess !== child) return;
+        this._appServerProcess = null;
         this._alive = false;
         this.rejectTurnCompletion(new Error('Codex app-server exited'));
-        this._onExitHandler?.(exitCode, signal);
+        this._onExitHandler?.(exitCode ?? 1, signal ?? undefined);
+        rejectOnce(new Error(`Codex app-server exited before socket was ready (code ${exitCode ?? 'null'}, signal ${signal ?? 'none'})`));
       });
 
-      this.waitForSocket().then(resolve, reject);
+      this.waitForSocket().then(() => {
+        settled = true;
+        resolve();
+      }, rejectOnce);
     });
   }
 
   private async waitForSocket(timeoutMs = 10000): Promise<void> {
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
-      if (existsSync(this._socketPath)) return;
+      if (this._transport === 'tcp') {
+        if (await this.canConnectTcp()) return;
+      } else if (existsSync(this._socketPath)) {
+        return;
+      }
       await sleep(100);
+    }
+
+    if (this._transport === 'tcp') {
+      throw new Error(`Timed out waiting for app-server TCP listener: ${this._socketListenArg}`);
     }
     throw new Error(`Timed out waiting for app-server socket: ${this._socketPath}`);
   }
 
+  private canConnectTcp(): Promise<boolean> {
+    const endpoint = this._rpcEndpoint;
+    if (typeof endpoint === 'string') return Promise.resolve(false);
+    return new Promise<boolean>((resolve) => {
+      let settled = false;
+      const socket = createConnection(endpoint.port, endpoint.host);
+      const done = (ok: boolean) => {
+        if (settled) return;
+        settled = true;
+        socket.destroy();
+        resolve(ok);
+      };
+      socket.setTimeout(200);
+      socket.once('connect', () => done(true));
+      socket.once('timeout', () => done(false));
+      socket.once('error', () => done(false));
+    });
+  }
+
   private async connectRpc(): Promise<void> {
-    this._rpc = new WsUnixJsonRpcClient(this._socketPath);
+    this._rpc = new WsUnixJsonRpcClient(this._rpcEndpoint);
     this._rpc.onMessage((message) => this.handleRpcMessage(message));
     await this._rpc.connect();
   }
@@ -923,10 +993,31 @@ export class CodexAppServerPTY {
     }
   }
 
-  private resolveSocketPath(): { path: string; listenArg: string; cwd: string } {
+  private chooseLoopbackPort(): number {
+    return 39000 + (randomBytes(2).readUInt16BE(0) % 20000);
+  }
+
+  private resolveSocketPath(): SocketResolution {
     const defaultPath = join(this._stateDir, SOCKET_BASENAME);
+    if (process.platform === 'win32') {
+      const port = this.chooseLoopbackPort();
+      return {
+        path: defaultPath,
+        listenArg: `ws://127.0.0.1:${port}`,
+        cwd: this._stateDir,
+        rpcEndpoint: { host: '127.0.0.1', port },
+        transport: 'tcp',
+      };
+    }
+
     if (Buffer.byteLength(defaultPath) < SOCKET_PATH_WARN_BYTES) {
-      return { path: defaultPath, listenArg: `unix://./${SOCKET_BASENAME}`, cwd: this._stateDir };
+      return {
+        path: defaultPath,
+        listenArg: `unix://./${SOCKET_BASENAME}`,
+        cwd: this._stateDir,
+        rpcEndpoint: defaultPath,
+        transport: 'unix',
+      };
     }
 
     const fallbackBasename = `cas-${randomBytes(4).toString('hex')}.sock`;
@@ -943,10 +1034,17 @@ export class CodexAppServerPTY {
     } catch {
       // Non-fatal; spawn will still use fallback path.
     }
-    return { path: fallback, listenArg: `unix://./${fallbackBasename}`, cwd: '/tmp' };
+    return {
+      path: fallback,
+      listenArg: `unix://./${fallbackBasename}`,
+      cwd: '/tmp',
+      rpcEndpoint: fallback,
+      transport: 'unix',
+    };
   }
 
   private removeSocket(): void {
+    if (this._transport !== 'unix') return;
     try {
       if (existsSync(this._socketPath)) unlinkSync(this._socketPath);
     } catch {
@@ -955,16 +1053,27 @@ export class CodexAppServerPTY {
   }
 
   private cleanupSpawnAttempt(): void {
-    const pty = this._appServerPty;
-    this._appServerPty = null;
-    if (pty) {
-      try {
-        pty.kill();
-      } catch {
-        // Ignore failed attempt cleanup errors.
-      }
-    }
+    this.stopAppServerProcess();
     this.removeSocket();
+  }
+
+  private stopAppServerProcess(): void {
+    const child = this._appServerProcess;
+    this._appServerProcess = null;
+    if (!child) return;
+
+    try {
+      if (process.platform === 'win32' && child.pid) {
+        spawnSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], {
+          stdio: 'ignore',
+          windowsHide: true,
+        });
+      } else {
+        child.kill();
+      }
+    } catch {
+      // Ignore shutdown errors.
+    }
   }
 
   private writeIdleFlag(): void {

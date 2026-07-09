@@ -36,7 +36,7 @@ async function getAgentRuntime(name: string, org?: string): Promise<AgentRuntime
   try {
     const raw = await fs.readFile(path.join(agentDir, 'config.json'), 'utf-8');
     const cfg = JSON.parse(raw) as { runtime?: string };
-    if (cfg.runtime === 'codex-app-server' || cfg.runtime === 'hermes' || cfg.runtime === 'claude-code') {
+    if (cfg.runtime === 'codex-app-server' || cfg.runtime === 'codex-exec' || cfg.runtime === 'hermes' || cfg.runtime === 'claude-code') {
       return cfg.runtime;
     }
   } catch {
