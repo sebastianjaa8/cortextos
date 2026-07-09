@@ -326,8 +326,12 @@ export function checkGoalStaleness(
         continue;
       }
 
-      // Parse ISO 8601 timestamp
-      const parsedDate = new Date(updatedLine);
+      // Parse ISO 8601 timestamp — tolerate trailing annotation like "(by <agent>)"
+      // and a missing seconds component (e.g. "T05:56Z").
+      const isoMatch = updatedLine.match(
+        /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?/,
+      );
+      const parsedDate = new Date(isoMatch ? isoMatch[0] : updatedLine);
       if (isNaN(parsedDate.getTime())) {
         agents.push({
           agent: agentName,

@@ -237,6 +237,36 @@ describe('Bus System', () => {
       expect(report.agents[0].stale).toBe(true);
     });
 
+    it('tolerates a trailing "(by <agent>)" annotation on the timestamp', () => {
+      const agentDir = join(testDir, 'orgs', 'myorg', 'agents', 'worker');
+      mkdirSync(agentDir, { recursive: true });
+
+      const recentDate = new Date().toISOString();
+      writeFileSync(
+        join(agentDir, 'GOALS.md'),
+        `# Goals\n\n## Updated\n${recentDate} (by worker)\n`,
+      );
+
+      const report = checkGoalStaleness(testDir, 7);
+      expect(report.agents[0].status).toBe('fresh');
+      expect(report.agents[0].stale).toBe(false);
+    });
+
+    it('tolerates a trailing annotation on a seconds-less timestamp', () => {
+      const agentDir = join(testDir, 'orgs', 'myorg', 'agents', 'worker');
+      mkdirSync(agentDir, { recursive: true });
+
+      const recentDate = new Date().toISOString().replace(/:\d{2}\.\d{3}Z$/, 'Z');
+      writeFileSync(
+        join(agentDir, 'GOALS.md'),
+        `# Goals\n\n## Updated\n${recentDate} (content confirmed unchanged, sign-off — timestamp bump only)\n`,
+      );
+
+      const report = checkGoalStaleness(testDir, 7);
+      expect(report.agents[0].status).toBe('fresh');
+      expect(report.agents[0].stale).toBe(false);
+    });
+
     it('returns empty report when no orgs directory', () => {
       const report = checkGoalStaleness(testDir);
       expect(report.summary.total).toBe(0);
