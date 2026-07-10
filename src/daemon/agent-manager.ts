@@ -249,10 +249,18 @@ export class AgentManager {
         // fleet restart while heartbeat crons caught up). A bare "deduped"
         // reply looks like a wedged registry; stating pid/uptime shows the
         // truth in the same breath.
-        const live = this.agents.get(name)!.process.getStatus();
-        const detail = live.status === 'running' && live.pid
-          ? `agent is RUNNING (pid ${live.pid}, up ${live.uptime ?? '?'}s) — no start needed. If list-agents showed it stopped, its heartbeat is stale, not the process; trust \`cortextos status\`.`
-          : `in-flight start or transitional state (${live.status})`;
+        const entry = this.agents.get(name);
+        let detail = 'in-flight start or transitional state (status unavailable)';
+        try {
+          const live = entry?.process?.getStatus?.();
+          if (live) {
+            detail = live.status === 'running' && live.pid
+              ? `agent is RUNNING (pid ${live.pid}, up ${live.uptime ?? '?'}s) — no start needed. If list-agents showed it stopped, its heartbeat is stale, not the process; trust \`cortextos status\`.`
+              : `in-flight start or transitional state (${live.status})`;
+          }
+        } catch {
+          // Transitional registry entries should still classify as DEDUPED.
+        }
         return { ok: false, code: 'DEDUPED', message: `start request for "${name}" deduped — already in registry: ${detail}` };
       }
       return { ok: true };

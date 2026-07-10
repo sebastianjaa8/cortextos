@@ -28,6 +28,7 @@ describe('PR-02: add-agent --runtime codex-app-server', () => {
   let tempRoot: string;
   let tempHome: string;
   let originalHome: string | undefined;
+  let originalUserProfile: string | undefined;
   let originalCwd: string | undefined;
   let originalFrameworkRoot: string | undefined;
 
@@ -36,9 +37,11 @@ describe('PR-02: add-agent --runtime codex-app-server', () => {
     tempHome = mkdtempSync(join(tmpdir(), 'pr02-home-'));
 
     originalHome = process.env.HOME;
+    originalUserProfile = process.env.USERPROFILE;
     originalCwd = process.env.CTX_PROJECT_ROOT;
     originalFrameworkRoot = process.env.CTX_FRAMEWORK_ROOT;
     process.env.HOME = tempHome;
+    process.env.USERPROFILE = tempHome;
     // Point template lookup + agent creation at the temp root.
     process.env.CTX_FRAMEWORK_ROOT = tempRoot;
     process.env.CTX_PROJECT_ROOT = tempRoot;
@@ -64,7 +67,10 @@ describe('PR-02: add-agent --runtime codex-app-server', () => {
   });
 
   afterEach(() => {
-    process.env.HOME = originalHome;
+    if (originalHome === undefined) delete process.env.HOME;
+    else process.env.HOME = originalHome;
+    if (originalUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = originalUserProfile;
     process.env.CTX_PROJECT_ROOT = originalCwd;
     process.env.CTX_FRAMEWORK_ROOT = originalFrameworkRoot;
     rmSync(tempRoot, { recursive: true, force: true });
@@ -267,6 +273,7 @@ describe('PR-10: add-agent rejects codex+claude-only-template combos', () => {
   let tempRoot: string;
   let tempHome: string;
   let originalHome: string | undefined;
+  let originalUserProfile: string | undefined;
   let originalCwd: string | undefined;
   let originalFrameworkRoot: string | undefined;
   let exitSpy: ReturnType<typeof vi.spyOn>;
@@ -277,6 +284,7 @@ describe('PR-10: add-agent rejects codex+claude-only-template combos', () => {
     tempHome = mkdtempSync(join(tmpdir(), 'pr10-home-'));
 
     originalHome = process.env.HOME;
+    originalUserProfile = process.env.USERPROFILE;
     originalCwd = process.env.CTX_PROJECT_ROOT;
     originalFrameworkRoot = process.env.CTX_FRAMEWORK_ROOT;
     process.env.HOME = tempHome;
@@ -303,7 +311,10 @@ describe('PR-10: add-agent rejects codex+claude-only-template combos', () => {
   });
 
   afterEach(() => {
-    process.env.HOME = originalHome;
+    if (originalHome === undefined) delete process.env.HOME;
+    else process.env.HOME = originalHome;
+    if (originalUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = originalUserProfile;
     process.env.CTX_PROJECT_ROOT = originalCwd;
     process.env.CTX_FRAMEWORK_ROOT = originalFrameworkRoot;
     rmSync(tempRoot, { recursive: true, force: true });

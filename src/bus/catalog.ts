@@ -6,7 +6,7 @@
  */
 
 import { existsSync, readFileSync, writeFileSync, readdirSync, statSync, mkdirSync, cpSync, rmSync, chmodSync } from 'fs';
-import { join, resolve, relative } from 'path';
+import { join, resolve, relative, isAbsolute } from 'path';
 import { execSync, execFileSync } from 'child_process';
 import { ensureDir } from '../utils/atomic.js';
 
@@ -119,6 +119,11 @@ function lockdownPermissions(targetDir: string): void {
 
 function findCatalogPath(frameworkRoot: string): string {
   return join(frameworkRoot, 'community', 'catalog.json');
+}
+
+function isInsideDir(parent: string, child: string): boolean {
+  const rel = relative(resolve(parent), resolve(child));
+  return rel === '' || (!!rel && !rel.startsWith('..') && !isAbsolute(rel));
 }
 
 function getInstalledPath(ctxRoot: string): string {
@@ -235,7 +240,7 @@ export function installCommunityItem(
   const installPath = item.install_path.replace(/^community\//, '');
 
   // Validate install_path to prevent path traversal
-  if (installPath.includes('..') || installPath.startsWith('/')) {
+  if (installPath.includes('..') || isAbsolute(installPath)) {
     return { status: 'error', name: itemName, error: 'install_path contains path traversal' };
   }
 
@@ -243,9 +248,7 @@ export function installCommunityItem(
   const sourceDir = join(communityBase, installPath);
 
   // Verify resolved path is under community/
-  const resolvedSource = resolve(sourceDir);
-  const resolvedBase = resolve(communityBase);
-  if (!resolvedSource.startsWith(resolvedBase + '/') && resolvedSource !== resolvedBase) {
+  if (!isInsideDir(communityBase, sourceDir)) {
     return { status: 'error', name: itemName, error: 'install_path resolves outside community directory' };
   }
 
@@ -341,9 +344,7 @@ export function prepareSubmission(
   const stagingDir = join(ctxRoot, 'community-staging', itemName);
 
   // Verify staging path is under community-staging/
-  const resolvedStaging = resolve(stagingDir);
-  const resolvedStagingBase = resolve(join(ctxRoot, 'community-staging'));
-  if (!resolvedStaging.startsWith(resolvedStagingBase + '/') && resolvedStaging !== resolvedStagingBase) {
+  if (!isInsideDir(join(ctxRoot, 'community-staging'), stagingDir)) {
     return { status: 'error', name: itemName, type: itemType, staging_dir: '', file_count: 0, files: [], pii_detected: ['staging directory resolves outside expected path'] };
   }
 

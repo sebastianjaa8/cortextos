@@ -237,19 +237,17 @@ describe('FM-1: Disk full — ENOSPC write failure, no data loss on recovery', (
     scheduler.stop();
   });
 
-  it('atomicWriteSync: ENOSPC on tmp write throws; subsequent write succeeds', () => {
-    // Direct unit test: atomicWriteSync propagates write errors correctly.
-    // We simulate ENOSPC by writing to a path in a non-writable directory.
-    const readOnlyDir = join(tmpRoot, 'readonly-dir');
-    mkdirSync(readOnlyDir, { recursive: true });
-    const { chmodSync } = require('fs');
-    chmodSync(readOnlyDir, 0o555);
+  it('atomicWriteSync: filesystem write failure throws; subsequent write succeeds', () => {
+    // Direct unit test: atomicWriteSync propagates filesystem errors correctly.
+    // chmod-based read-only directories are not reliable on Windows, so block the
+    // target path with a directory first. The atomic rename must fail, clean up,
+    // and allow a later write once the path is clear.
+    const testPath = join(tmpRoot, 'atomic-target.json');
+    mkdirSync(testPath, { recursive: true });
 
-    const testPath = join(readOnlyDir, 'test.json');
     expect(() => atomicWriteSync(testPath, '{"data":1}')).toThrow();
 
-    // Restore and confirm write works
-    chmodSync(readOnlyDir, 0o755);
+    rmSync(testPath, { recursive: true, force: true });
     expect(() => atomicWriteSync(testPath, '{"data":2}')).not.toThrow();
     expect(existsSync(testPath)).toBe(true);
   });

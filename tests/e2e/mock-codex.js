@@ -42,7 +42,8 @@ const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
 
 class MockCodexServer {
   constructor(options = {}) {
-    this.socketPath = options.socketPath;
+    this.socketPath = options.socketPath || null;
+    this.endpoint = options.endpoint || null;
     this.skills = options.skills || [];
     this.tokenUsage = options.tokenUsage || {
       cachedInputTokens: 0,
@@ -65,16 +66,25 @@ class MockCodexServer {
 
   async listen() {
     if (this.server) return;
-    try { await unlink(this.socketPath); } catch { /* ok */ }
+    if (this.socketPath) {
+      if (this.socketPath) {
+      try { await unlink(this.socketPath); } catch { /* ok */ }
+    }
+    }
 
     const server = net.createServer((socket) => this._handleConnection(socket));
     this.server = server;
     await new Promise((resolve, reject) => {
       server.once('error', reject);
-      server.listen(this.socketPath, () => {
+      const onListen = () => {
         server.off('error', reject);
         resolve();
-      });
+      };
+      if (this.endpoint) {
+        server.listen(this.endpoint.port, this.endpoint.host, onListen);
+      } else {
+        server.listen(this.socketPath, onListen);
+      }
     });
   }
 
@@ -89,7 +99,9 @@ class MockCodexServer {
       this.server = null;
       await new Promise((resolve) => server.close(() => resolve()));
     }
-    try { await unlink(this.socketPath); } catch { /* ok */ }
+    if (this.socketPath) {
+      try { await unlink(this.socketPath); } catch { /* ok */ }
+    }
   }
 
   /** Force the next inbound request (any method) to respond with a JSON-RPC error. */

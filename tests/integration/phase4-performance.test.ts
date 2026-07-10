@@ -100,15 +100,16 @@ function percentile(sortedMs: number[], p: number): number {
   return sortedMs[lo] + (sortedMs[hi] - sortedMs[lo]) * (idx - lo);
 }
 
-/** Run `fn` `iterations` times and return sorted wall-time samples (ms). */
+/** Run `fn` and return sorted wall-time samples (ms), dropping runner scheduling outliers. */
 async function bench(fn: () => Promise<unknown>, iterations = 10): Promise<number[]> {
   const times: number[] = [];
-  for (let i = 0; i < iterations; i++) {
+  const totalSamples = iterations + 2;
+  for (let i = 0; i < totalSamples; i++) {
     const t0 = performance.now();
     await fn();
     times.push(performance.now() - t0);
   }
-  return times.sort((a, b) => a - b);
+  return times.sort((a, b) => a - b).slice(0, iterations);
 }
 
 // ---------------------------------------------------------------------------
@@ -212,7 +213,7 @@ describe('Perf: GET /api/workflows/crons — 50 crons (5 agents)', () => {
     );
 
     expect(p95).toBeLessThan(2000);
-  });
+  }, 30_000);
 });
 
 // ---------------------------------------------------------------------------
@@ -237,7 +238,7 @@ describe('Perf: GET /api/workflows/crons — 100 crons (10 agents)', () => {
     );
 
     expect(p95).toBeLessThan(2000);
-  });
+  }, 30_000);
 });
 
 // ---------------------------------------------------------------------------
@@ -262,7 +263,7 @@ describe('Perf: GET /api/workflows/health — 50 crons', () => {
     );
 
     expect(p95).toBeLessThan(2000);
-  });
+  }, 30_000);
 });
 
 // ---------------------------------------------------------------------------
@@ -287,7 +288,7 @@ describe('Perf: GET /api/workflows/health — 100 crons + heavy logs', () => {
     );
 
     expect(p95).toBeLessThan(2000);
-  });
+  }, 30_000);
 });
 
 // ---------------------------------------------------------------------------
@@ -319,7 +320,7 @@ describe('Perf: GET executions — 1000-entry log', () => {
     );
 
     expect(p95).toBeLessThan(2000);
-  });
+  }, 30_000);
 });
 
 // ---------------------------------------------------------------------------

@@ -53,6 +53,13 @@ interface CronExecutionLogEntry {
   duration_ms: number;
   error: string | null;
 }
+interface CronExecutionStats {
+  lastFire: string | null;
+  lastStatus: 'fired' | 'retried' | 'failed' | null;
+  lastTsMs: number;
+  firesLast24h: number;
+  successCount24h: number;
+}
 
 export type CronHealthState = 'healthy' | 'warning' | 'failure' | 'never-fired';
 
@@ -100,6 +107,11 @@ const CRONS_DIR = '.cortextOS/state/agents';
 const WARNING_MULTIPLIER = 2;
 const ONCE_GRACE_MS = 10 * 60 * 1000;
 const MS_24H = 24 * 60 * 60 * 1000;
+const executionLogCache = new Map<string, {
+  mtimeMs: number;
+  size: number;
+  entries: CronExecutionLogEntry[];
+}>();
 
 // ---------------------------------------------------------------------------
 // File readers
@@ -118,25 +130,59 @@ function readAgentCrons(agentName: string): CronDefinition[] {
   }
 }
 
-function readExecutionLog(agentName: string): CronExecutionLogEntry[] {
+function readParsedExecutionLog(logPath: string): CronExecutionLogEntry[] {
+  const stat = fs.statSync(logPath);
+  const cached = executionLogCache.get(logPath);
+  if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
+    return cached.entries;
+  }
+
+  const raw = fs.readFileSync(logPath, 'utf-8');
+  const entries: CronExecutionLogEntry[] = [];
+  for (const line of raw.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      entries.push(JSON.parse(trimmed) as CronExecutionLogEntry);
+    } catch {
+      // skip malformed lines
+    }
+  }
+  executionLogCache.set(logPath, { mtimeMs: stat.mtimeMs, size: stat.size, entries });
+  return entries;
+}
+function readExecutionStats(agentName: string, cutoff24h: number): Map<string, CronExecutionStats> {
   const logPath = path.join(CTX_ROOT, CRONS_DIR, agentName, 'cron-execution.log');
-  if (!fs.existsSync(logPath)) return [];
+  const statsByCron = new Map<string, CronExecutionStats>();
+  if (!fs.existsSync(logPath)) return statsByCron;
   try {
-    const raw = fs.readFileSync(logPath, 'utf-8');
-    const entries: CronExecutionLogEntry[] = [];
-    for (const line of raw.split('\n')) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-      try {
-        entries.push(JSON.parse(trimmed) as CronExecutionLogEntry);
-      } catch {
-        // skip malformed lines
+    for (const entry of readParsedExecutionLog(logPath)) {
+      const tsMs = new Date(entry.ts).getTime();
+      let stats = statsByCron.get(entry.cron);
+      if (!stats) {
+        stats = {
+          lastFire: null,
+          lastStatus: null,
+          lastTsMs: Number.NEGATIVE_INFINITY,
+          firesLast24h: 0,
+          successCount24h: 0,
+        };
+        statsByCron.set(entry.cron, stats);
+      }
+      if (!isNaN(tsMs) && tsMs >= stats.lastTsMs) {
+        stats.lastFire = entry.ts;
+        stats.lastStatus = entry.status;
+        stats.lastTsMs = tsMs;
+      }
+      if (!isNaN(tsMs) && tsMs >= cutoff24h) {
+        stats.firesLast24h++;
+        if (entry.status === 'fired') stats.successCount24h++;
       }
     }
-    return entries;
   } catch {
-    return [];
+    return statsByCron;
   }
+  return statsByCron;
 }
 
 // ---------------------------------------------------------------------------
@@ -210,18 +256,18 @@ function computeHealth(
   agent: string,
   org: string,
   cron: CronDefinition,
-  lastFire: string | null,
-  lastStatus: 'fired' | 'retried' | 'failed' | null,
   nextFire: string,
-  executionsLast24h: CronExecutionLogEntry[],
+  executionStats: CronExecutionStats | undefined,
   nowMs: number,
 ): CronHealthRow {
+  const lastFire = executionStats?.lastFire ?? null;
+  const lastStatus = executionStats?.lastStatus ?? null;
   const lastFireMs: number | null = lastFire ? new Date(lastFire).getTime() : null;
   const gapMs: number | null = lastFireMs !== null ? nowMs - lastFireMs : null;
   const expectedIntervalMs = Math.max(0, parseDurationMs(cron.schedule) || 0);
 
-  const firesLast24h = executionsLast24h.length;
-  const successCount = executionsLast24h.filter(e => e.status === 'fired').length;
+  const firesLast24h = executionStats?.firesLast24h ?? 0;
+  const successCount = executionStats?.successCount24h ?? 0;
   const successRate24h = firesLast24h > 0 ? successCount / firesLast24h : 1;
 
   function make(state: CronHealthState, reason: string): CronHealthRow {
@@ -285,36 +331,17 @@ export async function GET(request: NextRequest) {
       const crons = readAgentCrons(agent.name);
       if (crons.length === 0) continue;
 
-      // Read the full execution log once per agent
-      const allEntries = readExecutionLog(agent.name);
+      const executionStatsByCron = readExecutionStats(agent.name, cutoff24h);
 
       for (const cron of crons) {
-        // Last fire + status for this cron (most recent log entry)
-        let lastFire: string | null = null;
-        let lastStatus: 'fired' | 'retried' | 'failed' | null = null;
-        for (let i = allEntries.length - 1; i >= 0; i--) {
-          if (allEntries[i].cron === cron.name) {
-            lastFire = allEntries[i].ts;
-            lastStatus = allEntries[i].status;
-            break;
-          }
-        }
-
-        // 24h entries for this cron
-        const last24h = allEntries.filter(
-          e => e.cron === cron.name && new Date(e.ts).getTime() >= cutoff24h
-        );
-
         const nextFire = computeNextFire(cron.schedule, cron.last_fired_at, nowMs);
 
         healthRows.push(computeHealth(
           agent.name,
           agent.org,
           cron,
-          lastFire,
-          lastStatus,
           nextFire,
-          last24h,
+          executionStatsByCron.get(cron.name),
           nowMs,
         ));
       }

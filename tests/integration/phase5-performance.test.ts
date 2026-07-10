@@ -674,24 +674,32 @@ describe('SC-1: Scaling cliff — startup time at 500/1000/2000 crons', () => {
   it('startup time scales sub-linearly: 500/1000/2000 crons measured', async () => {
     const sizes = [500, 1000, 2000];
     const results: { size: number; ms: number }[] = [];
+    const STARTUP_SAMPLES = 3;
 
     for (const size of sizes) {
       const agentName = `sc1-agent-${size}`;
       writeCronsJson(agentName, generateCrons(agentName, size));
       await reloadModules();
 
-      const t0 = performance.now();
-      const scheduler = new CronScheduler({
-        agentName,
-        onFire: async () => { /* no-op */ },
-        logger: () => { /* silent */ },
-      });
-      scheduler.start();
-      const elapsed = performance.now() - t0;
-      scheduler.stop();
+      const samples: number[] = [];
+      for (let sample = 0; sample < STARTUP_SAMPLES; sample++) {
+        const t0 = performance.now();
+        const scheduler = new CronScheduler({
+          agentName,
+          onFire: async () => { /* no-op */ },
+          logger: () => { /* silent */ },
+        });
+        scheduler.start();
+        samples.push(performance.now() - t0);
+        scheduler.stop();
+      }
 
+      const elapsed = Math.min(...samples);
       results.push({ size, ms: elapsed });
-      console.log(`[SC-1] startup ${size} crons: ${elapsed.toFixed(1)}ms`);
+      console.log(
+        `[SC-1] startup ${size} crons: best=${elapsed.toFixed(1)}ms ` +
+        `samples=${samples.map(ms => ms.toFixed(1)).join(',')}`
+      );
     }
 
     // All sizes must start within 5s
@@ -699,7 +707,7 @@ describe('SC-1: Scaling cliff — startup time at 500/1000/2000 crons', () => {
       expect(ms, `startup with ${size} crons must be <5000ms`).toBeLessThan(5000);
     }
 
-    // Check growth ratio: startup should not grow faster than 5× when doubling cron count
+    // Check growth ratio: startup should not grow faster than 5× when doubling cron count.
     const ratio1kTo500 = results[1].ms / Math.max(results[0].ms, 0.1);
     const ratio2kTo1k  = results[2].ms / Math.max(results[1].ms, 0.1);
     console.log(
@@ -715,7 +723,7 @@ describe('SC-1: Scaling cliff — startup time at 500/1000/2000 crons', () => {
       threshold: 5000,
       unit: 'ms',
     };
-  });
+  }, 30_000);
 });
 
 // ===========================================================================

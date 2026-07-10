@@ -4,6 +4,8 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 // it returns true for any path EXCEPT the MMRAG_CONFIG one (when the test
 // wants to simulate a missing config) so loadSecretsEnv and other path
 // lookups still work normally inside the module under test.
+const toPosixPath = (value: unknown): string => String(value).replace(/\\/g, '/');
+
 const fsMocks = {
   existsSync: vi.fn(),
   readFileSync: vi.fn(),
@@ -96,7 +98,7 @@ afterEach(() => {
  */
 function mockMissingKbConfig(): void {
   fsMocks.existsSync.mockImplementation((p: any) => {
-    const path = String(p);
+    const path = toPosixPath(p);
     if (path.endsWith('/knowledge-base/config.json')) return false;
     return true;
   });

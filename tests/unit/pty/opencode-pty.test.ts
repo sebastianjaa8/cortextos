@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { join } from 'path';
+import { join, normalize } from 'path';
 
 const fsMocks = {
   existsSync: vi.fn().mockReturnValue(false),
@@ -9,6 +9,8 @@ const fsMocks = {
   readFileSync: vi.fn(),
   readdirSync: vi.fn().mockReturnValue([]),
 };
+
+const native = (value: string): string => normalize(value);
 
 let spawnCall: { file: string; args: string[]; options: any } | null = null;
 const mockPty = {
@@ -44,12 +46,12 @@ const { OpencodePTY, opencodeSessionExists } = await import('../../../src/pty/op
 
 const mockEnv = {
   instanceId: 'test',
-  ctxRoot: '/tmp/ctx',
-  frameworkRoot: '/tmp/fw',
+  ctxRoot: native('/tmp/ctx'),
+  frameworkRoot: native('/tmp/fw'),
   agentName: 'opencode-agent',
-  agentDir: '/tmp/fw/orgs/acme/agents/opencode-agent',
+  agentDir: native('/tmp/fw/orgs/acme/agents/opencode-agent'),
   org: 'acme',
-  projectRoot: '/tmp/fw',
+  projectRoot: native('/tmp/fw'),
 };
 
 beforeEach(() => {
@@ -109,7 +111,7 @@ describe('OpencodePTY', () => {
       opencode_agent: 'build',
     });
     installSpawnMock(pty);
-    await pty.spawn('fresh', 'boot prompt');
+    await pty.spawn('fresh', '');
 
     expect(spawnCall?.args).toEqual([
       '--model', 'openai/gpt-4.1-nano',
@@ -120,32 +122,32 @@ describe('OpencodePTY', () => {
   it('sets OPENCODE_CONFIG_DIR under the agent directory when spawning', async () => {
     const pty = new OpencodePTY(mockEnv, {});
     installSpawnMock(pty);
-    await pty.spawn('fresh', 'boot');
+    await pty.spawn('fresh', '');
 
     expect(spawnCall?.file).toBe('opencode');
     expect(spawnCall?.options.env.OPENCODE_CONFIG_DIR)
-      .toBe('/tmp/fw/orgs/acme/agents/opencode-agent/.opencode');
+      .toBe(native('/tmp/fw/orgs/acme/agents/opencode-agent/.opencode'));
   });
 
   it('isolates OpenCode data, config, state, and cache under cortextOS agent state', async () => {
     const pty = new OpencodePTY(mockEnv, {});
     installSpawnMock(pty);
-    await pty.spawn('fresh', 'boot');
+    await pty.spawn('fresh', '');
 
     expect(spawnCall?.options.env.XDG_DATA_HOME)
-      .toBe('/tmp/ctx/state/opencode-agent/opencode/data');
+      .toBe(native('/tmp/ctx/state/opencode-agent/opencode/data'));
     expect(spawnCall?.options.env.XDG_CONFIG_HOME)
-      .toBe('/tmp/ctx/state/opencode-agent/opencode/config');
+      .toBe(native('/tmp/ctx/state/opencode-agent/opencode/config'));
     expect(spawnCall?.options.env.XDG_STATE_HOME)
-      .toBe('/tmp/ctx/state/opencode-agent/opencode/state');
+      .toBe(native('/tmp/ctx/state/opencode-agent/opencode/state'));
     expect(spawnCall?.options.env.XDG_CACHE_HOME)
-      .toBe('/tmp/ctx/state/opencode-agent/opencode/cache');
+      .toBe(native('/tmp/ctx/state/opencode-agent/opencode/cache'));
   });
 
   it('overrides inherited XDG roots so OpenCode state stays agent-isolated by default', async () => {
-    fsMocks.existsSync.mockImplementation((path: string) => path === '/tmp/fw/orgs/acme/agents/opencode-agent/.env');
+    fsMocks.existsSync.mockImplementation((path: string) => path === native('/tmp/fw/orgs/acme/agents/opencode-agent/.env'));
     fsMocks.readFileSync.mockImplementation((path: string) => {
-      if (path === '/tmp/fw/orgs/acme/agents/opencode-agent/.env') {
+      if (path === native('/tmp/fw/orgs/acme/agents/opencode-agent/.env')) {
         return [
           'XDG_DATA_HOME=/global/data',
           'XDG_CONFIG_HOME=/global/config',
@@ -159,22 +161,22 @@ describe('OpencodePTY', () => {
 
     const pty = new OpencodePTY(mockEnv, {});
     installSpawnMock(pty);
-    await pty.spawn('fresh', 'boot');
+    await pty.spawn('fresh', '');
 
     expect(spawnCall?.options.env.XDG_DATA_HOME)
-      .toBe('/tmp/ctx/state/opencode-agent/opencode/data');
+      .toBe(native('/tmp/ctx/state/opencode-agent/opencode/data'));
     expect(spawnCall?.options.env.XDG_CONFIG_HOME)
-      .toBe('/tmp/ctx/state/opencode-agent/opencode/config');
+      .toBe(native('/tmp/ctx/state/opencode-agent/opencode/config'));
     expect(spawnCall?.options.env.XDG_STATE_HOME)
-      .toBe('/tmp/ctx/state/opencode-agent/opencode/state');
+      .toBe(native('/tmp/ctx/state/opencode-agent/opencode/state'));
     expect(spawnCall?.options.env.XDG_CACHE_HOME)
-      .toBe('/tmp/ctx/state/opencode-agent/opencode/cache');
+      .toBe(native('/tmp/ctx/state/opencode-agent/opencode/cache'));
   });
 
   it('supports an explicit OPENCODE_XDG_ROOT override for custom isolated roots', async () => {
-    fsMocks.existsSync.mockImplementation((path: string) => path === '/tmp/fw/orgs/acme/agents/opencode-agent/.env');
+    fsMocks.existsSync.mockImplementation((path: string) => path === native('/tmp/fw/orgs/acme/agents/opencode-agent/.env'));
     fsMocks.readFileSync.mockImplementation((path: string) => {
-      if (path === '/tmp/fw/orgs/acme/agents/opencode-agent/.env') {
+      if (path === native('/tmp/fw/orgs/acme/agents/opencode-agent/.env')) {
         return 'OPENCODE_XDG_ROOT=/custom/opencode\n';
       }
       return '';
@@ -182,34 +184,34 @@ describe('OpencodePTY', () => {
 
     const pty = new OpencodePTY(mockEnv, {});
     installSpawnMock(pty);
-    await pty.spawn('fresh', 'boot');
+    await pty.spawn('fresh', '');
 
-    expect(spawnCall?.options.env.XDG_DATA_HOME).toBe('/custom/opencode/data');
-    expect(spawnCall?.options.env.XDG_CONFIG_HOME).toBe('/custom/opencode/config');
-    expect(spawnCall?.options.env.XDG_STATE_HOME).toBe('/custom/opencode/state');
-    expect(spawnCall?.options.env.XDG_CACHE_HOME).toBe('/custom/opencode/cache');
+    expect(spawnCall?.options.env.XDG_DATA_HOME).toBe(native('/custom/opencode/data'));
+    expect(spawnCall?.options.env.XDG_CONFIG_HOME).toBe(native('/custom/opencode/config'));
+    expect(spawnCall?.options.env.XDG_STATE_HOME).toBe(native('/custom/opencode/state'));
+    expect(spawnCall?.options.env.XDG_CACHE_HOME).toBe(native('/custom/opencode/cache'));
   });
 
   it('keeps OPENCODE_CONFIG_DIR under the agent directory even when working_directory differs', async () => {
     const pty = new OpencodePTY(mockEnv, { working_directory: '/tmp/project-checkout' });
     installSpawnMock(pty);
-    await pty.spawn('fresh', 'boot');
+    await pty.spawn('fresh', '');
 
     expect(spawnCall?.options.cwd).toBe('/tmp/project-checkout');
     expect(spawnCall?.options.env.OPENCODE_CONFIG_DIR)
-      .toBe('/tmp/fw/orgs/acme/agents/opencode-agent/.opencode');
+      .toBe(native('/tmp/fw/orgs/acme/agents/opencode-agent/.opencode'));
   });
 
   it('maps GEMINI_API_KEY to OpenCode Google provider env name when needed', async () => {
-    fsMocks.existsSync.mockImplementation((path: string) => path === '/tmp/fw/orgs/acme/secrets.env');
+    fsMocks.existsSync.mockImplementation((path: string) => path === native('/tmp/fw/orgs/acme/secrets.env'));
     fsMocks.readFileSync.mockImplementation((path: string) => {
-      if (path === '/tmp/fw/orgs/acme/secrets.env') return 'GEMINI_API_KEY=gemini-secret\n';
+      if (path === native('/tmp/fw/orgs/acme/secrets.env')) return 'GEMINI_API_KEY=gemini-secret\n';
       return '';
     });
 
     const pty = new OpencodePTY(mockEnv, {});
     installSpawnMock(pty);
-    await pty.spawn('fresh', 'boot');
+    await pty.spawn('fresh', '');
 
     expect(spawnCall?.options.env.GOOGLE_GENERATIVE_AI_API_KEY).toBe('gemini-secret');
   });
@@ -217,11 +219,11 @@ describe('OpencodePTY', () => {
   it('writes a session marker but does not bootstrap before real TUI readiness', async () => {
     const pty = new OpencodePTY(mockEnv, {});
     installSpawnMock(pty);
-    await pty.spawn('fresh', 'boot');
+    await pty.spawn('fresh', '');
 
-    expect(fsMocks.mkdirSync).toHaveBeenCalledWith('/tmp/ctx/state/opencode-agent', { recursive: true });
+    expect(fsMocks.mkdirSync).toHaveBeenCalledWith(native('/tmp/ctx/state/opencode-agent'), { recursive: true });
     expect(fsMocks.writeFileSync).toHaveBeenCalledWith(
-      '/tmp/ctx/state/opencode-agent/opencode-session.json',
+      native('/tmp/ctx/state/opencode-agent/opencode-session.json'),
       expect.stringContaining('"runtime": "opencode"'),
       'utf-8',
     );
@@ -538,9 +540,9 @@ describe('OpencodePTY', () => {
   it('cleans up a stale recorded OpenCode process before spawning a replacement', async () => {
     const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
     fsMocks.existsSync.mockImplementation((path: string) =>
-      path === '/tmp/ctx/state/opencode-agent/opencode-process.json');
+      path === native('/tmp/ctx/state/opencode-agent/opencode-process.json'));
     fsMocks.readFileSync.mockImplementation((path: string) => {
-      if (path === '/tmp/ctx/state/opencode-agent/opencode-process.json') {
+      if (path === native('/tmp/ctx/state/opencode-agent/opencode-process.json')) {
         return JSON.stringify({ pid: 24680 });
       }
       return '';
@@ -552,7 +554,7 @@ describe('OpencodePTY', () => {
       await pty.spawn('fresh', '');
 
       expect(killSpy).toHaveBeenCalledWith(24680, 'SIGTERM');
-      expect(fsMocks.unlinkSync).toHaveBeenCalledWith('/tmp/ctx/state/opencode-agent/opencode-process.json');
+      expect(fsMocks.unlinkSync).toHaveBeenCalledWith(native('/tmp/ctx/state/opencode-agent/opencode-process.json'));
     } finally {
       killSpy.mockRestore();
     }
@@ -566,7 +568,7 @@ describe('OpencodePTY', () => {
     pty.kill();
 
     expect(mockPty.kill).toHaveBeenCalled();
-    expect(fsMocks.unlinkSync).toHaveBeenCalledWith('/tmp/ctx/state/opencode-agent/opencode-process.json');
+    expect(fsMocks.unlinkSync).toHaveBeenCalledWith(native('/tmp/ctx/state/opencode-agent/opencode-process.json'));
   });
 });
 

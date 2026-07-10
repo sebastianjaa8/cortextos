@@ -52,8 +52,16 @@ describe('readMaxCrashesPerDay', () => {
 });
 
 describe('notifyAgents', () => {
+  const originalFrameworkRoot = process.env.CTX_FRAMEWORK_ROOT;
+
   beforeEach(() => {
     execFileMock.mockReset();
+    delete process.env.CTX_FRAMEWORK_ROOT;
+  });
+
+  afterEach(() => {
+    if (originalFrameworkRoot === undefined) delete process.env.CTX_FRAMEWORK_ROOT;
+    else process.env.CTX_FRAMEWORK_ROOT = originalFrameworkRoot;
   });
 
   it('sends one bus send-message per recipient', () => {

@@ -71,9 +71,17 @@ function lastEmittedEvent(): { name: string; meta: Record<string, unknown> } | n
 }
 
 describe('src/bus/hooks — Day-2 per-handler wiring', () => {
+  const originalFrameworkRoot = process.env.CTX_FRAMEWORK_ROOT;
+
   beforeEach(() => {
     execFileCalls.length = 0;
     clearHandlerRegistry();
+    delete process.env.CTX_FRAMEWORK_ROOT;
+  });
+
+  afterEach(() => {
+    if (originalFrameworkRoot === undefined) delete process.env.CTX_FRAMEWORK_ROOT;
+    else process.env.CTX_FRAMEWORK_ROOT = originalFrameworkRoot;
   });
 
   describe('loadHookRegistry', () => {

@@ -863,8 +863,9 @@ describe('FastChecker', () => {
     it('fires exec after bootstrap at 50-min interval', async () => {
       const { execFile } = await import('child_process');
       const agent = createMockAgent('my-agent');
-      const checker = new FastChecker(agent, paths, '/tmp/framework');
-      checker.start();
+      const checker = new FastChecker(agent, paths, '/tmp/framework', { pollInterval: 60 * 60 * 1000 });
+      const startPromise = checker.start();
+      await vi.advanceTimersByTimeAsync(0);
       await vi.advanceTimersByTimeAsync(50 * 60 * 1000);
       expect(execFile).toHaveBeenCalledWith(
         process.execPath,
@@ -883,19 +884,22 @@ describe('FastChecker', () => {
       );
       checker.stop();
       checker.wake();
+      await startPromise;
     });
 
     it('clears timer on stop — no further exec calls after stop', async () => {
       const { execFile } = await import('child_process');
       const execMock = execFile as ReturnType<typeof vi.fn>;
       const agent = createMockAgent('my-agent');
-      const checker = new FastChecker(agent, paths, '/tmp/framework');
-      checker.start();
+      const checker = new FastChecker(agent, paths, '/tmp/framework', { pollInterval: 60 * 60 * 1000 });
+      const startPromise = checker.start();
+      await vi.advanceTimersByTimeAsync(0);
       await vi.advanceTimersByTimeAsync(50 * 60 * 1000);
       const callsBefore = execMock.mock.calls.length;
       expect(callsBefore).toBeGreaterThan(0);
       checker.stop();
       checker.wake();
+      await startPromise;
       await vi.advanceTimersByTimeAsync(50 * 60 * 1000);
       expect(execMock.mock.calls.length).toBe(callsBefore);
     });
@@ -905,7 +909,7 @@ describe('FastChecker', () => {
       const agent = createMockAgent('my-agent');
       agent.isBootstrapped.mockReturnValue(false);
       const checker = new FastChecker(agent, paths, '/tmp/framework');
-      checker.start();
+      const startPromise = checker.start();
       await vi.advanceTimersByTimeAsync(20 * 1000);
       expect(execFile).not.toHaveBeenCalledWith(
         'cortextos',
@@ -913,7 +917,8 @@ describe('FastChecker', () => {
         expect.any(Function),
       );
       checker.stop();
-      checker.wake();
+      await vi.advanceTimersByTimeAsync(10 * 1000);
+      await startPromise;
     });
   });
 

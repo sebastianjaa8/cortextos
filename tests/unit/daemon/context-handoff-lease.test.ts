@@ -205,7 +205,8 @@ describe('context handoff fleet lease', () => {
     const agentDir = join(ctxRoot, 'agents', agentName);
     mkdirSync(stateDir, { recursive: true });
     mkdirSync(agentDir, { recursive: true });
-    writeFileSync(join(agentDir, 'config.json'), JSON.stringify({}), 'utf-8');
+    const config = { ctx_handoff_threshold: 60 };
+    writeFileSync(join(agentDir, 'config.json'), JSON.stringify(config), 'utf-8');
     const status: Record<string, unknown> = {
       used_percentage: opts.pct ?? 50,
       exceeds_200k_tokens: false,
@@ -221,7 +222,7 @@ describe('context handoff fleet lease', () => {
     const agent = {
       name: agentName,
       injectMessage,
-      getConfig: () => ({}),
+      getConfig: () => config,
       getAgentDir: () => agentDir,
       getOutputBuffer: () => ({ getRecent: () => '' }),
       sessionRefresh: () => Promise.resolve(),

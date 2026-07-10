@@ -19,13 +19,15 @@
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync } from 'fs';
+import { createServer } from 'net';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { WsUnixJsonRpcClient } from '../../src/utils/ws-unix-client.js';
 
 const { MockCodexServer } = require('./mock-codex.js') as {
   MockCodexServer: new (options: {
-    socketPath: string;
+    socketPath?: string;
+    endpoint?: { host: string; port: number };
     skills?: Array<{ name: string; path: string; enabled?: boolean }>;
     turnDeltaText?: string;
     tokenUsage?: Record<string, number>;
@@ -43,22 +45,24 @@ interface MockCodexServerInstance {
 
 describe('E2E codex lifecycle (mock-codex.js + WsUnixJsonRpcClient)', () => {
   let testDir: string;
-  let socketPath: string;
+  let endpoint: string | { host: string; port: number };
   let server: MockCodexServerInstance;
   let client: WsUnixJsonRpcClient;
   let notifications: Array<{ method: string; params: unknown }>;
 
   beforeEach(async () => {
     testDir = mkdtempSync(join(tmpdir(), 'lifecycle-codex-'));
-    socketPath = join(testDir, 'codex.sock');
+    endpoint = process.platform === 'win32'
+      ? { host: '127.0.0.1', port: await getFreePort() }
+      : join(testDir, 'codex.sock');
     server = new MockCodexServer({
-      socketPath,
+      ...(typeof endpoint === 'string' ? { socketPath: endpoint } : { endpoint }),
       skills: [{ name: 'review-pr', path: '/skills/review-pr', enabled: true }],
       turnDeltaText: 'hello world',
     });
     await server.listen();
     notifications = [];
-    client = new WsUnixJsonRpcClient(socketPath);
+    client = new WsUnixJsonRpcClient(endpoint);
     client.onMessage((message) => {
       if (typeof message === 'object' && message !== null && 'method' in message && !('id' in message)) {
         notifications.push({ method: (message as { method: string }).method, params: (message as { params: unknown }).params });
@@ -193,6 +197,18 @@ describe('E2E codex lifecycle (mock-codex.js + WsUnixJsonRpcClient)', () => {
     await expect(client.request('not/a/method', {})).rejects.toThrow(/Method not found/);
   });
 });
+
+async function getFreePort(): Promise<number> {
+  const server = createServer();
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => resolve());
+  });
+  const address = server.address();
+  const port = typeof address === 'object' && address ? address.port : 0;
+  await new Promise<void>((resolve) => server.close(() => resolve()));
+  return port;
+}
 
 async function waitFor(predicate: () => boolean, timeoutMs = 2000, stepMs = 10): Promise<void> {
   const start = Date.now();

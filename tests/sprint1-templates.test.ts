@@ -3,6 +3,7 @@ import { existsSync, readdirSync, readFileSync, statSync } from 'fs';
 import { join } from 'path';
 
 const TEMPLATE_ROOT = join(__dirname, '..', 'templates');
+const normalizeNewlines = (content: string): string => content.replace(/\r\n/g, '\n');
 
 describe('Sprint 1: Template Completeness', () => {
   describe('Agent template', () => {
@@ -116,7 +117,7 @@ describe('Sprint 1: Template Completeness', () => {
 
     it('skill files have YAML frontmatter', () => {
       const skillPath = join(agentDir, '.claude', 'skills', 'autoresearch', 'SKILL.md');
-      const content = readFileSync(skillPath, 'utf-8');
+      const content = normalizeNewlines(readFileSync(skillPath, 'utf-8'));
       expect(content).toMatch(/^---\n/);
       expect(content).toContain('name: autoresearch');
       expect(content).toContain('description:');

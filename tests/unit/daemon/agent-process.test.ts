@@ -1,4 +1,8 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { normalize } from 'path';
+
+const native = (value: string): string => normalize(value);
+const toPosixPath = (value: unknown): string => String(value).replace(/\\/g, '/');
 
 // Capture the PTY exit handler so tests can simulate exits at controlled times
 let capturedOnExit: ((exitCode: number, signal?: number) => void) | null = null;
@@ -177,7 +181,7 @@ describe('AgentProcess - BUG-011 fix (stop awaits PTY exit)', () => {
     // to stdout and left restarts.log empty.
     expect(fsMocks.appendFileSync).toHaveBeenCalledTimes(1);
     const [logPath, logLine] = fsMocks.appendFileSync.mock.calls[0];
-    expect(String(logPath)).toContain('/logs/alice/restarts.log');
+    expect(toPosixPath(logPath)).toContain('/logs/alice/restarts.log');
     expect(String(logLine)).toMatch(/\] CRASH: exit_code=1 crash_count=1 backoff_s=5\b/);
     expect(String(logLine).endsWith('\n')).toBe(true);
   });
@@ -187,8 +191,7 @@ describe('AgentProcess - BUG-011 fix (stop awaits PTY exit)', () => {
     // marker moments ago. handleExit should recognize the shutdown-in-progress
     // signal and bail out before touching the crash counter or restarts.log.
     fsMocks.existsSync.mockImplementation((p: any) => {
-      const path = String(p);
-      return path.endsWith('/state/alice/.daemon-stop');
+      return toPosixPath(p).endsWith('/state/alice/.daemon-stop');
     });
     fsMocks.statSync.mockImplementation((p: any) => ({ mtimeMs: Date.now() - 2_000 }));
 
@@ -218,7 +221,7 @@ describe('AgentProcess - BUG-011 fix (stop awaits PTY exit)', () => {
     // we do NOT want it to silently swallow genuine crashes hours later.
     // The 60s window in isDaemonShuttingDown() is the load-bearing check.
     fsMocks.existsSync.mockImplementation((p: any) =>
-      String(p).endsWith('/state/alice/.daemon-stop'),
+      toPosixPath(p).endsWith('/state/alice/.daemon-stop'),
     );
     fsMocks.statSync.mockImplementation((p: any) => ({ mtimeMs: Date.now() - 3_600_000 })); // 1h old
 
@@ -263,7 +266,7 @@ describe('AgentProcess - BUG-011 fix (stop awaits PTY exit)', () => {
       (call) => String(call[0]).endsWith('.session-refresh'),
     );
     expect(writeIdx).toBeGreaterThanOrEqual(0);
-    expect(String(fsMocks.writeFileSync.mock.calls[writeIdx][0])).toBe('/tmp/test-ctx/state/alice/.session-refresh');
+    expect(String(fsMocks.writeFileSync.mock.calls[writeIdx][0])).toBe(native('/tmp/test-ctx/state/alice/.session-refresh'));
     // The marker must be written BEFORE stop() — a SessionEnd hook firing as
     // the PTY dies must already see the marker, or it classifies a false crash.
     const markerWriteOrder = fsMocks.writeFileSync.mock.invocationCallOrder[writeIdx];
@@ -428,10 +431,10 @@ describe('AgentProcess - onboarding marker (do not auto-write .onboarded on hear
   // runtime).
   it('does not auto-mark a heartbeat-only agent as onboarded (still routes to FIRST BOOT)', async () => {
     fsMocks.existsSync.mockImplementation((path: string) => {
-      if (path.endsWith('/.force-fresh')) return false;
-      if (path.endsWith('/.onboarded')) return false;
-      if (path.endsWith('/heartbeat.json')) return true;
-      if (path.endsWith('/ONBOARDING.md')) return true;
+      if (toPosixPath(path).endsWith('/.force-fresh')) return false;
+      if (toPosixPath(path).endsWith('/.onboarded')) return false;
+      if (toPosixPath(path).endsWith('/heartbeat.json')) return true;
+      if (toPosixPath(path).endsWith('/ONBOARDING.md')) return true;
       return false;
     });
 
@@ -451,10 +454,10 @@ describe('AgentProcess - onboarding marker (do not auto-write .onboarded on hear
 
   it('respects an existing .onboarded marker (suppresses FIRST BOOT)', async () => {
     fsMocks.existsSync.mockImplementation((path: string) => {
-      if (path.endsWith('/.force-fresh')) return false;
-      if (path.endsWith('/.onboarded')) return true;
-      if (path.endsWith('/heartbeat.json')) return true;
-      if (path.endsWith('/ONBOARDING.md')) return true;
+      if (toPosixPath(path).endsWith('/.force-fresh')) return false;
+      if (toPosixPath(path).endsWith('/.onboarded')) return true;
+      if (toPosixPath(path).endsWith('/heartbeat.json')) return true;
+      if (toPosixPath(path).endsWith('/ONBOARDING.md')) return true;
       return false;
     });
 

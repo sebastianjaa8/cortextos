@@ -122,6 +122,12 @@ export class FastChecker {
 
     // Wait for bootstrap
     await this.waitForBootstrap();
+    if (!this.running) {
+      if (process.platform !== 'win32') {
+        process.removeListener('SIGUSR1', sigusr1Handler);
+      }
+      return;
+    }
     this.log('Bootstrap complete. Beginning poll loop.');
 
     // Idle-session heartbeat watchdog: fires every 50 min regardless of REPL state

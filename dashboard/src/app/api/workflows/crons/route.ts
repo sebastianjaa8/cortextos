@@ -75,28 +75,28 @@ function readAgentCrons(agentName: string): CronDefinition[] {
   }
 }
 
-function readLastExecution(
-  agentName: string,
-  cronName: string,
-): CronExecutionLogEntry | null {
+function readLastExecutions(agentName: string): Map<string, CronExecutionLogEntry> {
   const logPath = path.join(CTX_ROOT, CRONS_DIR, agentName, 'cron-execution.log');
-  if (!fs.existsSync(logPath)) return null;
+  const latest = new Map<string, CronExecutionLogEntry>();
+  if (!fs.existsSync(logPath)) return latest;
   try {
     const raw = fs.readFileSync(logPath, 'utf-8');
-    const lines = raw.split('\n').filter(l => l.trim());
-    // Walk backwards to find last entry for this cron
+    const lines = raw.split('\n');
+    // Walk backwards once and keep the first entry seen for each cron.
     for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i].trim();
+      if (!line) continue;
       try {
-        const entry = JSON.parse(lines[i]) as CronExecutionLogEntry;
-        if (entry.cron === cronName) return entry;
+        const entry = JSON.parse(line) as CronExecutionLogEntry;
+        if (!latest.has(entry.cron)) latest.set(entry.cron, entry);
       } catch {
         // skip malformed line
       }
     }
-    return null;
   } catch {
-    return null;
+    return latest;
   }
+  return latest;
 }
 
 // ---------------------------------------------------------------------------
@@ -119,10 +119,11 @@ export async function GET(request: NextRequest) {
 
     for (const agent of agents) {
       const crons = readAgentCrons(agent.name);
+      const lastExecutions = readLastExecutions(agent.name);
       for (const cron of crons) {
         if (searchFilter && !cron.name.toLowerCase().includes(searchFilter)) continue;
 
-        const lastEntry = readLastExecution(agent.name, cron.name);
+        const lastEntry = lastExecutions.get(cron.name) ?? null;
 
         rows.push({
           agent: agent.name,
