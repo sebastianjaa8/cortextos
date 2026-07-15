@@ -55,22 +55,23 @@ const TICK = CronScheduler.TICK_INTERVAL_MS; // 30_000 ms
 // ---------------------------------------------------------------------------
 // nextFireFromCron — unit tests for the cron expression parser
 //
-// These tests are timezone-agnostic: rather than hardcoding UTC epoch ms
-// values (which would break on machines not set to UTC), we verify:
-//   (a) the result is a valid number,
-//   (b) the local-time fields (hour, minute, day-of-week) of the result
-//       match what the cron expression requests.
+// BUG 2 fix: cron expressions are evaluated in UTC, not the daemon process's
+// local timezone (previously getHours()/getDate()/etc., which made every
+// fixed-hour cron fire at the host machine's local-TZ hour instead of UTC).
+// These tests therefore assert against UTC fields (getUTCHours() etc.) —
+// they are still timezone-agnostic (no hardcoded epoch ms), but the fields
+// being checked are UTC ones since that's now the scheduling contract.
 // ---------------------------------------------------------------------------
 
-/** Pull the local-time components out of an epoch-ms value. */
+/** Pull the UTC-time components out of an epoch-ms value. */
 function localOf(ms: number) {
   const d = new Date(ms);
   return {
-    minutes:    d.getMinutes(),
-    hours:      d.getHours(),
-    date:       d.getDate(),
-    month:      d.getMonth() + 1,
-    dayOfWeek:  d.getDay(),
+    minutes:    d.getUTCMinutes(),
+    hours:      d.getUTCHours(),
+    date:       d.getUTCDate(),
+    month:      d.getUTCMonth() + 1,
+    dayOfWeek:  d.getUTCDay(),
   };
 }
 
@@ -89,10 +90,10 @@ describe('nextFireFromCron', () => {
     expect(next % 60_000).toBe(0);
   });
 
-  it('computes next fire at local hour 13 for "0 13 * * *" when before 13:00 today', () => {
-    // Construct a "from" time that is in local hour 12 today.
+  it('computes next fire at UTC hour 13 for "0 13 * * *" when before 13:00 UTC today', () => {
+    // Construct a "from" time that is in UTC hour 12 today.
     const ref = new Date();
-    ref.setHours(12, 0, 0, 0);
+    ref.setUTCHours(12, 0, 0, 0);
     const fromMs = ref.getTime();
 
     const next = nextFireFromCron('0 13 * * *', fromMs);
@@ -101,14 +102,14 @@ describe('nextFireFromCron', () => {
     const loc = localOf(next);
     expect(loc.hours).toBe(13);
     expect(loc.minutes).toBe(0);
-    // Must be the same calendar date (still today)
-    expect(loc.date).toBe(new Date(fromMs).getDate());
+    // Must be the same calendar date (still today), in UTC
+    expect(loc.date).toBe(new Date(fromMs).getUTCDate());
   });
 
-  it('wraps to next day when local hour 13 has already passed today', () => {
-    // Construct a "from" time in local hour 14 today.
+  it('wraps to next day when UTC hour 13 has already passed today', () => {
+    // Construct a "from" time in UTC hour 14 today.
     const ref = new Date();
-    ref.setHours(14, 0, 0, 0);
+    ref.setUTCHours(14, 0, 0, 0);
     const fromMs = ref.getTime();
 
     const next = nextFireFromCron('0 13 * * *', fromMs);
@@ -117,16 +118,16 @@ describe('nextFireFromCron', () => {
     const loc = localOf(next);
     expect(loc.hours).toBe(13);
     expect(loc.minutes).toBe(0);
-    // Must be tomorrow (date + 1), accounting for month wrap
+    // Must be tomorrow (date + 1), accounting for month wrap, in UTC
     const expectedDate = new Date(fromMs);
-    expectedDate.setDate(expectedDate.getDate() + 1);
-    expect(loc.date).toBe(expectedDate.getDate());
+    expectedDate.setUTCDate(expectedDate.getUTCDate() + 1);
+    expect(loc.date).toBe(expectedDate.getUTCDate());
   });
 
   it('handles comma-list: "0 0,6,12,18 * * *" — picks the next matching hour', () => {
-    // Set from = local 05:00 so next matching hour is 6.
+    // Set from = UTC 05:00 so next matching hour is 6.
     const ref = new Date();
-    ref.setHours(5, 0, 0, 0);
+    ref.setUTCHours(5, 0, 0, 0);
     const fromMs = ref.getTime();
 
     const next = nextFireFromCron('0 0,6,12,18 * * *', fromMs);
@@ -138,9 +139,9 @@ describe('nextFireFromCron', () => {
     expect(next).toBeGreaterThan(fromMs);
   });
 
-  it('handles ranges: "0 8-10 * * *" — fires within [8,9,10] local hours', () => {
+  it('handles ranges: "0 8-10 * * *" — fires within [8,9,10] UTC hours', () => {
     const ref = new Date();
-    ref.setHours(7, 59, 0, 0);
+    ref.setUTCHours(7, 59, 0, 0);
     const fromMs = ref.getTime();
 
     const next = nextFireFromCron('0 8-10 * * *', fromMs);
@@ -246,6 +247,59 @@ describe('CronScheduler', () => {
     await vi.advanceTimersByTimeAsync(3 * 60_000 + TICK);
 
     expect(fired.length).toBeGreaterThanOrEqual(3);
+  });
+
+  // -------------------------------------------------------------------------
+  // BUG 1 regression: interval schedule must anchor to the scheduled slot,
+  // not to the tick that happened to observe it.
+  //
+  // The scheduler only checks for due crons every TICK_INTERVAL_MS (30s), so
+  // a cron's nextFireAt rarely lands exactly on a tick boundary — the tick
+  // that notices "it's due" is typically a few seconds to ~30s AFTER the
+  // real slot. Before the fix, tick() advanced the schedule from `now` (the
+  // tick-observation time) instead of from the slot that was actually due
+  // (`sc.nextFireAt`), permanently baking that observation lag into the
+  // schedule's phase every time a cron is (re)loaded. The fix anchors off
+  // `sc.nextFireAt` so the grid derived from `last_fired_at` is preserved
+  // exactly, regardless of tick granularity.
+  // -------------------------------------------------------------------------
+
+  it('interval cron stays anchored to the last_fired_at grid despite tick-boundary misalignment', async () => {
+    // Deliberately offset so the computed nextFireAt does NOT land on a
+    // 30s tick boundary: last_fired_at = now - 12_345ms, schedule = 1m,
+    // so nextFireAt = now + 47_655ms — the tick that notices it due fires
+    // at +60_000ms, a 12_345ms observation lag if that lag gets baked in.
+    const OFFSET_MS = 12_345;
+    const lastFiredAt = new Date(Date.now() - OFFSET_MS).toISOString();
+    mockReadCrons.mockReturnValue([
+      makeCron({ schedule: '1m', last_fired_at: lastFiredAt }),
+    ]);
+
+    const anchorScheduler = new CronScheduler({
+      agentName: 'test-agent',
+      onFire: () => {},
+      logger: (msg) => logs.push(msg),
+    });
+
+    anchorScheduler.start();
+
+    // Ideal grid, independent of tick granularity: last_fired_at + N * 1m.
+    const lastFiredAtMs = new Date(lastFiredAt).getTime();
+
+    // Let one fire cycle complete.
+    await vi.advanceTimersByTimeAsync(60_000 + TICK);
+
+    const entry = anchorScheduler.getNextFireTimes().find(e => e.name === 'test-cron');
+    expect(entry).toBeDefined();
+
+    // After 1 fire, nextFireAt should be exactly lastFiredAt + 2 * 60_000 —
+    // not lastFiredAt + 2*60_000 + OFFSET_MS (which is what the pre-fix
+    // "advance from now" logic would have produced, since the observing
+    // tick landed OFFSET_MS after the true slot).
+    const idealNextFireAt = lastFiredAtMs + 2 * 60_000;
+    expect(entry!.nextFireAt).toBe(idealNextFireAt);
+
+    anchorScheduler.stop();
   });
 
   // -------------------------------------------------------------------------
