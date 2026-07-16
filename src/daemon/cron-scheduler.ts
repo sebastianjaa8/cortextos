@@ -104,11 +104,18 @@ export function nextFireFromCron(expr: string, fromMs: number): number {
 
   for (let i = 0; i < MAX_MINUTES; i++) {
     const d = new Date(candidate);
-    const m  = d.getMinutes();
-    const h  = d.getHours();
-    const dy = d.getDate();
-    const mo = d.getMonth() + 1; // 1-12
-    const dw = d.getDay();       // 0-6
+    // BUG 2 fix: cron expressions are evaluated in UTC, not the daemon
+    // process's local timezone. Using getHours()/getDate()/etc. made every
+    // fixed-hour cron (e.g. "0 9 * * 1-5") fire at 9am in whatever TZ the
+    // host machine happens to be configured with (America/New_York for this
+    // fleet) instead of 9am UTC. Confirmed via pm_bot's crons.json: schedule
+    // "0 22 * * 0" (intended UTC-facing) was firing at 02:00 UTC Monday —
+    // i.e. 22:00 *local ET* Sunday, not 22:00 UTC Sunday.
+    const m  = d.getUTCMinutes();
+    const h  = d.getUTCHours();
+    const dy = d.getUTCDate();
+    const mo = d.getUTCMonth() + 1; // 1-12
+    const dw = d.getUTCDay();       // 0-6
 
     if (
       months.includes(mo) &&
@@ -160,6 +167,39 @@ function computeNextFireAt(cron: CronDefinition, referenceMs: number): number {
   }
   // Try as a cron expression
   const next = nextFireFromCron(cron.schedule, referenceMs);
+  return next;
+}
+
+/**
+ * Advance a cron's nextFireAt after it fires (successfully or not).
+ *
+ * BUG 1 fix: the previous implementation always computed the next slot from
+ * `now` — the moment tick() *observed* the cron as due, captured once at the
+ * top of tick() — i.e. `computeNextFireAt(cron, now)`. Because tick() only
+ * runs every TICK_INTERVAL_MS (30s), `now` lags the true scheduled slot
+ * (`sc.nextFireAt`) by up to one tick whenever that slot doesn't land
+ * exactly on a tick boundary — which is true for almost every interval cron,
+ * since last_fired_at (the anchor) is essentially never tick-aligned. That
+ * lag then got baked permanently into the schedule's phase: e.g. a "1m" cron
+ * whose slot was 12s before the observing tick would forever fire 12s later
+ * than the last_fired_at-derived grid intended, every cycle, with no way to
+ * claw it back.
+ *
+ * Fix: advance from the slot that was actually due (`previousScheduledAt` —
+ * the pre-fire `sc.nextFireAt`), not from the observation time. This keeps
+ * interval crons anchored exactly to their original reference point
+ * (last_fired_at + N * interval) regardless of tick granularity.
+ *
+ * Guard: if the daemon stalled for a long time (system sleep, blocked event
+ * loop) such that `previousScheduledAt + duration` is still <= now, don't
+ * flood-fire every missed slot — rebase from `now` once, matching the
+ * single-catch-up policy already used in loadCrons().
+ */
+function advanceNextFireAt(cron: CronDefinition, previousScheduledAt: number, now: number): number {
+  const next = computeNextFireAt(cron, previousScheduledAt);
+  if (!isNaN(next) && next <= now) {
+    return computeNextFireAt(cron, now);
+  }
   return next;
 }
 
@@ -509,8 +549,9 @@ export class CronScheduler {
           );
         }
 
-        // Advance in-memory nextFireAt
-        const next = computeNextFireAt(cron, now);
+        // Advance in-memory nextFireAt — from the scheduled slot, not `now`
+        // (see advanceNextFireAt doc comment / BUG 1 fix).
+        const next = advanceNextFireAt(cron, sc.nextFireAt, now);
         if (!isNaN(next)) {
           sc.nextFireAt = next;
           sc.definition = { ...cron, last_fired_at: nowIso, fire_count: newFireCount };
@@ -525,7 +566,7 @@ export class CronScheduler {
         // we don't re-fire the same scheduled slot on every subsequent tick —
         // that produced a busy-loop when an agent was unreachable. Treat the
         // failed window as a missed slot and schedule the next normal fire.
-        const next = computeNextFireAt(cron, now);
+        const next = advanceNextFireAt(cron, sc.nextFireAt, now);
         if (!isNaN(next)) {
           sc.nextFireAt = next;
           this.logger(

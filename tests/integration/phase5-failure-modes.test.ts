@@ -28,8 +28,9 @@
  *        next start sees cron as overdue and fires catch-up.
  * FM-7: Log rotation under concurrent write pressure — 100+ simultaneous
  *        appends while size threshold is exceeded; rotation stays atomic.
- * FM-8: Cron-expression local-time behavior — scheduler uses Date.getHours()
- *        (local wall clock, not UTC); documented behavior, tested for consistency.
+ * FM-8: Cron-expression UTC behavior — scheduler uses Date.getUTCHours() etc.
+ *        (UTC wall clock, not the daemon process's local TZ); BUG 2 fix,
+ *        tested for consistency regardless of host machine timezone.
  * FM-9: IPC reload during active catch-up — schedule-change mid-flight via
  *        reload() while a cron is in its firing guard (firing=true).
  *
@@ -829,13 +830,13 @@ describe('FM-7: Log rotation under concurrent write pressure', () => {
 // FM-8: Cron-expression local-time behavior
 // ---------------------------------------------------------------------------
 
-describe('FM-8: Cron-expression local-time behavior — consistent with Date.getHours()', () => {
-  it('fixed-hour cron expression fires at the correct local hour', async () => {
-    // DOCUMENTED BEHAVIOR: The scheduler uses Date.getHours() (local wall clock).
-    // Cron expression `0 H * * *` fires at H:00 LOCAL time, not H:00 UTC.
-    // This is consistent with the standard cron behavior on most systems.
+describe('FM-8: Cron-expression UTC behavior — consistent with Date.getUTCHours()', () => {
+  it('fixed-hour cron expression fires at the correct UTC hour', async () => {
+    // BUG 2 FIX: The scheduler uses Date.getUTCHours() (UTC wall clock), not
+    // the daemon process's local TZ. Cron expression `0 H * * *` fires at
+    // H:00 UTC regardless of host machine timezone.
     //
-    // We test this by setting a known start time, computing the expected local-hour
+    // We test this by setting a known start time, computing the expected UTC-hour
     // fire time, and verifying the scheduler fires at that moment.
 
     const agent = 'fm-localtime';
@@ -843,16 +844,16 @@ describe('FM-8: Cron-expression local-time behavior — consistent with Date.get
 
     const fired: number[] = [];
 
-    // Set start to midnight local time on a known day
-    // Use fake timers to set a concrete start — midnight local (getHours() = 0)
+    // Set start to midnight UTC on a known day
+    // Use fake timers to set a concrete start — midnight UTC (getUTCHours() = 0)
     const now = Date.now();
-    // Find midnight local time: floor to day boundary
+    // Find midnight UTC: floor to day boundary
     const d = new Date(now);
-    d.setHours(0, 0, 0, 0); // midnight local
-    const midnightLocal = d.getTime();
-    vi.setSystemTime(midnightLocal);
+    d.setUTCHours(0, 0, 0, 0); // midnight UTC
+    const midnightUtc = d.getTime();
+    vi.setSystemTime(midnightUtc);
 
-    // Schedule cron for 3am local (avoids DST ambiguity in spring/fall transitions)
+    // Schedule cron for 3am UTC
     addCron(agent, makeCronDef('local-3am', '0 3 * * *'));
 
     const scheduler = buildScheduler(agent, () => {
@@ -866,8 +867,8 @@ describe('FM-8: Cron-expression local-time behavior — consistent with Date.get
     // Exactly 1 fire in 4 hours
     expect(fired.length).toBe(1);
 
-    // The fire time should be at or after 3:00am local
-    const expectedFireMs = midnightLocal + 3 * ONE_HOUR;
+    // The fire time should be at or after 3:00am UTC
+    const expectedFireMs = midnightUtc + 3 * ONE_HOUR;
     expect(fired[0]).toBeGreaterThanOrEqual(expectedFireMs);
     expect(fired[0]).toBeLessThan(expectedFireMs + 2 * TICK_MS); // within 1 tick
 
@@ -881,17 +882,17 @@ describe('FM-8: Cron-expression local-time behavior — consistent with Date.get
 
     const fired: string[] = [];
 
-    // Set time to a Sunday at midnight local
+    // Set time to a Sunday at midnight UTC
     // Find next Sunday
     const now = Date.now();
     const d = new Date(now);
-    d.setHours(0, 0, 0, 0);
-    // Advance to Sunday (getDay() = 0)
-    while (d.getDay() !== 0) {
-      d.setDate(d.getDate() + 1);
+    d.setUTCHours(0, 0, 0, 0);
+    // Advance to Sunday (getUTCDay() = 0)
+    while (d.getUTCDay() !== 0) {
+      d.setUTCDate(d.getUTCDate() + 1);
     }
-    const sundayMidnightLocal = d.getTime();
-    vi.setSystemTime(sundayMidnightLocal);
+    const sundayMidnightUtc = d.getTime();
+    vi.setSystemTime(sundayMidnightUtc);
 
     addCron(agent, makeCronDef('weekday-9am', '0 9 * * 1-5'));
 
@@ -909,7 +910,7 @@ describe('FM-8: Cron-expression local-time behavior — consistent with Date.get
     // Advance into Monday (another 9h+)
     await advanceSim(10 * ONE_HOUR);
 
-    // Should fire on Monday at 9am local
+    // Should fire on Monday at 9am UTC
     expect(fired.length).toBe(1);
 
     scheduler.stop();
