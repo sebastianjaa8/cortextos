@@ -204,8 +204,13 @@ busCommand
       }
     }
 
-    updateTask(paths, id, status as TaskStatus);
-    console.log(`Updated ${id} -> ${status}`);
+    try {
+      updateTask(paths, id, status as TaskStatus);
+      console.log(`Updated ${id} -> ${status}`);
+    } catch (err) {
+      console.error(err instanceof Error ? err.message : String(err));
+      process.exit(1);
+    }
   });
 
 busCommand
@@ -315,8 +320,13 @@ busCommand
       }
     }
 
-    completeTask(paths, id, effectiveResult);
-    console.log(`Completed ${id}`);
+    try {
+      completeTask(paths, id, effectiveResult);
+      console.log(`Completed ${id}`);
+    } catch (err) {
+      console.error(err instanceof Error ? err.message : String(err));
+      process.exit(1);
+    }
   });
 
 busCommand
