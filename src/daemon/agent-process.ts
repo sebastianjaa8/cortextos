@@ -462,7 +462,17 @@ export class AgentProcess {
     this.pendingInjections.push({ content, enqueuedAt: Date.now(), attempts: 0 });
     if (this.pendingInjections.length > AgentProcess.DRAIN_MAX_QUEUE) {
       const dropped = this.pendingInjections.shift();
-      this.log(`Inject queue overflow (>${AgentProcess.DRAIN_MAX_QUEUE}) — dropped oldest queued prompt: ${(dropped?.content ?? '').slice(0, 80)}`);
+      if (dropped) {
+        this.log(`Inject queue overflow (>${AgentProcess.DRAIN_MAX_QUEUE}) — dropped oldest queued prompt: ${dropped.content.slice(0, 80)}`);
+        // A retry (attempts > 0) sits at the FRONT by design (see
+        // handleQueuedDeliveryFailure), so plain oldest-at-front eviction can
+        // silently re-lose an item that already survived one real delivery
+        // failure — with no attempts budget left to retry it further, this
+        // must escalate the same as delivery-exhaustion does, not just log.
+        if (dropped.attempts > 0) {
+          this.emitDroppedInjectEvent(dropped.content, dropped.attempts, dropped.enqueuedAt, 'queue-overflow-eviction');
+        }
+      }
     }
     this.ensureDrainTimer();
     return { ok: true, queued: true };
@@ -559,13 +569,34 @@ export class AgentProcess {
     this.log(
       `Queued inject delivery FAILED after ${attempts} attempts — dropping and escalating: ${item.content.slice(0, 80)}`
     );
+    this.emitDroppedInjectEvent(item.content, attempts, item.enqueuedAt, 'delivery-retries-exhausted');
+  }
+
+  /**
+   * Escalate a permanently-lost queued inject. `skipHeartbeatRefresh: true`
+   * (logEvent's last arg) because this event is reported BY the daemon ABOUT
+   * this agent's session, not something the agent itself did — refreshing
+   * last_heartbeat here would mask the exact staleness a watchdog needs to
+   * see (Opus adversarial review finding, 2026-07-23).
+   */
+  private emitDroppedInjectEvent(content: string, attempts: number, enqueuedAt: number, reason: string): void {
     try {
       const paths = resolvePaths(this.name, this.env.instanceId, this.env.org);
-      logEvent(paths, this.name, this.env.org, 'error', 'cron_inject_dropped', 'critical', {
-        attempts,
-        content_preview: item.content.slice(0, 200),
-        enqueued_at: new Date(item.enqueuedAt).toISOString(),
-      });
+      logEvent(
+        paths,
+        this.name,
+        this.env.org,
+        'error',
+        'cron_inject_dropped',
+        'critical',
+        {
+          reason,
+          attempts,
+          content_preview: content.slice(0, 200),
+          enqueued_at: new Date(enqueuedAt).toISOString(),
+        },
+        true,
+      );
     } catch (err) {
       this.log(`Failed to emit cron_inject_dropped event: ${err instanceof Error ? err.message : String(err)}`);
     }

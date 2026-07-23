@@ -19,6 +19,12 @@ import { validateEventCategory, validateEventSeverity, isValidJson } from '../ut
  * a failing heartbeat refresh never blocks the event write itself.
  * If no heartbeat file exists yet we do nothing — the first
  * update-heartbeat call creates it with full field values.
+ *
+ * Pass `skipHeartbeatRefresh: true` when the event is being logged ABOUT the
+ * agent by something other than the agent itself (e.g. the daemon reporting
+ * that agent's session dropped an inject) — the liveness premise above is
+ * false in that case, and refreshing would mask the exact staleness the
+ * event is meant to surface.
  */
 export function logEvent(
   paths: BusPaths,
@@ -28,6 +34,7 @@ export function logEvent(
   eventName: string,
   severity: EventSeverity,
   metadata?: Record<string, unknown> | string,
+  skipHeartbeatRefresh = false,
 ): void {
   validateEventCategory(category);
   validateEventSeverity(severity);
@@ -65,7 +72,9 @@ export function logEvent(
   appendFileSync(join(eventsDir, `${today}.jsonl`), eventLine + '\n', 'utf-8');
 
   // Refresh heartbeat timestamp as a side-effect. See doc comment above.
-  refreshHeartbeatTimestamp(paths, timestamp);
+  if (!skipHeartbeatRefresh) {
+    refreshHeartbeatTimestamp(paths, timestamp);
+  }
 }
 
 /**

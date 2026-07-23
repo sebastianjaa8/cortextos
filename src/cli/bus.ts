@@ -196,15 +196,14 @@ busCommand
     // Guard: block review/completion when deliverables are required but missing.
     // Checks both ready_for_review (approval workflow) and completed (vanilla upstream)
     // so the validator works regardless of which status set is installed.
-    if ((status === 'ready_for_review' || status === 'completed') && env.org) {
-      const err = checkDeliverableRequirement(id, env.frameworkRoot, env.org, paths.taskDir);
-      if (err) {
-        console.error(err);
-        process.exit(1);
-      }
-    }
-
     try {
+      if ((status === 'ready_for_review' || status === 'completed') && env.org) {
+        const err = checkDeliverableRequirement(id, env.frameworkRoot, env.org, paths.taskDir);
+        if (err) {
+          console.error(err);
+          process.exit(1);
+        }
+      }
       updateTask(paths, id, status as TaskStatus);
       console.log(`Updated ${id} -> ${status}`);
     } catch (err) {
@@ -311,16 +310,15 @@ busCommand
     const env = resolveEnv();
     const paths = resolvePaths(env.agentName, env.instanceId, env.org);
 
-    // Guard: block completion when deliverables are required but missing
-    if (env.org) {
-      const err = checkDeliverableRequirement(id, env.frameworkRoot, env.org, paths.taskDir);
-      if (err) {
-        console.error(err);
-        process.exit(1);
-      }
-    }
-
     try {
+      // Guard: block completion when deliverables are required but missing
+      if (env.org) {
+        const err = checkDeliverableRequirement(id, env.frameworkRoot, env.org, paths.taskDir);
+        if (err) {
+          console.error(err);
+          process.exit(1);
+        }
+      }
       completeTask(paths, id, effectiveResult);
       console.log(`Completed ${id}`);
     } catch (err) {
