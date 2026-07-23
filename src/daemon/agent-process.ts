@@ -13,6 +13,7 @@ import { ensureDir } from '../utils/atomic.js';
 import { writeCortextosEnv } from '../utils/env.js';
 import { getOverdueReminders } from '../bus/reminders.js';
 import { resolvePaths } from '../utils/paths.js';
+import { logEvent } from '../bus/event.js';
 
 type LogFn = (msg: string) => void;
 
@@ -335,7 +336,10 @@ export class AgentProcess {
    * See issue #346 — both used to surface as a bare `false` and got mistaken
    * for "agent not found" by operators investigating restart/cron failures.
    */
-  injectMessageDetailed(content: string): { ok: true } | { ok: false; code: 'NOT_RUNNING' | 'DEDUPED'; message: string } {
+  injectMessageDetailed(
+    content: string,
+    onDeliveryFailed?: () => void,
+  ): { ok: true } | { ok: false; code: 'NOT_RUNNING' | 'DEDUPED'; message: string } {
     if (!this.pty || this.status !== 'running') {
       return { ok: false, code: 'NOT_RUNNING', message: `agent "${this.name}" is registered but not running (status: ${this.status})` };
     }
@@ -369,6 +373,7 @@ export class AgentProcess {
         onFailed: () => {
           this.log('Inject submit failed — forgetting dedup hash so a re-send can go through');
           this.dedup.forget(content);
+          onDeliveryFailed?.();
         },
       });
     }
@@ -416,7 +421,7 @@ export class AgentProcess {
   // fix is end-to-end delivery verification against the conversation JSONL;
   // upgrade to that if drops recur despite this queue.
 
-  private pendingInjections: Array<{ content: string; enqueuedAt: number }> = [];
+  private pendingInjections: Array<{ content: string; enqueuedAt: number; attempts: number }> = [];
   private drainTimer: ReturnType<typeof setInterval> | null = null;
   /** getTotalBytes() sample from the previous drain tick; -1 = no baseline. */
   private drainLastBytes = -1;
@@ -429,6 +434,17 @@ export class AgentProcess {
   private static readonly DRAIN_MAX_WAIT_MS = 15 * 60_000;
   /** Bounded queue: beyond this, drop the OLDEST entry (crons are periodic — the next fire re-delivers fresher state). */
   private static readonly DRAIN_MAX_QUEUE = 40;
+  /**
+   * Max delivery attempts for a single queued inject before it is dropped and
+   * escalated. Root-cause fix (2026-07-23): a verifiably-failed drain delivery
+   * (Enter swallowed / retries exhausted — see inject.ts onFailed) used to just
+   * forget the dedup hash and move on. The content itself was already shifted
+   * out of pendingInjections before the async verify-retry resolved, so it was
+   * gone forever with nothing re-attempting it and nothing surfacing the loss —
+   * the exact "silent drop" class behind the 2026-07-20/22 multi-hour outages.
+   * Bounded so a permanently-wedged PTY can't retry the same prompt forever.
+   */
+  private static readonly DRAIN_MAX_DELIVERY_ATTEMPTS = 3;
 
   /**
    * Queue a message for injection at the next turn boundary.
@@ -443,7 +459,7 @@ export class AgentProcess {
     if (!this.pty || this.status !== 'running') {
       return { ok: false, code: 'NOT_RUNNING', message: `agent "${this.name}" is registered but not running (status: ${this.status})` };
     }
-    this.pendingInjections.push({ content, enqueuedAt: Date.now() });
+    this.pendingInjections.push({ content, enqueuedAt: Date.now(), attempts: 0 });
     if (this.pendingInjections.length > AgentProcess.DRAIN_MAX_QUEUE) {
       const dropped = this.pendingInjections.shift();
       this.log(`Inject queue overflow (>${AgentProcess.DRAIN_MAX_QUEUE}) — dropped oldest queued prompt: ${(dropped?.content ?? '').slice(0, 80)}`);
@@ -495,7 +511,7 @@ export class AgentProcess {
 
     this.pendingInjections.shift();
     const waitedS = Math.round((Date.now() - head.enqueuedAt) / 1000);
-    const res = this.injectMessageDetailed(head.content);
+    const res = this.injectMessageDetailed(head.content, () => this.handleQueuedDeliveryFailure(head));
     if (res.ok) {
       this.log(
         `Drained queued inject after ${waitedS}s ` +
@@ -508,6 +524,51 @@ export class AgentProcess {
     // The delivered prompt starts its own turn — force a fresh baseline so the
     // next queued item waits for THAT turn to finish.
     this.drainLastBytes = -1;
+  }
+
+  /**
+   * Called asynchronously (~4-38s later, see inject.ts ENTER_RETRY_DELAYS_MS)
+   * when a drained inject verifiably failed to submit — the paste landed but
+   * Enter never produced output growth, so the prompt never actually became a
+   * turn. `res.ok` from drainTick was already `true` at that point (queuing
+   * succeeded), which is why this can't be handled inline in drainTick itself.
+   *
+   * Root-cause fix for the silent catch-up-cron-drop class: re-queue the
+   * failed content at the FRONT of pendingInjections (ahead of anything queued
+   * since) for a bounded number of retries. Once attempts are exhausted, drop
+   * it and emit a critical bus event so existing watchdog / cron-effectiveness
+   * tooling (analyst / seb_boss) can see the loss — instead of the daemon log
+   * being the only trace, which is what made every past incidence silent.
+   */
+  private handleQueuedDeliveryFailure(item: { content: string; enqueuedAt: number; attempts: number }): void {
+    const attempts = item.attempts + 1;
+    if (attempts < AgentProcess.DRAIN_MAX_DELIVERY_ATTEMPTS) {
+      this.log(
+        `Queued inject delivery failed (attempt ${attempts}/${AgentProcess.DRAIN_MAX_DELIVERY_ATTEMPTS}) — ` +
+        `re-queuing at front for retry: ${item.content.slice(0, 80)}`
+      );
+      this.pendingInjections.unshift({ ...item, attempts, enqueuedAt: Date.now() });
+      // Force a fresh quiet-window baseline before retrying, and make sure the
+      // drain loop is still running (it may have been torn down if this was
+      // the only queued item and the queue briefly went empty).
+      this.drainLastBytes = -1;
+      this.ensureDrainTimer();
+      return;
+    }
+
+    this.log(
+      `Queued inject delivery FAILED after ${attempts} attempts — dropping and escalating: ${item.content.slice(0, 80)}`
+    );
+    try {
+      const paths = resolvePaths(this.name, this.env.instanceId, this.env.org);
+      logEvent(paths, this.name, this.env.org, 'error', 'cron_inject_dropped', 'critical', {
+        attempts,
+        content_preview: item.content.slice(0, 200),
+        enqueued_at: new Date(item.enqueuedAt).toISOString(),
+      });
+    } catch (err) {
+      this.log(`Failed to emit cron_inject_dropped event: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
   /**

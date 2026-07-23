@@ -12,6 +12,15 @@ vi.mock('../../../src/pty/inject.js', () => ({
   },
 }));
 
+const { mockLogEvent } = vi.hoisted(() => ({ mockLogEvent: vi.fn() }));
+vi.mock('../../../src/bus/event.js', () => ({
+  logEvent: mockLogEvent,
+}));
+
+vi.mock('../../../src/utils/paths.js', () => ({
+  resolvePaths: vi.fn().mockReturnValue({ stateDir: '/tmp/test-ctx/state/alice', analyticsDir: '/tmp/test-ctx/analytics' }),
+}));
+
 import { AgentProcess } from '../../../src/daemon/agent-process.js';
 
 const mockEnv = {
@@ -53,6 +62,7 @@ describe('AgentProcess.injectMessageQueued — turn-boundary drain', () => {
   beforeEach(() => {
     vi.useFakeTimers();
     mockInjectMessage.mockClear();
+    mockLogEvent.mockClear();
   });
 
   afterEach(() => {
@@ -172,5 +182,57 @@ describe('AgentProcess.injectMessageQueued — turn-boundary drain', () => {
     vi.advanceTimersByTime(TICK * 2);
     expect(mockInjectMessage).toHaveBeenCalledTimes(1);
     expect(mockInjectMessage.mock.calls[0][1]).toBe('prompt-5');
+  });
+
+  describe('dropped catch-up inject detection (root-cause fix 2026-07-23)', () => {
+    it('re-queues a verifiably-failed delivery ahead of newer queued items', () => {
+      const { proc } = makeRunningProcess();
+      proc.injectMessageQueued('first');
+
+      // Deliver "first" (baseline tick + quiet tick).
+      vi.advanceTimersByTime(TICK * 2);
+      expect(mockInjectMessage).toHaveBeenCalledTimes(1);
+      expect(mockInjectMessage.mock.calls[0][1]).toBe('first');
+
+      // Simulate the Enter-swallow / retries-exhausted failure that inject.ts
+      // reports via verify.onFailed — this is what used to just forget the
+      // dedup hash and drop the content forever.
+      const verify0 = mockInjectMessage.mock.calls[0][3];
+      verify0.onFailed();
+
+      // A newer cron fires while the failed retry is pending.
+      proc.injectMessageQueued('second');
+
+      // Next delivery cycle must re-attempt "first" (front of queue), not "second".
+      vi.advanceTimersByTime(TICK * 2);
+      expect(mockInjectMessage).toHaveBeenCalledTimes(2);
+      expect(mockInjectMessage.mock.calls[1][1]).toBe('first');
+      // Not yet escalated — still within retry budget.
+      expect(mockLogEvent).not.toHaveBeenCalled();
+    });
+
+    it('drops and emits a critical bus event after retry budget is exhausted', () => {
+      const { proc } = makeRunningProcess();
+      proc.injectMessageQueued('stuck');
+
+      // DRAIN_MAX_DELIVERY_ATTEMPTS = 3: fail every delivery.
+      for (let i = 0; i < 3; i++) {
+        vi.advanceTimersByTime(TICK * 2);
+        const call = mockInjectMessage.mock.calls[mockInjectMessage.mock.calls.length - 1];
+        call[3].onFailed();
+      }
+
+      expect(mockInjectMessage).toHaveBeenCalledTimes(3);
+      // No 4th attempt — budget exhausted, content dropped instead of re-queued.
+      vi.advanceTimersByTime(TICK * 4);
+      expect(mockInjectMessage).toHaveBeenCalledTimes(3);
+
+      expect(mockLogEvent).toHaveBeenCalledTimes(1);
+      const [, , , category, eventName, severity, metadata] = mockLogEvent.mock.calls[0];
+      expect(category).toBe('error');
+      expect(eventName).toBe('cron_inject_dropped');
+      expect(severity).toBe('critical');
+      expect(metadata).toMatchObject({ attempts: 3 });
+    });
   });
 });
