@@ -8,7 +8,12 @@
 import { readFileSync } from 'fs';
 import { join } from 'path';
 import { describe, it, expect } from 'vitest';
-import { DAEMON_STOP_TIMEOUT_MS, exactProcessGenerationIsGone, restartCommand } from '../../../src/cli/restart';
+import {
+  DAEMON_STOP_TIMEOUT_MS,
+  exactProcessGenerationIsGone,
+  pm2SupervisorSlotIsQuiescent,
+  restartCommand,
+} from '../../../src/cli/restart';
 import { inspectProcessIdentity } from '../../../src/utils/process-ownership';
 
 describe('issue #328: cortextos restart <agent>', () => {
@@ -36,6 +41,22 @@ describe('issue #328: cortextos restart <agent>', () => {
 
   it('waits longer than the configured 60-second PM2 kill timeout', () => {
     expect(DAEMON_STOP_TIMEOUT_MS).toBeGreaterThan(60_000);
+  });
+
+  it('accepts PM2 waiting-restart only after the supervised PID is gone', () => {
+    expect(pm2SupervisorSlotIsQuiescent({
+      name: 'cortextos-daemon-default',
+      status: 'waiting restart',
+    })).toBe(true);
+    expect(pm2SupervisorSlotIsQuiescent({
+      name: 'cortextos-daemon-default',
+      status: 'waiting restart',
+      pid: 123,
+    })).toBe(false);
+    expect(pm2SupervisorSlotIsQuiescent({
+      name: 'cortextos-daemon-default',
+      status: 'online',
+    })).toBe(false);
   });
 
   it('warns operators away from direct PM2 restart', () => {

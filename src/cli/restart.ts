@@ -4,7 +4,12 @@ import { homedir } from 'os';
 import { join } from 'path';
 import { IPCClient } from '../daemon/ipc-server.js';
 import { daemonAppName, resolveFrameworkRoot } from './ecosystem.js';
-import { pm2PreflightError, readPm2Processes, runPm2 } from './start.js';
+import {
+  pm2PreflightError,
+  readPm2Processes,
+  runPm2,
+  type Pm2ProcessSummary,
+} from './start.js';
 import { writeStopMarker } from './stop.js';
 import { validateInstanceId } from '../utils/validate.js';
 import {
@@ -21,6 +26,12 @@ export function exactProcessGenerationIsGone(expected: ProcessIdentity): boolean
   const probe = probeProcessIdentity(expected.pid);
   if (probe.status === 'unknown') return false;
   return probe.status === 'absent' || !processIdentityEquals(expected, probe.identity);
+}
+
+export function pm2SupervisorSlotIsQuiescent(app: Pm2ProcessSummary | undefined): boolean {
+  return !!app
+    && app.pid === undefined
+    && ['stopped', 'waiting restart', 'errored'].includes(app.status ?? '');
 }
 
 async function waitUntil(predicate: () => boolean | Promise<boolean>, timeoutMs: number): Promise<boolean> {
@@ -78,7 +89,9 @@ async function restartDaemon(instance: string): Promise<void> {
   console.log(`Stopping daemon safely: ${appName}`);
   runPm2(['stop', appName], projectRoot, env);
   const stopped = await waitUntil(async () => {
-    const pm2Stopped = readPm2Processes(env).find(entry => entry.name === appName)?.status === 'stopped';
+    const pm2Stopped = pm2SupervisorSlotIsQuiescent(
+      readPm2Processes(env).find(entry => entry.name === appName),
+    );
     const ipcStopped = !(await new IPCClient(instance).isDaemonRunning());
     const exactOldGenerationGone = exactProcessGenerationIsGone(oldIdentity);
     return pm2Stopped && ipcStopped && exactOldGenerationGone;
