@@ -118,11 +118,18 @@ function Test-SameTaskUser {
 }
 
 function Test-ExistingStartupTask {
-    param([object]$Task, [string]$NodePath, [string]$Pm2Path)
+    param(
+        [object]$Task,
+        [string]$PowerShellPath,
+        [string]$ResurrectScript,
+        [string]$NodePath,
+        [string]$Pm2Path
+    )
     $actions = @($Task.Actions)
     $triggers = @($Task.Triggers)
-    $expectedArguments = [char]34 + $Pm2Path + [char]34 + ' resurrect'
-    if ($actions.Count -ne 1 -or -not (Test-SamePath $actions[0].Execute $NodePath) -or $actions[0].Arguments -ne $expectedArguments) { return $false }
+    $expectedArguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File ' + [char]34 + $ResurrectScript + [char]34 +
+        ' -NodePath ' + [char]34 + $NodePath + [char]34 + ' -Pm2Path ' + [char]34 + $Pm2Path + [char]34
+    if ($actions.Count -ne 1 -or -not (Test-SamePath $actions[0].Execute $PowerShellPath) -or $actions[0].Arguments -ne $expectedArguments) { return $false }
     if (@($triggers | Where-Object { $_.CimClass.CimClassName -eq 'MSFT_TaskLogonTrigger' -and $_.Enabled -and (Test-SameTaskUser $_.UserId $env:USERNAME) }).Count -ne 1) { return $false }
     if (-not (Test-SameTaskUser $Task.Principal.UserId $env:USERNAME) -or [string]$Task.Principal.LogonType -ne 'Interactive' -or [string]$Task.Principal.RunLevel -ne 'Limited') { return $false }
     if ([string]$Task.Settings.MultipleInstances -ne 'IgnoreNew' -or -not $Task.Settings.StartWhenAvailable -or -not $Task.Settings.Hidden) { return $false }
@@ -144,6 +151,10 @@ $pm2BinCandidates = @(
 )
 $pm2Bin = $pm2BinCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
 if (-not $pm2Bin) { throw 'Could not locate PM2. Install with: npm install -g pm2' }
+$powershell = (Get-Command powershell.exe -ErrorAction SilentlyContinue).Source
+if (-not $powershell) { throw 'powershell.exe not found on PATH.' }
+$resurrectScript = Join-Path $PSScriptRoot 'pm2-resurrect-sanitized.ps1'
+if (-not (Test-Path $resurrectScript)) { throw 'Credential-sanitized PM2 resurrect script is missing.' }
 
 $dumpFile = Join-Path $env:USERPROFILE '.pm2\dump.pm2'
 if (-not (Test-Path $dumpFile)) { throw "PM2 dump file not found at $dumpFile. Run cortextos start --instance <id> before installing startup." }
@@ -176,15 +187,17 @@ foreach ($liveApp in @($live | Where-Object Name -ne 'pm2-logrotate')) {
     }
 }
 
-$action = New-ScheduledTaskAction -Execute $node -Argument "`"$pm2Bin`" resurrect"
+$actionArguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File ' + [char]34 + $resurrectScript + [char]34 +
+    ' -NodePath ' + [char]34 + $node + [char]34 + ' -Pm2Path ' + [char]34 + $pm2Bin + [char]34
+$action = New-ScheduledTaskAction -Execute $powershell -Argument $actionArguments
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
 $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Hours 72) -MultipleInstances IgnoreNew -Hidden
 $existingTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-if ($existingTask -and (Test-ExistingStartupTask $existingTask $node $pm2Bin)) {
+if ($existingTask -and (Test-ExistingStartupTask $existingTask $powershell $resurrectScript $node $pm2Bin)) {
     Write-Host ''
     Write-Host ('[ok] Existing scheduled task is canonical: {0}' -f $TaskName)
-    Write-Host '      Verified: action, logon trigger, limited principal, settings, and complete PM2 manifest parity'
+    Write-Host '      Verified: sanitized action, logon trigger, limited principal, settings, and complete PM2 manifest parity'
     return
 }
 if ($existingTask) { Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false }
@@ -194,7 +207,7 @@ Write-Host ''
 Write-Host "[ok] Registered scheduled task: $TaskName"
 Write-Host '      Verified: complete live/saved PM2 parity with only canonical cortextOS apps and pm2-logrotate'
 Write-Host "      Trigger:  At logon ($env:USERDOMAIN\$env:USERNAME)"
-Write-Host "      Action:   $node `"$pm2Bin`" resurrect"
+Write-Host "      Action:   credential-sanitized PM2 resurrect via $powershell"
 Write-Host ''
 Write-Host "Verify with: Get-ScheduledTask -TaskName '$TaskName' | Get-ScheduledTaskInfo"
 Write-Host "Test now:    Start-ScheduledTask -TaskName '$TaskName'"

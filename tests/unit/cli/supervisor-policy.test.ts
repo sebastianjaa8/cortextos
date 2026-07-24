@@ -204,6 +204,7 @@ describe('Windows supervisor scripts', () => {
   it('does not recommend the broken pm2-windows-startup package', () => {
     const startSource = readFileSync(resolve('src/cli/start.ts'), 'utf-8');
     const installSource = readFileSync(resolve('scripts/install-windows-pm2-startup.ps1'), 'utf-8');
+    const resurrectSource = readFileSync(resolve('scripts/pm2-resurrect-sanitized.ps1'), 'utf-8');
     expect(startSource).not.toContain('npm install -g pm2-windows-startup');
     expect(installSource).not.toContain('npm install -g pm2-windows-startup');
     expect(installSource).toContain('Live and saved complete PM2 manifests differ');
@@ -211,8 +212,15 @@ describe('Windows supervisor scripts', () => {
     expect(installSource).toMatch(/foreach \(\$liveApp in @\(\$live \| Where-Object Name -ne 'pm2-logrotate'\)\)/);
     expect(installSource).toContain('Test-ExistingStartupTask');
     expect(installSource).toContain('Existing scheduled task is canonical');
+    expect(installSource).toContain('pm2-resurrect-sanitized.ps1');
+    expect(installSource).toContain('credential-sanitized PM2 resurrect');
     expect(installSource).toContain("if ($App.Name -ne 'pm2-logrotate')");
     expect(installSource).not.toContain("Where-Object { $_.Name -match '^cortextos-(daemon|dashboard)");
+    expect(resurrectSource).toContain('Get-ChildItem Env:');
+    expect(resurrectSource).toContain('Remove-Item -LiteralPath');
+    for (const prefix of PM2_SUPERVISOR_POLICY.filterEnv) {
+      expect(resurrectSource).toContain(`'${prefix}'`);
+    }
   });
 
   it('pins health failures to a nonzero exit and never prints raw PM2 env', () => {
