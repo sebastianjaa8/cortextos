@@ -80,6 +80,33 @@ describe('Windows process identity inspection failures', () => {
     expect(spawnSyncMock).toHaveBeenCalledTimes(1);
   });
 
+  it('can retry confirmed absence only for a just-spawned process', () => {
+    spawnSyncMock
+      .mockReturnValueOnce({
+        status: 0,
+        stdout: JSON.stringify({ status: 'absent' }),
+      })
+      .mockReturnValueOnce({
+        status: 0,
+        stdout: JSON.stringify({
+          status: 'present',
+          pid: 123,
+          startIdentity: 'start-2',
+          executablePath: 'node.exe',
+        }),
+      });
+
+    expect(inspectProcessIdentityWithRetry(123, {
+      attempts: 2,
+      retryAbsent: true,
+    })).toEqual({
+      pid: 123,
+      startIdentity: 'start-2',
+      executablePath: 'node.exe',
+    });
+    expect(spawnSyncMock).toHaveBeenCalledTimes(2);
+  });
+
   it('does not report termination when taskkill and the post-kill probe are inconclusive', () => {
     spawnSyncMock
       .mockReturnValueOnce({

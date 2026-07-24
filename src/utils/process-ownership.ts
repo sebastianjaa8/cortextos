@@ -28,6 +28,7 @@ export type ProcessIdentityProbe =
   | { status: 'unknown' };
 
 const PROCESS_IDENTITY_PROBE_ATTEMPTS = 3;
+const SPAWNED_PROCESS_IDENTITY_PROBE_ATTEMPTS = 5;
 let cachedDaemonIdentity: ProcessIdentity | null = null;
 
 export interface RuntimeProcessRecord {
@@ -143,13 +144,13 @@ export function inspectProcessIdentity(pid: number): ProcessIdentity | null {
 /** Retry only inconclusive probes; confirmed absence is authoritative. */
 export function inspectProcessIdentityWithRetry(
   pid: number,
-  attempts = PROCESS_IDENTITY_PROBE_ATTEMPTS,
+  options: { attempts?: number; retryAbsent?: boolean } = {},
 ): ProcessIdentity | null {
-  const maxAttempts = Math.max(1, Math.floor(attempts));
+  const maxAttempts = Math.max(1, Math.floor(options.attempts ?? PROCESS_IDENTITY_PROBE_ATTEMPTS));
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     const probe = probeProcessIdentity(pid);
     if (probe.status === 'present') return probe.identity;
-    if (probe.status === 'absent') return null;
+    if (probe.status === 'absent' && !options.retryAbsent) return null;
   }
   return null;
 }
@@ -179,7 +180,10 @@ export function writeRuntimeProcessRecord(
   stateDir: string,
   input: Pick<RuntimeProcessRecord, 'instanceId' | 'agentName' | 'runtime' | 'pid'>,
 ): RuntimeProcessRecord {
-  const processIdentity = inspectProcessIdentityWithRetry(input.pid);
+  const processIdentity = inspectProcessIdentityWithRetry(input.pid, {
+    attempts: SPAWNED_PROCESS_IDENTITY_PROBE_ATTEMPTS,
+    retryAbsent: true,
+  });
   const daemonIdentity = cachedDaemonIdentity
     ?? inspectProcessIdentityWithRetry(process.pid);
   if (!processIdentity || !daemonIdentity) {
