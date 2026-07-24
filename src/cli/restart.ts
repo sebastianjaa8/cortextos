@@ -90,6 +90,7 @@ async function restartDaemon(instance: string): Promise<void> {
   // reports success. A quiet gap prevents that callback from corrupting the
   // next generation's supervisor record.
   await delay(2_000);
+  runPm2(['delete', appName], projectRoot, env);
   console.log(`Starting daemon safely: ${appName}`);
   runPm2(['start', ecosystemPath, '--only', appName, '--update-env'], projectRoot, env);
   const ready = await waitUntil(async () => {

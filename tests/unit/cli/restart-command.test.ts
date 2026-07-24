@@ -5,6 +5,8 @@
  * pins the command-level wiring (name, required argument, --instance
  * option, description) instead of duplicating the marker-write tests.
  */
+import { readFileSync } from 'fs';
+import { join } from 'path';
 import { describe, it, expect } from 'vitest';
 import { exactProcessGenerationIsGone, restartCommand } from '../../../src/cli/restart';
 import { inspectProcessIdentity } from '../../../src/utils/process-ownership';
@@ -49,5 +51,10 @@ describe('issue #328: cortextos restart <agent>', () => {
       ...current!,
       startIdentity: `${current!.startIdentity}-old-generation`,
     })).toBe(true);
+  });
+
+  it('fresh-registers the stopped daemon before starting the replacement', () => {
+    const source = readFileSync(join(process.cwd(), 'src', 'cli', 'restart.ts'), 'utf-8');
+    expect(source).toMatch(/runPm2\(\['stop', appName\][\s\S]*runPm2\(\['delete', appName\][\s\S]*runPm2\(\['start', ecosystemPath/);
   });
 });
