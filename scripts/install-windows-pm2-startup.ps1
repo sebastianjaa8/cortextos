@@ -110,6 +110,24 @@ function Assert-SafeManifestEntry {
     if (-not (Test-SamePath $App.Cwd $moduleRoot)) { throw 'pm2-logrotate has non-canonical cwd' }
     if (-not (Test-SamePath $App.ScriptPath (Join-Path $moduleRoot 'app.js'))) { throw 'pm2-logrotate has non-canonical script' }
 }
+
+function Test-SameTaskUser {
+    param([string]$Actual, [string]$Expected)
+    if (-not $Actual -or -not $Expected) { return $false }
+    return $Actual.Split('\')[-1] -ieq $Expected.Split('\')[-1]
+}
+
+function Test-ExistingStartupTask {
+    param([object]$Task, [string]$NodePath, [string]$Pm2Path)
+    $actions = @($Task.Actions)
+    $triggers = @($Task.Triggers)
+    $expectedArguments = [char]34 + $Pm2Path + [char]34 + ' resurrect'
+    if ($actions.Count -ne 1 -or -not (Test-SamePath $actions[0].Execute $NodePath) -or $actions[0].Arguments -ne $expectedArguments) { return $false }
+    if (@($triggers | Where-Object { $_.CimClass.CimClassName -eq 'MSFT_TaskLogonTrigger' -and $_.Enabled -and (Test-SameTaskUser $_.UserId $env:USERNAME) }).Count -ne 1) { return $false }
+    if (-not (Test-SameTaskUser $Task.Principal.UserId $env:USERNAME) -or [string]$Task.Principal.LogonType -ne 'Interactive' -or [string]$Task.Principal.RunLevel -ne 'Limited') { return $false }
+    if ([string]$Task.Settings.MultipleInstances -ne 'IgnoreNew' -or -not $Task.Settings.StartWhenAvailable -or -not $Task.Settings.Hidden) { return $false }
+    return $true
+}
 if ($Uninstall) {
     if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
         Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
@@ -144,11 +162,11 @@ foreach ($app in $live) { Assert-SafeManifestEntry $app }
 foreach ($app in $saved) { Assert-SafeManifestEntry $app -Saved }
 if (@($live | Where-Object { $_.Name -match '^cortextos-daemon-' }).Count -eq 0) { throw 'No canonical online daemon is live. Run cortextos start --instance <id> first.' }
 
-$liveNames = @($live | ForEach-Object Name | Sort-Object)
+$liveNames = @($live | Where-Object Name -ne 'pm2-logrotate' | ForEach-Object Name | Sort-Object)
 $savedNames = @($saved | ForEach-Object Name | Sort-Object)
 $manifestDiff = @(Compare-Object -ReferenceObject $liveNames -DifferenceObject $savedNames)
 if ($manifestDiff.Count -gt 0) { throw 'Live and saved complete PM2 manifests differ. Rerun cortextos start for each instance.' }
-foreach ($liveApp in $live) {
+foreach ($liveApp in @($live | Where-Object Name -ne 'pm2-logrotate')) {
     $savedApp = @($saved | Where-Object Name -eq $liveApp.Name)
     if ($savedApp.Count -ne 1) { throw "Saved manifest does not contain exactly one $($liveApp.Name)" }
     foreach ($field in @('InstanceId', 'CtxRoot', 'FrameworkRoot', 'ProjectRoot', 'ScriptPath', 'Cwd', 'Port')) {
@@ -162,7 +180,14 @@ $action = New-ScheduledTaskAction -Execute $node -Argument "`"$pm2Bin`" resurrec
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
 $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Hours 72) -MultipleInstances IgnoreNew -Hidden
-if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) { Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false }
+$existingTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+if ($existingTask -and (Test-ExistingStartupTask $existingTask $node $pm2Bin)) {
+    Write-Host ''
+    Write-Host ('[ok] Existing scheduled task is canonical: {0}' -f $TaskName)
+    Write-Host '      Verified: action, logon trigger, limited principal, settings, and complete PM2 manifest parity'
+    return
+}
+if ($existingTask) { Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false }
 Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Description 'cortextOS: resurrect the verified PM2 manifest at user logon.' | Out-Null
 
 Write-Host ''

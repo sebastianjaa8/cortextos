@@ -207,6 +207,10 @@ describe('Windows supervisor scripts', () => {
     expect(startSource).not.toContain('npm install -g pm2-windows-startup');
     expect(installSource).not.toContain('npm install -g pm2-windows-startup');
     expect(installSource).toContain('Live and saved complete PM2 manifests differ');
+    expect(installSource).toMatch(/\$liveNames = @\(\$live \| Where-Object Name -ne 'pm2-logrotate'/);
+    expect(installSource).toMatch(/foreach \(\$liveApp in @\(\$live \| Where-Object Name -ne 'pm2-logrotate'\)\)/);
+    expect(installSource).toContain('Test-ExistingStartupTask');
+    expect(installSource).toContain('Existing scheduled task is canonical');
     expect(installSource).toContain("if ($App.Name -ne 'pm2-logrotate')");
     expect(installSource).not.toContain("Where-Object { $_.Name -match '^cortextos-(daemon|dashboard)");
   });
