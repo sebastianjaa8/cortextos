@@ -18,6 +18,7 @@ vi.mock('os', async (importOriginal) => ({
 
 import {
   inspectProcessIdentity,
+  inspectProcessIdentityWithRetry,
   probeProcessIdentity,
   terminateProcessTree,
 } from '../../../src/utils/process-ownership.js';
@@ -46,6 +47,37 @@ describe('Windows process identity inspection failures', () => {
 
     expect(probeProcessIdentity(123)).toEqual({ status: 'absent' });
     expect(probeProcessIdentity(123)).toEqual({ status: 'unknown' });
+  });
+
+  it('retries an inconclusive identity probe and accepts a later proven identity', () => {
+    spawnSyncMock
+      .mockReturnValueOnce(undefined)
+      .mockReturnValueOnce({
+        status: 0,
+        stdout: JSON.stringify({
+          status: 'present',
+          pid: 123,
+          startIdentity: 'start-1',
+          executablePath: 'node.exe',
+        }),
+      });
+
+    expect(inspectProcessIdentityWithRetry(123)).toEqual({
+      pid: 123,
+      startIdentity: 'start-1',
+      executablePath: 'node.exe',
+    });
+    expect(spawnSyncMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not retry a confirmed missing PID', () => {
+    spawnSyncMock.mockReturnValue({
+      status: 0,
+      stdout: JSON.stringify({ status: 'absent' }),
+    });
+
+    expect(inspectProcessIdentityWithRetry(123)).toBeNull();
+    expect(spawnSyncMock).toHaveBeenCalledTimes(1);
   });
 
   it('does not report termination when taskkill and the post-kill probe are inconclusive', () => {

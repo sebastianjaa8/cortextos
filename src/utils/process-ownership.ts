@@ -27,6 +27,9 @@ export type ProcessIdentityProbe =
   | { status: 'absent' }
   | { status: 'unknown' };
 
+const PROCESS_IDENTITY_PROBE_ATTEMPTS = 3;
+let cachedDaemonIdentity: ProcessIdentity | null = null;
+
 export interface RuntimeProcessRecord {
   version: 1;
   ownerToken: string;
@@ -77,12 +80,22 @@ export function probeProcessIdentity(pid: number): ProcessIdentityProbe {
     try {
       const parsed = JSON.parse(result.stdout) as Partial<ProcessIdentity> & { status?: unknown };
       if (parsed.status === 'absent') return { status: 'absent' };
-      return parsed.status === 'present'
+      if (
+        parsed.status === 'present'
         && typeof parsed.pid === 'number'
         && typeof parsed.startIdentity === 'string'
         && typeof parsed.executablePath === 'string'
-        ? { status: 'present', identity: parsed as ProcessIdentity }
-        : { status: 'unknown' };
+      ) {
+        return {
+          status: 'present',
+          identity: {
+            pid: parsed.pid,
+            startIdentity: parsed.startIdentity,
+            executablePath: parsed.executablePath,
+          },
+        };
+      }
+      return { status: 'unknown' };
     } catch {
       return { status: 'unknown' };
     }
@@ -127,6 +140,20 @@ export function inspectProcessIdentity(pid: number): ProcessIdentity | null {
   return probe.status === 'present' ? probe.identity : null;
 }
 
+/** Retry only inconclusive probes; confirmed absence is authoritative. */
+export function inspectProcessIdentityWithRetry(
+  pid: number,
+  attempts = PROCESS_IDENTITY_PROBE_ATTEMPTS,
+): ProcessIdentity | null {
+  const maxAttempts = Math.max(1, Math.floor(attempts));
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const probe = probeProcessIdentity(pid);
+    if (probe.status === 'present') return probe.identity;
+    if (probe.status === 'absent') return null;
+  }
+  return null;
+}
+
 export function processIdentityEquals(
   expected: Pick<ProcessIdentity, 'pid' | 'startIdentity'>,
   current: ProcessIdentity | null,
@@ -152,11 +179,13 @@ export function writeRuntimeProcessRecord(
   stateDir: string,
   input: Pick<RuntimeProcessRecord, 'instanceId' | 'agentName' | 'runtime' | 'pid'>,
 ): RuntimeProcessRecord {
-  const processIdentity = inspectProcessIdentity(input.pid);
-  const daemonIdentity = inspectProcessIdentity(process.pid);
+  const processIdentity = inspectProcessIdentityWithRetry(input.pid);
+  const daemonIdentity = cachedDaemonIdentity
+    ?? inspectProcessIdentityWithRetry(process.pid);
   if (!processIdentity || !daemonIdentity) {
     throw new Error(`Cannot prove process identity for agent PID ${input.pid}`);
   }
+  cachedDaemonIdentity = daemonIdentity;
   const record: RuntimeProcessRecord = {
     version: 1,
     ownerToken: randomBytes(32).toString('hex'),

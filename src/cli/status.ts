@@ -4,7 +4,10 @@ import { basename, join } from 'path';
 import { homedir } from 'os';
 import { IPCClient } from '../daemon/ipc-server.js';
 import type { AgentStatus, Heartbeat } from '../types/index.js';
-import { inspectProcessIdentity, processIdentityMatches } from '../utils/process-ownership.js';
+import {
+  inspectProcessIdentityWithRetry,
+  processIdentityMatches,
+} from '../utils/process-ownership.js';
 import type { RuntimeProcessRecord } from '../utils/process-ownership.js';
 
 export interface RuntimeOwnershipDiagnostic {
@@ -37,7 +40,7 @@ export function inspectRuntimeOwnership(ctxRoot: string, instanceId: string): Ru
     const parsed = Number(readFileSync(join(ctxRoot, 'daemon.pid'), 'utf-8').trim());
     if (Number.isSafeInteger(parsed) && parsed > 0) daemonPid = parsed;
   } catch { /* missing daemon is reported against each runtime record */ }
-  const daemonIdentity = daemonPid === null ? null : inspectProcessIdentity(daemonPid);
+  const daemonIdentity = daemonPid === null ? null : inspectProcessIdentityWithRetry(daemonPid);
   const results: RuntimeOwnershipDiagnostic[] = [];
 
   for (const entry of readdirSync(stateRoot, { withFileTypes: true })) {
@@ -49,7 +52,11 @@ export function inspectRuntimeOwnership(ctxRoot: string, instanceId: string): Ru
     const recordsDir = join(agentDir, 'agent-processes');
     if (existsSync(recordsDir)) {
       for (const record of readdirSync(recordsDir, { withFileTypes: true })) {
-        if (record.isFile() && record.name.endsWith('.json')) canonicalPaths.push(join(recordsDir, record.name));
+        if (
+          record.isFile()
+          && record.name.endsWith('.json')
+          && !/^[a-f0-9]{64}\.(?:stale|invalid)-\d+-[a-f0-9]{8}\.json$/.test(record.name)
+        ) canonicalPaths.push(join(recordsDir, record.name));
       }
     }
 
@@ -71,7 +78,7 @@ export function inspectRuntimeOwnership(ctxRoot: string, instanceId: string): Ru
         results.push({ ...base, status: 'invalid', detail: 'record instance or agent identity mismatch' });
         continue;
       }
-      const runtimeIdentity = inspectProcessIdentity(record.pid);
+      const runtimeIdentity = inspectProcessIdentityWithRetry(record.pid);
       if (!runtimeIdentity) {
         results.push({ ...base, status: 'stale', detail: 'recorded runtime process is not alive' });
         continue;
