@@ -153,17 +153,18 @@ describe('Per-agent message signing', () => {
     expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('SECURITY'));
   });
 
-  it('flags but accepts an unsigned message when the sender has a key on file', () => {
+  it('rejects an unsigned message when the sender has a key on file', () => {
     generateAgentKey(agentDir('sender'));
-    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
 
     writeInboxMessage({ id: 'msg-unsigned', from: 'sender', to: 'receiver', text: 'no sig' });
     const messages = checkInbox(paths);
 
-    expect(messages.length).toBe(1);
-    expect(warnSpy).toHaveBeenCalledWith(
+    expect(messages.length).toBe(0);
+    expect(errSpy).toHaveBeenCalledWith(
       expect.stringContaining('Unsigned message msg-unsigned'),
     );
+    expect(readdirSync(join(paths.inbox, '.errors'))).toHaveLength(1);
   });
 
   it('accepts a legacy shared-key-signed message with a transition warning', () => {

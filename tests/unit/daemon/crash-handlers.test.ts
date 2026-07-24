@@ -14,6 +14,7 @@ import {
   CRASH_LOOP_THRESHOLD,
   CRASH_LOOP_COOLDOWN_MS,
   CrashHistory,
+  isPm2ShutdownMessage,
 } from '../../../src/daemon/index';
 
 // Regression guard for the 2026-04-22 restart storm visibility work. These
@@ -25,6 +26,15 @@ function mkCtxRoot(): string {
   mkdirSync(join(dir, 'state'), { recursive: true });
   return dir;
 }
+
+describe('PM2 shutdown message', () => {
+  it('accepts only the exact PM2 graceful-shutdown message', () => {
+    expect(isPm2ShutdownMessage('shutdown')).toBe(true);
+    expect(isPm2ShutdownMessage('SHUTDOWN')).toBe(false);
+    expect(isPm2ShutdownMessage({ command: 'shutdown' })).toBe(false);
+    expect(isPm2ShutdownMessage(undefined)).toBe(false);
+  });
+});
 
 describe('crash history persistence', () => {
   let ctxRoot: string;

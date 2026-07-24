@@ -40,6 +40,22 @@ vi.mock('../../../src/utils/atomic.js', () => ({
   ensureDir: vi.fn(),
 }));
 
+const ownershipMocks = vi.hoisted(() => ({
+  write: vi.fn((_stateDir, input) => ({
+    ...input,
+    ownerToken: 'a'.repeat(64),
+    processStartIdentity: 'start-321',
+  })),
+  remove: vi.fn(() => true),
+  terminate: vi.fn(() => true),
+}));
+
+vi.mock('../../../src/utils/process-ownership.js', () => ({
+  writeRuntimeProcessRecord: ownershipMocks.write,
+  removeRuntimeProcessRecord: ownershipMocks.remove,
+  terminateProcessTree: ownershipMocks.terminate,
+}));
+
 const { CodexExecPTY, codexExecSessionExists } = await import('../../../src/pty/codex-exec-pty.js');
 
 const mockEnv = {
@@ -60,13 +76,15 @@ function makeMockChildProcess() {
     pid: number;
     stdout: EventEmitter;
     stderr: EventEmitter;
-    stdin: { end: ReturnType<typeof vi.fn> };
+    stdin: EventEmitter & { end: ReturnType<typeof vi.fn> };
     kill: ReturnType<typeof vi.fn>;
   };
   child.pid = 321;
   child.stdout = new EventEmitter();
   child.stderr = new EventEmitter();
-  child.stdin = { end: vi.fn() };
+  const stdin = new EventEmitter() as EventEmitter & { end: ReturnType<typeof vi.fn> };
+  stdin.end = vi.fn((_prompt: string, callback?: () => void) => callback?.());
+  child.stdin = stdin;
   child.kill = vi.fn();
   return child;
 }
@@ -79,6 +97,9 @@ beforeEach(() => {
   fsMocks.statSync.mockReset();
   childProcessMocks.spawn.mockReset();
   childProcessMocks.spawnSync.mockReset();
+  ownershipMocks.write.mockClear();
+  ownershipMocks.remove.mockClear();
+  ownershipMocks.terminate.mockClear();
 });
 
 describe('CodexExecPTY', () => {
@@ -98,10 +119,24 @@ describe('CodexExecPTY', () => {
         windowsHide: true,
       }),
     );
-    expect(child.stdin.end).toHaveBeenCalledWith('hello codex');
+    expect(child.stdin.end).toHaveBeenCalledWith('hello codex', expect.any(Function));
+    expect(ownershipMocks.write).toHaveBeenCalledWith(
+      join(mockEnv.ctxRoot, 'state', mockEnv.agentName),
+      expect.objectContaining({
+        instanceId: mockEnv.instanceId,
+        agentName: mockEnv.agentName,
+        runtime: 'codex-exec',
+        pid: 321,
+      }),
+    );
 
     child.stdout.emit('data', Buffer.from(`session id: ${sessionId}\nOK\n`));
     child.emit('exit', 0, null);
+
+    expect(ownershipMocks.remove).toHaveBeenCalledWith(
+      join(mockEnv.ctxRoot, 'state', mockEnv.agentName),
+      'a'.repeat(64),
+    );
 
     expect(fsMocks.writeFileSync).toHaveBeenCalledWith(
       sessionPath,
@@ -128,7 +163,9 @@ describe('CodexExecPTY', () => {
 
     const pty = new CodexExecPTY(mockEnv, { model: 'gpt-5.5', dangerously_skip_permissions: false });
     await pty.spawn('continue', 'boot prompt');
-    pty.injectMessage('queued prompt');
+    const onAccepted = vi.fn();
+    pty.injectMessage('queued prompt', { onAccepted });
+    expect(onAccepted).not.toHaveBeenCalled();
 
     expect(childProcessMocks.spawn).toHaveBeenNthCalledWith(
       1,
@@ -136,7 +173,7 @@ describe('CodexExecPTY', () => {
       ['exec', 'resume', '--skip-git-repo-check', '--model', 'gpt-5.5', sessionId, '-'],
       expect.any(Object),
     );
-    expect(first.stdin.end).toHaveBeenCalledWith('boot prompt');
+    expect(first.stdin.end).toHaveBeenCalledWith('boot prompt', expect.any(Function));
     expect(childProcessMocks.spawn).toHaveBeenCalledTimes(1);
 
     first.emit('exit', 0, null);
@@ -147,7 +184,29 @@ describe('CodexExecPTY', () => {
       ['exec', 'resume', '--skip-git-repo-check', '--model', 'gpt-5.5', sessionId, '-'],
       expect.any(Object),
     );
-    expect(second.stdin.end).toHaveBeenCalledWith('queued prompt');
+    expect(second.stdin.end).toHaveBeenCalledWith('queued prompt', expect.any(Function));
+    second.stdout.emit('data', Buffer.from('queued turn started\n'));
+    expect(onAccepted).toHaveBeenCalledTimes(1);
+    expect(ownershipMocks.write).toHaveBeenCalledTimes(2);
+    expect(ownershipMocks.remove).toHaveBeenCalledTimes(1);
+  });
+
+  it('terminates and token-clears the currently owned turn on kill', async () => {
+    const child = makeMockChildProcess();
+    childProcessMocks.spawn.mockReturnValue(child);
+
+    const pty = new CodexExecPTY(mockEnv, { dangerously_skip_permissions: false });
+    await pty.spawn('fresh', 'hello');
+    pty.kill();
+
+    expect(ownershipMocks.terminate).toHaveBeenCalledWith(321, {
+      pid: 321,
+      startIdentity: 'start-321',
+    });
+    expect(ownershipMocks.remove).toHaveBeenCalledWith(
+      join(mockEnv.ctxRoot, 'state', mockEnv.agentName),
+      'a'.repeat(64),
+    );
   });
 
   it('reports session continuity from codex-exec state', () => {

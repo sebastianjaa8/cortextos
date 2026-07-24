@@ -1,6 +1,6 @@
 import { existsSync, writeFileSync } from 'fs';
-import { join } from 'path';
-import { homedir } from 'os';
+import { delimiter, join } from 'path';
+import { homedir, platform } from 'os';
 import type { AgentConfig, CtxEnv } from '../types/index.js';
 import { AgentPTY } from './agent-pty.js';
 
@@ -43,7 +43,7 @@ export class HermesPTY extends AgentPTY {
    * Hermes is a Python package installed via pip — no .cmd wrapper on Windows.
    */
   protected getBinaryName(): string {
-    return 'hermes';
+    return resolveHermesBinary() ?? (platform() === 'win32' ? 'hermes.exe' : 'hermes');
   }
 
   /**
@@ -77,6 +77,9 @@ export class HermesPTY extends AgentPTY {
    *   3. After `❯` appears (isBootstrapped), inject a single-line read command
    */
   async spawn(mode: 'fresh' | 'continue', prompt: string): Promise<void> {
+    if (platform() === 'win32' && !resolveHermesBinary()) {
+      throw new Error('Hermes runtime is enabled but hermes.exe is not installed or available on PATH');
+    }
     this.startupPrompt = prompt;
     // Write startup prompt to temp file BEFORE spawn so Hermes can read it
     this.writeStartupFile(prompt);
@@ -136,6 +139,17 @@ export class HermesPTY extends AgentPTY {
 export function hermesDbExists(hermesHome?: string): boolean {
   const base = hermesHome || join(homedir(), '.hermes');
   return existsSync(join(base, 'state.db'));
+}
+
+export function resolveHermesBinary(pathValue = process.env.PATH || ''): string | null {
+  if (platform() !== 'win32') return 'hermes';
+  for (const dir of pathValue.split(delimiter).filter(Boolean)) {
+    for (const filename of ['hermes.exe', 'hermes.cmd', 'hermes.bat']) {
+      const candidate = join(dir, filename);
+      if (existsSync(candidate)) return candidate;
+    }
+  }
+  return null;
 }
 
 function sleep(ms: number): Promise<void> {

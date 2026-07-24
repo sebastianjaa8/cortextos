@@ -9,10 +9,27 @@ import { updateApproval } from '../bus/approval.js';
 import { AgentProcess } from './agent-process.js';
 import type { TelegramAPI } from '../telegram/api.js';
 import { KEYS } from '../pty/inject.js';
+import type { TelegramDeliveryOutcome } from '../telegram/poller.js';
 import { stripControlChars, sanitizeForPtyInjection, wrapFenceSafe } from '../utils/validate.js';
 import { agentHoldsContextHandoffLease, releaseContextHandoffLease, requestContextHandoffLease } from './context-handoff-lease.js';
 
 type LogFn = (msg: string) => void;
+
+interface TelegramDeliveryHooks {
+  deliveryId: string;
+  onDispatch: () => void;
+  onAccepted: () => void;
+  onFailure: (error: string) => void;
+}
+
+type CallbackOutcome = Exclude<TelegramDeliveryOutcome, { ok: true; disposition: 'deferred' }>;
+
+const CALLBACK_CONFIRMED: CallbackOutcome = { ok: true, disposition: 'confirmed' };
+const CALLBACK_IDEMPOTENT: CallbackOutcome = { ok: true, disposition: 'idempotent' };
+
+function callbackFailure(error: unknown): CallbackOutcome {
+  return { ok: false, retryable: true, error: error instanceof Error ? error.message : String(error) };
+}
 
 /**
  * Post-boot grace window (ms) during which soft context-handoff actions are
@@ -50,7 +67,7 @@ export class FastChecker {
   private allowedUserId?: number;
 
   // External Telegram handler (set by daemon)
-  private telegramMessages: Array<{ formatted: string; ackIds: string[] }> = [];
+  private telegramMessages: Array<{ formatted: string; delivery?: TelegramDeliveryHooks }> = [];
 
   // Persistent dedup: message hashes to prevent duplicate delivery
   private seenHashes: Set<string> = new Set();
@@ -188,8 +205,8 @@ export class FastChecker {
    * Queue a formatted Telegram message for injection.
    * Called by the daemon's Telegram handler.
    */
-  queueTelegramMessage(formatted: string): void {
-    this.telegramMessages.push({ formatted, ackIds: [] });
+  queueTelegramMessage(formatted: string, delivery?: TelegramDeliveryHooks): void {
+    this.telegramMessages.push({ formatted, delivery });
   }
 
   /**
@@ -198,18 +215,52 @@ export class FastChecker {
   private async pollCycle(): Promise<void> {
     let messageBlock = '';
     const ackIds: string[] = [];
+    let injectedAnything = false;
 
-    // Process queued Telegram messages. Keep the shifted batch so a failed
-    // injection can put them back — before this, a shift()ed message whose
-    // injection failed was gone forever (message-loss window on every
-    // sessionRefresh: the checker keeps polling while the agent restarts).
-    let hasTelegramMessage = false;
-    const telegramBatch: Array<{ formatted: string; ackIds: string[] }> = [];
+    // Drain the in-memory routing queue, but submit each Telegram update as a
+    // distinct delivery. Journaled updates retry through TelegramPoller;
+    // legacy unjournaled callers are requeued locally on NOT_RUNNING.
+    const telegramBatch: Array<{ formatted: string; delivery?: TelegramDeliveryHooks }> = [];
     while (this.telegramMessages.length > 0) {
       const msg = this.telegramMessages.shift()!;
       telegramBatch.push(msg);
-      messageBlock += msg.formatted;
-      hasTelegramMessage = true;
+    }
+
+    for (let index = 0; index < telegramBatch.length; index++) {
+      const item = telegramBatch[index];
+      try {
+        item.delivery?.onDispatch();
+        const result = this.agent.injectMessageDetailed(
+          item.formatted,
+          (error) => item.delivery?.onFailure(error?.message || 'PTY submission failed'),
+          () => item.delivery?.onAccepted(),
+          item.delivery?.deliveryId ?? item.formatted,
+        );
+        if (result.ok) {
+          injectedAnything = true;
+          this.lastMessageInjectedAt = Date.now();
+          this.log(`Submitted Telegram delivery ${item.delivery?.deliveryId ?? 'legacy'} (${item.formatted.length} bytes)`);
+        } else if (result.code === 'NOT_RUNNING') {
+          if (item.delivery) {
+            item.delivery.onFailure(result.message);
+          } else {
+            this.telegramMessages.push(item);
+          }
+          this.log(`Telegram injection skipped: ${result.message}`);
+        } else {
+          this.log(`Telegram injection already in flight/deduped: ${result.message}`);
+        }
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        if (item.delivery) item.delivery.onFailure(message);
+        else this.telegramMessages.push(item);
+        for (const unprocessed of telegramBatch.slice(index + 1)) {
+          if (unprocessed.delivery) unprocessed.delivery.onFailure(`delivery batch aborted before dispatch: ${message}`);
+          else this.telegramMessages.push(unprocessed);
+        }
+        this.log(`Telegram delivery batch aborted: ${message}`);
+        break;
+      }
     }
 
     // Check agent inbox
@@ -223,6 +274,7 @@ export class FastChecker {
     if (messageBlock) {
       const result = this.agent.injectMessageDetailed(messageBlock);
       if (result.ok) {
+        injectedAnything = true;
         // ACK inbox messages
         for (const id of ackIds) {
           ackInbox(this.paths, id);
@@ -231,34 +283,22 @@ export class FastChecker {
         // Only update typing timestamp for Telegram messages, not inbox/cron.
         // Inbox messages (agent-to-agent, session continuations) must not
         // restart the typing indicator after Stop has cleared it.
-        if (hasTelegramMessage) {
-          this.lastMessageInjectedAt = Date.now();
-        }
         // Cooldown after injection
         await sleep(5000);
       } else if (result.code === 'NOT_RUNNING') {
-        // Agent is mid-restart (session refresh / crash recovery). Inbox
-        // messages recover via the 5-min inflight sweep, but Telegram
-        // messages have NO other recovery path — requeue them at the front
-        // so the next poll cycle retries in original order. Unbounded on
-        // purpose: messages are precious, the queue only grows with real
-        // inbound traffic. ponytail: if an agent HALTS permanently the queue
-        // holds messages until daemon restart — acceptable, they deliver then.
-        if (telegramBatch.length > 0) {
-          this.telegramMessages.unshift(...telegramBatch);
-        }
-        this.log(`Injection skipped (${result.message}) — requeued ${telegramBatch.length} Telegram message(s); ${ackIds.length} inbox message(s) recover via inflight sweep`);
+        // Inbox messages recover through the inflight sweep. Journaled
+        // Telegram deliveries were handled independently above.
+        this.log(`Inbox injection skipped (${result.message}); ${ackIds.length} message(s) recover via inflight sweep`);
       } else {
-        // DEDUPED: this exact block was already injected once — dropping the
-        // requeue is correct (re-queueing would loop forever). ACK the inbox
-        // ids too: without the ack they bounce inbox↔inflight every 5 min and
-        // re-hit this dedup forever.
+        // ACK deduped inbox ids so they do not bounce through inflight forever.
         for (const id of ackIds) {
           ackInbox(this.paths, id);
         }
-        this.log(`Injection DEDUPED — dropping batch (${telegramBatch.length} Telegram, ${ackIds.length} inbox acked): ${result.message}`);
+        this.log(`Inbox injection DEDUPED — ${ackIds.length} message(s) acked: ${result.message}`);
       }
     }
+
+    if (injectedAnything && !messageBlock) await sleep(5000);
 
     // Typing indicator: send while Claude is actively working
     if (this.chatId && this.telegramApi && this.isAgentActive()) {
@@ -525,7 +565,7 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
    * API (not the agent's own bot) so answerCallbackQuery + editMessageText
    * target the right message on the right bot.
    */
-  async handleActivityCallback(query: TelegramCallbackQuery, activityApi: TelegramAPI): Promise<void> {
+  async handleActivityCallback(query: TelegramCallbackQuery, activityApi: TelegramAPI): Promise<CallbackOutcome> {
     const data = stripControlChars(query.data || '');
     const callbackQueryId = query.id;
 
@@ -537,7 +577,7 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
       if (fromUserId !== this.allowedUserId) {
         this.log(`SECURITY: activity-channel callback from unauthorized user ${fromUserId} - rejecting`);
         try { await activityApi.answerCallbackQuery(callbackQueryId, 'Not authorized'); } catch { /* ignore */ }
-        return;
+        return CALLBACK_IDEMPOTENT;
       }
     }
 
@@ -545,10 +585,10 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
     if (!apprMatch) {
       this.log(`activity-channel callback ignored (unknown prefix): ${data.slice(0, 40)}`);
       try { await activityApi.answerCallbackQuery(callbackQueryId, 'Unknown button'); } catch { /* ignore */ }
-      return;
+      return CALLBACK_IDEMPOTENT;
     }
 
-    await this.routeApprovalCallback(apprMatch[1] as 'allow' | 'deny', apprMatch[2], query, activityApi);
+    return this.routeApprovalCallback(apprMatch[1] as 'allow' | 'deny', apprMatch[2], query, activityApi);
   }
 
   /**
@@ -568,7 +608,7 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
     approvalId: string,
     query: TelegramCallbackQuery,
     api: TelegramAPI | undefined,
-  ): Promise<void> {
+  ): Promise<CallbackOutcome> {
     const chatId = query.message?.chat?.id;
     const messageId = query.message?.message_id;
     const callbackQueryId = query.id;
@@ -588,10 +628,24 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
       updateApproval(this.paths, approvalId, status, auditNote);
     } catch (err) {
       this.log(`Approval callback: updateApproval failed for ${approvalId}: ${err}`);
+      const resolvedPath = join(this.paths.approvalDir, 'resolved', `${approvalId}.json`);
+      if (existsSync(resolvedPath)) {
+        try {
+          const resolved = JSON.parse(readFileSync(resolvedPath, 'utf-8')) as { status?: unknown };
+          if (resolved.status === 'approved' || resolved.status === 'rejected') {
+            if (api) {
+              try { await api.answerCallbackQuery(callbackQueryId, `Already ${resolved.status}`); } catch { /* cosmetic */ }
+            }
+            return CALLBACK_IDEMPOTENT;
+          }
+        } catch {
+          // An unreadable terminal record cannot prove idempotent completion.
+        }
+      }
       if (api) {
         try { await api.answerCallbackQuery(callbackQueryId, 'Approval not found or already resolved'); } catch { /* ignore */ }
       }
-      return;
+      return callbackFailure(err);
     }
 
     if (api) {
@@ -602,13 +656,14 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
       }
     }
     this.log(`Approval callback: ${decision} for ${approvalId} by ${auditWho}`);
+    return CALLBACK_CONFIRMED;
   }
 
   /**
    * Handle a Telegram inline button callback query.
    * Routes to permission, restart, or AskUserQuestion handlers.
    */
-  async handleCallback(query: TelegramCallbackQuery): Promise<void> {
+  async handleCallback(query: TelegramCallbackQuery): Promise<CallbackOutcome> {
     const data = stripControlChars(query.data || '');
     const chatId = query.message?.chat?.id;
     const messageId = query.message?.message_id;
@@ -620,7 +675,7 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
       const fromUserId = query.from?.id;
       if (fromUserId !== this.allowedUserId) {
         this.log(`SECURITY: callback from unauthorized user ${fromUserId} - rejecting`);
-        return;
+        return CALLBACK_IDEMPOTENT;
       }
     }
 
@@ -631,8 +686,7 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
     // prefix check is cheap and routing-agnostic.
     const apprMatch = data.match(/^appr_(allow|deny)_(approval_\d+_[a-zA-Z0-9]+)$/);
     if (apprMatch) {
-      await this.routeApprovalCallback(apprMatch[1] as 'allow' | 'deny', apprMatch[2], query, this.telegramApi);
-      return;
+      return this.routeApprovalCallback(apprMatch[1] as 'allow' | 'deny', apprMatch[2], query, this.telegramApi);
     }
 
     // Permission callbacks: perm_(allow|deny|continue)_{hexId}
@@ -651,7 +705,7 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
         }
       }
       this.log(`Permission callback: ${decision} for ${hexId}`);
-      return;
+      return CALLBACK_CONFIRMED;
     }
 
     // Restart callbacks: restart_(allow|deny)_{hexId}
@@ -669,7 +723,7 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
         }
       }
       this.log(`Restart callback: ${decision} for ${hexId}`);
-      return;
+      return CALLBACK_CONFIRMED;
     }
 
     // AskUserQuestion single-select: askopt_{questionIdx}_{optionIdx}
@@ -687,11 +741,11 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
 
       // Navigate TUI: Down * oIdx, then Enter
       for (let k = 0; k < oIdx; k++) {
-        this.agent.write(KEYS.DOWN);
+        if (!this.agent.write(KEYS.DOWN)) return callbackFailure('agent stopped while applying AskUserQuestion selection');
         await sleep(50);
       }
       await sleep(100);
-      this.agent.write(KEYS.ENTER);
+      if (!this.agent.write(KEYS.ENTER)) return callbackFailure('agent stopped before AskUserQuestion selection submit');
 
       this.log(`AskUserQuestion: Q${qIdx} selected option ${oIdx}`);
 
@@ -713,9 +767,11 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
             this.log('AskUserQuestion: submitted all answers');
             try { unlinkSync(askStatePath); } catch { /* ignore */ }
           }
-        } catch { /* ignore parse errors */ }
+        } catch (err) {
+          return callbackFailure(err);
+        }
       }
-      return;
+      return CALLBACK_CONFIRMED;
     }
 
     // AskUserQuestion multi-select toggle: asktoggle_{questionIdx}_{optionIdx}
@@ -764,10 +820,14 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
               await this.telegramApi.editMessageText(chatId, messageId, text, { inline_keyboard: keyboard });
             } catch { /* ignore */ }
           }
-        } catch { /* ignore parse errors */ }
+        } catch (err) {
+          return callbackFailure(err);
+        }
+      } else {
+        return callbackFailure('AskUserQuestion state is unavailable');
       }
       this.log(`AskUserQuestion: Q${qIdx} toggled option ${oIdx}`);
-      return;
+      return CALLBACK_CONFIRMED;
     }
 
     // AskUserQuestion multi-select submit: asksubmit_{questionIdx}
@@ -795,10 +855,10 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
           for (const idx of chosenIndices) {
             const moves = idx - currentPos;
             for (let k = 0; k < moves; k++) {
-              this.agent.write(KEYS.DOWN);
+              if (!this.agent.write(KEYS.DOWN)) return callbackFailure('agent stopped while applying multi-select navigation');
               await sleep(50);
             }
-            this.agent.write(KEYS.SPACE);
+            if (!this.agent.write(KEYS.SPACE)) return callbackFailure('agent stopped while applying multi-select choice');
             await sleep(50);
             currentPos = idx;
           }
@@ -807,11 +867,11 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
           const submitPos = totalOpts + 1;
           const remaining = submitPos - currentPos;
           for (let k = 0; k < remaining; k++) {
-            this.agent.write(KEYS.DOWN);
+            if (!this.agent.write(KEYS.DOWN)) return callbackFailure('agent stopped while navigating to multi-select submit');
             await sleep(50);
           }
           await sleep(100);
-          this.agent.write(KEYS.ENTER);
+          if (!this.agent.write(KEYS.ENTER)) return callbackFailure('agent stopped before multi-select submit');
 
           this.log(`AskUserQuestion: Q${qIdx} submitted multi-select`);
 
@@ -829,13 +889,17 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
             await this.sendNextQuestion(nextQ);
           } else {
             await sleep(500);
-            this.agent.write(KEYS.ENTER);
+            if (!this.agent.write(KEYS.ENTER)) return callbackFailure('agent stopped before final AskUserQuestion submit');
             this.log('AskUserQuestion: submitted all answers');
             try { unlinkSync(askStatePath); } catch { /* ignore */ }
           }
-        } catch { /* ignore parse errors */ }
+        } catch (err) {
+          return callbackFailure(err);
+        }
+      } else {
+        return callbackFailure('AskUserQuestion state is unavailable');
       }
-      return;
+      return CALLBACK_CONFIRMED;
     }
 
     // Inject unhandled callbacks as a Telegram message so the agent can process custom button flows.
@@ -852,13 +916,33 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
         `message_id: ${messageId}`,
         `Reply using: cortextos bus send-telegram ${chatId} '<your reply>'`,
       ].join('\n');
-      const injected = this.agent.injectMessage(msg);
-      if (injected && this.telegramApi) {
+      const outcome = await new Promise<CallbackOutcome>((resolve) => {
+        let settled = false;
+        const finish = (result: CallbackOutcome) => {
+          if (settled) return;
+          settled = true;
+          resolve(result);
+        };
+        const injected = this.agent.injectMessageDetailed(
+          msg,
+          (error) => finish(callbackFailure(error ?? 'custom callback delivery failed')),
+          () => finish(CALLBACK_CONFIRMED),
+          `telegram-callback:${callbackQueryId}`,
+        );
+        if (!injected.ok) {
+          // DEDUPED can mean the same payload is merely in flight. Without a
+          // correlated runtime acceptance signal it is not proof of delivery.
+          finish(callbackFailure(injected.message));
+        }
+      });
+      if (outcome.ok && this.telegramApi) {
         try { await this.telegramApi.answerCallbackQuery(callbackQueryId, 'Got it'); } catch { /* ignore */ }
       }
       this.log(`Injected unhandled callback to agent: ${data.slice(0, 60)}`);
+      return outcome;
     } else {
       this.log(`Unhandled callback data (no agent/chatId): ${data}`);
+      return callbackFailure('custom callback cannot be delivered without an active agent and chat id');
     }
   }
 

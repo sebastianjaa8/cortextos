@@ -1,5 +1,11 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
+vi.mock('../../../src/utils/process-ownership.js', () => ({
+  writeRuntimeProcessRecord: vi.fn((_stateDir, input) => ({ ...input, ownerToken: 'a'.repeat(64) })),
+  removeRuntimeProcessRecord: vi.fn(() => true),
+  terminateProcessTree: vi.fn(() => true),
+}));
+
 // Mock the inject module so injectMessageDetailed's final PTY write is observable.
 // vi.hoisted: the mock factory is hoisted above this const, so the fn must be too.
 const { mockInjectMessage } = vi.hoisted(() => ({ mockInjectMessage: vi.fn() }));

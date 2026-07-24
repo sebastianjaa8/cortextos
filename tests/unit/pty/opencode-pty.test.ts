@@ -311,6 +311,51 @@ describe('OpencodePTY', () => {
     }
   });
 
+  it('accepts a delivery only after correlated output returns to a new quiet composer', async () => {
+    vi.useFakeTimers();
+    try {
+      const pty = new OpencodePTY(mockEnv, {});
+      installSpawnMock(pty);
+      await pty.spawn('fresh', '');
+      const onAccepted = vi.fn();
+      const onFailed = vi.fn();
+
+      pty.injectMessage('durable inbound', { onAccepted, onFailed });
+      await vi.advanceTimersByTimeAsync(450);
+      expect(onAccepted).not.toHaveBeenCalled();
+
+      pty.getOutputBuffer().push('unrelated rendering without an idle boundary\n');
+      await vi.advanceTimersByTimeAsync(1_500);
+      expect(onAccepted).not.toHaveBeenCalled();
+
+      pty.getOutputBuffer().push('Ask anything\n');
+      await vi.advanceTimersByTimeAsync(1_250);
+      expect(onAccepted).toHaveBeenCalledTimes(1);
+      expect(onFailed).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps a second delivery retryable while the prior boundary is unresolved', async () => {
+    vi.useFakeTimers();
+    try {
+      const pty = new OpencodePTY(mockEnv, {});
+      installSpawnMock(pty);
+      await pty.spawn('fresh', '');
+      const secondFailed = vi.fn();
+
+      pty.injectMessage('first', { onAccepted: vi.fn(), onFailed: vi.fn() });
+      pty.injectMessage('second', { onAccepted: vi.fn(), onFailed: secondFailed });
+
+      expect(secondFailed).toHaveBeenCalledWith(expect.objectContaining({
+        message: expect.stringContaining('prior turn boundary'),
+      }));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('adds a strict Telegram send requirement for OpenCode Telegram inbound', async () => {
     vi.useFakeTimers();
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});

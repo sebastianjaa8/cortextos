@@ -3,6 +3,7 @@
  * No external dependencies.
  */
 
+import { createHash } from 'crypto';
 import { existsSync, readFileSync } from 'fs';
 import { basename } from 'path';
 
@@ -82,6 +83,7 @@ export function formatValidateError(result: Extract<ValidateCredentialsResult, {
 
 export class TelegramAPI {
   private baseUrl: string;
+  private botIdentity: string;
   private lastSendTime: Map<string, number> = new Map();
   // Chat IDs already warned for the self_chat trap. Keeps the runtime
   // diagnostic emitted at most once per chat_id per process lifetime.
@@ -89,6 +91,19 @@ export class TelegramAPI {
 
   constructor(token: string) {
     this.baseUrl = `https://api.telegram.org/bot${token}`;
+    const botId = token.split(':', 1)[0];
+    this.botIdentity = /^\d+$/.test(botId)
+      ? botId
+      : createHash('sha256').update(token).digest('hex').slice(0, 16);
+  }
+
+  /**
+   * Stable, non-secret identity for delivery journaling.
+   * Telegram bot tokens begin with the numeric bot id; malformed/test tokens
+   * fall back to a one-way digest so the token is never exposed.
+   */
+  getBotIdentity(): string {
+    return this.botIdentity;
   }
 
   /**

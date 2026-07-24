@@ -72,9 +72,16 @@ export class MessageDedup {
  * Enter leaves the pasted text sitting in the composer with near-zero
  * output. Comparing the counter before/after Enter distinguishes the two.
  */
+export interface DeliveryCallbacks {
+  onAccepted?: () => void;
+  onFailed?: (error: Error) => void;
+}
+
 export interface InjectVerify {
-  getOutputBytes: () => number;
+  getOutputBytes?: () => number;
   log?: (msg: string) => void;
+  /** Called once the deferred Enter write reaches the PTY. */
+  onSubmitted?: () => void;
   /**
    * Called when the submit verifiably failed: the Enter write threw (PTY
    * torn down) or every Enter retry saw zero PTY output. Callers use this
@@ -82,7 +89,9 @@ export interface InjectVerify {
    * silently dropped (at-least-once over at-most-once — a false-negative
    * here can at worst double-deliver, which is benign vs silent loss).
    */
-  onFailed?: () => void;
+  onFailed?: (error?: Error) => void;
+  /** Called once PTY output proves the submitted turn actually started. */
+  onAccepted?: () => void;
 }
 
 // A submit repaint is thousands of bytes; idle-prompt noise is ~0.
@@ -166,29 +175,34 @@ export function injectMessage(
     if (!sendEnter()) {
       // Enter never reached the PTY — the paste is stranded (or the PTY is
       // gone entirely). Report failure so dedup state can be un-poisoned.
-      verify?.onFailed?.();
+      verify?.onFailed?.(new Error('deferred Enter write failed'));
       return;
     }
-    if (!verify) return;
+    verify?.onSubmitted?.();
+    const getOutputBytes = verify?.getOutputBytes;
+    if (!getOutputBytes) return;
 
     // Verified-submit loop: if the PTY produced (almost) no output since
     // Enter, the composer still holds the paste — re-send Enter. A bare
     // Enter on an already-submitted (empty) composer is a no-op, so a
     // false-negative retry is harmless.
-    let baseline = verify.getOutputBytes();
+    let baseline = getOutputBytes();
     let attempt = 0;
     const check = () => {
-      const grown = verify.getOutputBytes() - baseline;
-      if (grown >= SUBMIT_ACTIVITY_MIN_BYTES) return; // turn started
+      const grown = getOutputBytes() - baseline;
+      if (grown >= SUBMIT_ACTIVITY_MIN_BYTES) {
+        verify.onAccepted?.();
+        return;
+      }
       if (attempt >= ENTER_RETRY_DELAYS_MS.length) {
         verify.log?.(`[inject] Enter retries exhausted (${grown}B output) — message may be stuck in composer`);
-        verify.onFailed?.();
+        verify.onFailed?.(new Error('Enter retries exhausted without PTY response'));
         return;
       }
       verify.log?.(`[inject] no PTY output after Enter (${grown}B) — re-sending Enter (retry ${attempt + 1})`);
-      baseline = verify.getOutputBytes();
+      baseline = getOutputBytes();
       if (!sendEnter()) {
-        verify.onFailed?.();
+        verify.onFailed?.(new Error('deferred Enter retry failed'));
         return;
       }
       attempt++;

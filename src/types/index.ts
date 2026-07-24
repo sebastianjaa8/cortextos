@@ -22,7 +22,8 @@ export interface InboxMessage {
   timestamp: string; // ISO 8601
   text: string;
   reply_to: string | null;
-  sig?: string; // Security (H10): HMAC-SHA256 signature — optional for backwards compat
+  sig_v?: 2;
+  sig?: string; // Required when sender/shared signing is configured; optional only on unsigned legacy installs.
 }
 
 // Task Types
@@ -634,6 +635,7 @@ export interface BusPaths {
 
 export type IPCCommandType =
   | 'status'
+  | 'start-all-agents'
   | 'start-agent'
   | 'stop-agent'
   | 'restart-agent'
@@ -651,7 +653,8 @@ export type IPCCommandType =
   | 'add-cron'
   | 'update-cron'
   | 'remove-cron'
-  | 'fleet-health';
+  | 'fleet-health'
+  | 'telegram-delivery-health';
 
 // ---------------------------------------------------------------------------
 // Execution log pagination response — Subtask 4.3
@@ -749,6 +752,8 @@ export interface IPCRequest {
   type: IPCCommandType;
   agent?: string;
   data?: Record<string, unknown>;
+  /** Per-instance local control-plane credential, attached by IPCClient. */
+  auth?: string;
   /**
    * BUG-015: human-readable identifier of the caller (e.g. 'cortextos enable',
    * 'cortextos bus soft-restart-all'). Logged by the daemon on every incoming
@@ -781,7 +786,7 @@ export interface IPCResponse {
    * "agent does not exist" (NOT_FOUND) from "request collapsed against an
    * in-flight identical op" (DEDUPED). See issue #346.
    */
-  code?: 'NOT_FOUND' | 'DEDUPED' | 'INVALID_INPUT' | 'NOT_RUNNING';
+  code?: 'NOT_FOUND' | 'DEDUPED' | 'INVALID_INPUT' | 'NOT_RUNNING' | 'UNAUTHORIZED' | 'PAYLOAD_TOO_LARGE';
 }
 
 // Agent Discovery Types
@@ -809,4 +814,6 @@ export interface AgentStatus {
   sessionStart?: string;
   crashCount?: number;
   model?: string;
+  /** Sanitized startup failure reason for a configured runtime that could not launch. */
+  lastError?: string;
 }

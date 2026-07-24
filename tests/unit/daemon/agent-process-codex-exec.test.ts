@@ -1,5 +1,11 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
+vi.mock('../../../src/utils/process-ownership.js', () => ({
+  writeRuntimeProcessRecord: vi.fn((_stateDir, input) => ({ ...input, ownerToken: 'a'.repeat(64) })),
+  removeRuntimeProcessRecord: vi.fn(() => true),
+  terminateProcessTree: vi.fn(() => true),
+}));
+
 let capturedOnExit: ((exitCode: number, signal?: number) => void) | null = null;
 let mockCodexExecPty: MockCodexExecPTY;
 const mockCodexExecSessionExists = vi.fn().mockReturnValue(false);
@@ -105,6 +111,7 @@ vi.mock('fs', async () => {
 });
 
 const { AgentProcess } = await import('../../../src/daemon/agent-process.js');
+const { writeRuntimeProcessRecord } = await import('../../../src/utils/process-ownership.js');
 
 const mockEnv = {
   instanceId: 'test',
@@ -125,6 +132,7 @@ beforeEach(() => {
   fsMocks.writeFileSync.mockReset();
   fsMocks.appendFileSync.mockReset();
   fsMocks.statSync.mockReset();
+  vi.mocked(writeRuntimeProcessRecord).mockClear();
 });
 
 describe('AgentProcess codex-exec runtime', () => {
@@ -134,6 +142,7 @@ describe('AgentProcess codex-exec runtime', () => {
 
     expect(mockCodexExecPty.spawn).toHaveBeenCalledWith('fresh', expect.any(String));
     expect(ap.getStatus().pid).toBe(24680);
+    expect(writeRuntimeProcessRecord).not.toHaveBeenCalled();
   });
 
   it('uses codex-exec session state for continue mode', async () => {

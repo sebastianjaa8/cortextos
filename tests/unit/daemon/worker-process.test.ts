@@ -20,6 +20,16 @@ vi.mock('../../../src/pty/agent-pty.js', () => ({
   },
 }));
 
+vi.mock('../../../src/utils/process-ownership.js', () => ({
+  writeRuntimeProcessRecord: vi.fn((_stateDir, input) => ({
+    ...input,
+    ownerToken: 'a'.repeat(64),
+    processStartIdentity: 'test-start',
+  })),
+  removeRuntimeProcessRecord: vi.fn(() => true),
+  terminateProcessTree: vi.fn(() => true),
+}));
+
 const mockInjectMessage = vi.fn();
 vi.mock('../../../src/pty/inject.js', () => ({
   injectMessage: mockInjectMessage,
@@ -31,6 +41,8 @@ vi.mock('fs', async () => {
 });
 
 const { WorkerProcess } = await import('../../../src/daemon/worker-process.js');
+const { writeRuntimeProcessRecord } = await import('../../../src/utils/process-ownership.js');
+const writeRuntimeProcessRecordMock = vi.mocked(writeRuntimeProcessRecord);
 
 const mockEnv = {
   instanceId: 'test',
@@ -49,9 +61,27 @@ beforeEach(() => {
   mockPty.kill.mockClear();
   mockPty.write.mockClear();
   mockInjectMessage.mockClear();
+  writeRuntimeProcessRecordMock.mockClear();
 });
 
 describe('WorkerProcess', () => {
+  it('publishes runtime ownership before the spawn promise settles', async () => {
+    let settleSpawn!: () => void;
+    mockPty.spawn.mockImplementationOnce(() => new Promise<void>((resolve) => {
+      settleSpawn = resolve;
+    }));
+    const worker = new WorkerProcess('publication-worker', '/tmp/proj', undefined);
+
+    const spawning = worker.spawn(mockEnv, 'do the task');
+
+    expect(writeRuntimeProcessRecordMock).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({ pid: 12345, runtime: 'worker' }),
+    );
+    settleSpawn();
+    await spawning;
+  });
+
   describe('construction', () => {
     it('sets name, dir, parent', () => {
       const w = new WorkerProcess('w1', '/tmp/proj', 'parent-agent');

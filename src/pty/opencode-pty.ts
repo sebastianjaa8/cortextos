@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from '
 import { join } from 'path';
 import { platform } from 'os';
 import { AgentPTY } from './agent-pty.js';
-import { KEYS } from './inject.js';
+import { KEYS, type DeliveryCallbacks } from './inject.js';
 import { OpencodeContextReporter } from './opencode-context-reporter.js';
 import type { AgentConfig, CtxEnv } from '../types/index.js';
 import { stripControlChars } from '../utils/validate.js';
@@ -16,6 +16,9 @@ const STARTUP_INJECT_MIN_ATTEMPTS = 6;
 const STARTUP_INJECT_STABLE_TICKS = 3;
 const CONTEXT_REPORT_INTERVAL_MS = 5000;
 const INJECTION_SHELL_RESET_DELAY_MS = 150;
+const DELIVERY_CONFIRM_POLL_MS = 250;
+const DELIVERY_CONFIRM_QUIET_TICKS = 4;
+const DELIVERY_CONFIRM_TIMEOUT_MS = 120_000;
 // After a typed `exit`, the zsh shell tears down and OpenCode repaints the chat
 // TUI. Give that repaint room before typing the real content, otherwise the
 // content races the shell teardown and lands at the dying prompt.
@@ -57,6 +60,8 @@ export class OpencodePTY extends AgentPTY {
   private contextReporter: OpencodeContextReporter | null = null;
   private contextReportTimer: ReturnType<typeof setInterval> | null = null;
   private spawnStartedAtMs = 0;
+  private deliveryConfirmationActive = false;
+  private activeDeliveryFailure: ((error: Error) => void) | null = null;
 
   constructor(env: CtxEnv, config: AgentConfig, logPath?: string) {
     super(env, config, logPath, OPENCODE_BOOTSTRAP_PATTERN);
@@ -140,6 +145,7 @@ export class OpencodePTY extends AgentPTY {
   }
 
   override kill(): void {
+    this.activeDeliveryFailure?.(new Error('OpenCode runtime stopped before delivery confirmation'));
     try {
       this.stopContextReporter();
       super.kill();
@@ -148,7 +154,10 @@ export class OpencodePTY extends AgentPTY {
     }
   }
 
-  override injectMessage(content: string): void {
+  override injectMessage(content: string, delivery?: DeliveryCallbacks): void {
+    const reservedDelivery = this.reserveDelivery(delivery);
+    if (reservedDelivery === null) return;
+    delivery = reservedDelivery;
     // OpenCode v1.17.9's TUI does not reliably surface content delivered with
     // bracketed paste (`ESC[200~ ... ESC[201~`): sandbox validation showed the
     // shared injector could repaint the screen without the inbound message
@@ -179,6 +188,7 @@ export class OpencodePTY extends AgentPTY {
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.warn(`[opencode-pty] shell-mode reset (Escape) failed before injection (pty likely torn down): ${msg}`);
+      delivery?.onFailed?.(err instanceof Error ? err : new Error(msg));
       return;
     }
 
@@ -190,14 +200,16 @@ export class OpencodePTY extends AgentPTY {
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           console.warn(`[opencode-pty] shell exit-recovery failed before injection (pty likely torn down): ${msg}`);
+          delivery?.onFailed?.(err instanceof Error ? err : new Error(msg));
           return;
         }
         setTimeout(() => {
           try {
-            this.typeAndSubmit(safeContent);
+            this.typeAndSubmit(safeContent, delivery);
           } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
             console.warn(`[opencode-pty] deferred injection failed after shell exit (pty likely torn down): ${msg}`);
+            delivery?.onFailed?.(err instanceof Error ? err : new Error(msg));
           }
         }, INJECTION_SHELL_EXIT_SETTLE_MS).unref?.();
       }, INJECTION_SHELL_RESET_DELAY_MS).unref?.();
@@ -206,10 +218,11 @@ export class OpencodePTY extends AgentPTY {
 
     setTimeout(() => {
       try {
-        this.typeAndSubmit(safeContent);
+        this.typeAndSubmit(safeContent, delivery);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         console.warn(`[opencode-pty] deferred injection failed (pty likely torn down): ${msg}`);
+        delivery?.onFailed?.(err instanceof Error ? err : new Error(msg));
       }
     }, INJECTION_SHELL_RESET_DELAY_MS).unref?.();
   }
@@ -249,19 +262,99 @@ export class OpencodePTY extends AgentPTY {
     return SHELL_PROMPT_TAIL_PATTERN.test(lastNonEmpty) ? 'shell' : 'chat';
   }
 
-  private typeAndSubmit(safeContent: string): void {
+  private typeAndSubmit(safeContent: string, delivery?: DeliveryCallbacks): void {
     const maxChunk = 4096;
     for (let i = 0; i < safeContent.length; i += maxChunk) {
       this.write(safeContent.slice(i, i + maxChunk));
     }
     setTimeout(() => {
       try {
+        const baselineBytes = this.getOutputBuffer().getTotalBytes();
+        const baselineRecent = this.getOutputBuffer().getRecent();
         this.write(KEYS.ENTER);
+        if (delivery) this.confirmSubmittedTurnBoundary(baselineBytes, baselineRecent, delivery);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         console.warn(`[opencode-pty] deferred Enter failed (pty likely torn down): ${msg}`);
+        delivery?.onFailed?.(err instanceof Error ? err : new Error(msg));
       }
     }, 300).unref?.();
+  }
+
+  private reserveDelivery(delivery?: DeliveryCallbacks): DeliveryCallbacks | null | undefined {
+    if (!delivery) return undefined;
+    if (this.deliveryConfirmationActive) {
+      delivery.onFailed?.(new Error('OpenCode delivery is waiting for the prior turn boundary'));
+      return null;
+    }
+    this.deliveryConfirmationActive = true;
+    let settled = false;
+    const settle = (callback: (() => void) | undefined) => {
+      if (settled) return;
+      settled = true;
+      this.deliveryConfirmationActive = false;
+      this.activeDeliveryFailure = null;
+      callback?.();
+    };
+    const wrapped: DeliveryCallbacks = {
+      onAccepted: () => settle(delivery.onAccepted),
+      onFailed: (error) => settle(() => delivery.onFailed?.(error)),
+    };
+    this.activeDeliveryFailure = (error) => wrapped.onFailed?.(error);
+    return wrapped;
+  }
+
+  /**
+   * OpenCode exposes no semantic submit acknowledgement in its TUI protocol.
+   * Keep the journal retryable until this exact Enter is followed by output,
+   * a quiet window, and the runtime-specific chat composer signal. Output
+   * growth alone is deliberately insufficient because mid-turn rendering can
+   * otherwise false-accept an unrelated delivery.
+   */
+  private confirmSubmittedTurnBoundary(
+    baselineBytes: number,
+    baselineRecent: string,
+    delivery: DeliveryCallbacks,
+  ): void {
+    const startedAt = Date.now();
+    let sawPostSubmitOutput = false;
+    let lastBytes = baselineBytes;
+    let quietTicks = 0;
+    const timer = setInterval(() => {
+      if (!this.isAlive()) {
+        clearInterval(timer);
+        delivery.onFailed?.(new Error('OpenCode runtime exited before delivery confirmation'));
+        return;
+      }
+      const bytes = this.getOutputBuffer().getTotalBytes();
+      if (bytes > baselineBytes) sawPostSubmitOutput = true;
+      quietTicks = bytes === lastBytes ? quietTicks + 1 : 0;
+      lastBytes = bytes;
+
+      if (sawPostSubmitOutput
+        && quietTicks >= DELIVERY_CONFIRM_QUIET_TICKS
+        && this.hasNewChatComposerSignal(baselineRecent)) {
+        clearInterval(timer);
+        delivery.onAccepted?.();
+        return;
+      }
+      if (Date.now() - startedAt >= DELIVERY_CONFIRM_TIMEOUT_MS) {
+        clearInterval(timer);
+        delivery.onFailed?.(new Error('OpenCode did not reach a correlated idle composer boundary'));
+      }
+    }, DELIVERY_CONFIRM_POLL_MS);
+    timer.unref?.();
+  }
+
+  private hasNewChatComposerSignal(baselineRecent: string): boolean {
+    const recent = this.getOutputBuffer().getRecent();
+    const postSubmit = recent.startsWith(baselineRecent) ? recent.slice(baselineRecent.length) : recent;
+    const tail = postSubmit
+      .replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '')
+      .split('\n')
+      .slice(-SHELL_DETECT_TAIL_LINES)
+      .join('\n');
+    return tail.includes('Ask anything') || tail.includes('ctrl+p commands');
   }
 
   private prepareInjectedContent(content: string): string {

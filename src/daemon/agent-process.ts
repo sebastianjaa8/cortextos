@@ -14,6 +14,12 @@ import { writeCortextosEnv } from '../utils/env.js';
 import { getOverdueReminders } from '../bus/reminders.js';
 import { resolvePaths } from '../utils/paths.js';
 import { logEvent } from '../bus/event.js';
+import {
+  removeRuntimeProcessRecord,
+  terminateProcessTree,
+  writeRuntimeProcessRecord,
+  type RuntimeProcessRecord,
+} from '../utils/process-ownership.js';
 
 type LogFn = (msg: string) => void;
 
@@ -71,6 +77,15 @@ export class AgentProcess {
   // a handoff doc marker. start() reads this after spawn to decide whether the
   // daemon should fire runtime-owned lifecycle Telegram directly.
   private lastSpawnWasHandoff = false;
+  // Lifecycle entry points can be triggered by IPC, crash recovery, timers,
+  // and context handoff. Singleflight prevents an untracked duplicate PTY.
+  private startPromise: Promise<void> | null = null;
+  private stopPromise: Promise<void> | null = null;
+  private refreshPromise: Promise<void> | null = null;
+  private lifecycleTail: Promise<void> = Promise.resolve();
+  private desiredRunning = false;
+  private runtimeProcessRecords = new Map<string, RuntimeProcessRecord>();
+  private lastError: string | undefined;
 
   constructor(name: string, env: CtxEnv, config: AgentConfig, log?: LogFn) {
     this.name = name;
@@ -91,6 +106,29 @@ export class AgentProcess {
    * Start the agent. Spawns Claude Code in a PTY.
    */
   async start(): Promise<void> {
+    this.desiredRunning = true;
+    if (this.startPromise) return this.startPromise;
+    const operation = this.enqueueLifecycle(() => this.startImpl());
+    this.startPromise = operation;
+    try {
+      await operation;
+    } finally {
+      if (this.startPromise === operation) this.startPromise = null;
+    }
+  }
+
+  private enqueueLifecycle(operation: () => Promise<void>): Promise<void> {
+    const run = this.lifecycleTail.catch(() => undefined).then(operation);
+    this.lifecycleTail = run.catch(() => undefined);
+    return run;
+  }
+
+  private async startImpl(): Promise<void> {
+    if (!this.desiredRunning) {
+      this.status = 'stopped';
+      return;
+    }
+    this.lastError = undefined;
     if (this.status === 'running') {
       this.log('Already running');
       return;
@@ -101,6 +139,10 @@ export class AgentProcess {
     if (delay > 0) {
       this.log(`Startup delay: ${delay}s`);
       await sleep(delay * 1000);
+    }
+    if (!this.desiredRunning) {
+      this.status = 'stopped';
+      return;
     }
 
     // Write .cortextos-env for backward compat (D6)
@@ -126,6 +168,7 @@ export class AgentProcess {
     // new lifecycle began" — in which case it bails out without touching
     // handleExit, preventing spurious crash recovery on the new agent.
     const myGeneration = ++this.lifecycleGeneration;
+    const myRuntimeOwnerTokens: string[] = [];
 
     // Create PTY — runtime-specific subclass handles binary, args, bootstrap detection
     const logPath = join(this.env.ctxRoot, 'logs', this.name, 'stdout.log');
@@ -157,6 +200,11 @@ export class AgentProcess {
 
     // Handle exit
     this.pty.onExit((exitCode, signal) => {
+      // Per-generation records are token-fenced, so an old exit can safely
+      // remove only its own records before the lifecycle-generation check.
+      for (const ownerToken of myRuntimeOwnerTokens) {
+        this.clearRuntimeProcessRecord(ownerToken);
+      }
       // BUG-040 fix: if the lifecycle has moved on (a new start() incremented
       // the generation since this PTY was spawned), this is an old PTY's late
       // exit. Ignore it entirely — we don't want it to trigger handleExit on
@@ -173,7 +221,25 @@ export class AgentProcess {
     });
 
     try {
-      await this.pty.spawn(mode, prompt);
+      const ptyForSpawn = this.pty;
+      let spawnSettled = false;
+      const spawnPromise = ptyForSpawn.spawn(mode, prompt).finally(() => {
+        spawnSettled = true;
+      });
+      const spawnDone = spawnPromise.then(() => undefined, () => undefined);
+      const ownershipPromise = this.config.runtime === 'codex-exec'
+        ? Promise.resolve()
+        : this.captureRuntimeOwnership(
+          ptyForSpawn,
+          myRuntimeOwnerTokens,
+          () => spawnSettled,
+          spawnDone,
+        );
+      try {
+        await spawnPromise;
+      } finally {
+        await ownershipPromise;
+      }
       // Codex exec-per-turn race: the new PTY's onExit can fire BEFORE this
       // line if `codex exec` completes its prompt quickly (CodexAppServerPTY's spawn
       // resolves once exec is launched, but the process may exit moments
@@ -184,9 +250,15 @@ export class AgentProcess {
         this.log('PTY exited during spawn — handleExit will recover');
         return;
       }
+      // codex-exec is a virtual resident adapter with one OS process per turn.
+      // It owns and fences each transient child itself; a boot-time record would
+      // become stale as soon as the bootstrap turn completed.
+      if (this.config.runtime !== 'codex-exec') {
+        if (myRuntimeOwnerTokens.length === 0) throw new Error('PTY spawned without a process ID');
+      }
       this.status = 'running';
       this.sessionStart = new Date();
-      this.log(`Running (pid: ${this.pty.getPid()})`);
+      this.log(`Running (pid: ${this.pty.getPid() ?? 'virtual-idle'})`);
 
       this.maybeSendRuntimeLifecycleNotification();
 
@@ -196,8 +268,43 @@ export class AgentProcess {
       this.notifyStatusChange();
     } catch (err) {
       this.log(`Failed to start: ${err}`);
-      this.status = 'crashed';
+      try { this.pty?.kill(); } catch { /* best effort */ }
+      this.pty = null;
+      for (const ownerToken of myRuntimeOwnerTokens) {
+        this.clearRuntimeProcessRecord(ownerToken);
+      }
+      this.lastError = sanitizeRuntimeError(err);
+      this.status = 'stopped';
       this.notifyStatusChange();
+    }
+  }
+
+  private async captureRuntimeOwnership(
+    pty: AgentPTY | CodexAppServerPTY | CodexExecPTY,
+    ownerTokens: string[],
+    isSpawnSettled: () => boolean,
+    spawnDone: Promise<void>,
+  ): Promise<void> {
+    const recordedPids = new Set<number>();
+    while (true) {
+      if (this.pty !== pty) return;
+      const pid = pty.getPid();
+      if (pid && !recordedPids.has(pid)) {
+        const record = writeRuntimeProcessRecord(
+          join(this.env.ctxRoot, 'state', this.name),
+          {
+            instanceId: this.env.instanceId,
+            agentName: this.name,
+            runtime: this.config.runtime || 'claude-code',
+            pid,
+          },
+        );
+        recordedPids.add(pid);
+        ownerTokens.push(record.ownerToken);
+        this.runtimeProcessRecords.set(record.ownerToken, record);
+      }
+      if (isSpawnSettled()) return;
+      await Promise.race([spawnDone, sleep(10)]);
     }
   }
 
@@ -205,6 +312,18 @@ export class AgentProcess {
    * Stop the agent gracefully.
    */
   async stop(): Promise<void> {
+    this.desiredRunning = false;
+    if (this.stopPromise) return this.stopPromise;
+    const operation = this.enqueueLifecycle(() => this.stopImpl());
+    this.stopPromise = operation;
+    try {
+      await operation;
+    } finally {
+      if (this.stopPromise === operation) this.stopPromise = null;
+    }
+  }
+
+  private async stopImpl(): Promise<void> {
     if (this.stopping) return;
     this.stopping = true;
     // BUG-040 fix: stopRequested persists ACROSS stop()'s return until
@@ -285,6 +404,8 @@ export class AgentProcess {
       }
     }
 
+    this.terminateAndClearRuntimeProcessRecord();
+
     this.stopping = false;
     // NOTE: this.stopRequested is intentionally NOT cleared here. It is
     // cleared by handleExit when the intentional exit fires (or by start()
@@ -292,6 +413,41 @@ export class AgentProcess {
     this.status = 'stopped';
     this.notifyStatusChange();
     this.log('Stopped');
+  }
+
+  /** Synchronous, idempotent last-resort teardown for fatal daemon exit. */
+  forceStop(): void {
+    this.desiredRunning = false;
+    this.stopRequested = true;
+    this.stopping = true;
+    this.clearSessionTimer();
+    const pty = this.pty;
+    this.pty = null;
+    if (pty) {
+      try { pty.kill(); } catch { /* already exited */ }
+    }
+    this.terminateAndClearRuntimeProcessRecord();
+    this.resolveExit?.();
+    this.resolveExit = null;
+    this.status = 'stopped';
+    this.stopping = false;
+  }
+
+  private clearRuntimeProcessRecord(ownerToken: string | null): void {
+    if (!ownerToken) return;
+    removeRuntimeProcessRecord(join(this.env.ctxRoot, 'state', this.name), ownerToken);
+    this.runtimeProcessRecords.delete(ownerToken);
+  }
+
+  private terminateAndClearRuntimeProcessRecord(): void {
+    for (const record of [...this.runtimeProcessRecords.values()]) {
+      const expected = { pid: record.pid, startIdentity: record.processStartIdentity };
+      if (terminateProcessTree(record.pid, expected)) {
+        this.clearRuntimeProcessRecord(record.ownerToken);
+      } else {
+        this.log(`Process ownership record retained: PID ${record.pid} could not be proven terminated`);
+      }
+    }
   }
 
   /**
@@ -305,6 +461,21 @@ export class AgentProcess {
    * conversation directory still has .jsonl files (shouldContinue() is true).
    */
   async sessionRefresh(): Promise<void> {
+    if (this.refreshPromise) return this.refreshPromise;
+    const operation = this.enqueueLifecycle(() => this.sessionRefreshImpl());
+    this.refreshPromise = operation;
+    try {
+      await operation;
+    } finally {
+      if (this.refreshPromise === operation) this.refreshPromise = null;
+    }
+  }
+
+  private async sessionRefreshImpl(): Promise<void> {
+    if (!this.desiredRunning || this.status !== 'running') {
+      this.log('Skipping session refresh: agent is stopping or not running');
+      return;
+    }
     this.log('Session refresh (--continue restart)');
     // Write .session-refresh marker so the SessionEnd crash-alert hook
     // (src/hooks/hook-crash-alert.ts) classifies the imminent PTY exit as a
@@ -323,8 +494,12 @@ export class AgentProcess {
     } catch (err) {
       this.log(`Failed to write .session-refresh marker: ${err}`);
     }
-    await this.stop();
-    await this.start();
+    await this.stopImpl();
+    if (!this.desiredRunning) {
+      this.log('Session refresh cancelled by a concurrent stop request');
+      return;
+    }
+    await this.startImpl();
     this.log('Session refreshed');
   }
 
@@ -338,13 +513,15 @@ export class AgentProcess {
    */
   injectMessageDetailed(
     content: string,
-    onDeliveryFailed?: () => void,
+    onDeliveryFailed?: (error?: Error) => void,
+    onDeliveryAccepted?: () => void,
+    dedupKey: string = content,
   ): { ok: true } | { ok: false; code: 'NOT_RUNNING' | 'DEDUPED'; message: string } {
     if (!this.pty || this.status !== 'running') {
       return { ok: false, code: 'NOT_RUNNING', message: `agent "${this.name}" is registered but not running (status: ${this.status})` };
     }
 
-    if (this.dedup.isDuplicate(content)) {
+    if (this.dedup.isDuplicate(dedupKey)) {
       this.log('Dedup: skipping duplicate message');
       return { ok: false, code: 'DEDUPED', message: `inject for "${this.name}" deduped — content matches MessageDedup hash window` };
     }
@@ -358,11 +535,42 @@ export class AgentProcess {
     // for the primary Claude Code runtime. Narrowed the dispatch to OpencodePTY
     // specifically so every other runtime (AgentPTY, HermesPTY, CodexAppServerPTY) keeps
     // going through the verified-retry path.
-    if (this.pty instanceof OpencodePTY || this.pty instanceof CodexExecPTY) {
-      this.pty.injectMessage(content);
+    let deliverySettled = false;
+    const acceptDelivery = () => {
+      if (deliverySettled) return;
+      deliverySettled = true;
+      onDeliveryAccepted?.();
+    };
+    const failDelivery = (error?: Error) => {
+      if (deliverySettled) return;
+      deliverySettled = true;
+      this.dedup.forget(dedupKey);
+      onDeliveryFailed?.(error);
+    };
+
+    const targetPty = this.pty;
+    if (
+      targetPty instanceof OpencodePTY
+      || targetPty instanceof CodexExecPTY
+      || targetPty instanceof CodexAppServerPTY
+    ) {
+      if (onDeliveryAccepted || onDeliveryFailed) {
+        targetPty.injectMessage(content, {
+          onAccepted: acceptDelivery,
+          onFailed: failDelivery,
+        });
+      } else {
+        targetPty.injectMessage(content);
+      }
     } else {
-      const buffer = this.pty.getOutputBuffer();
-      injectMessage((data) => this.pty?.write(data), content, undefined, {
+      const buffer = targetPty.getOutputBuffer();
+      const writeToTarget = (data: string) => {
+        if (this.pty !== targetPty || !targetPty.isAlive()) {
+          throw new Error(`agent ${this.name} PTY generation changed before delivery completed`);
+        }
+        targetPty.write(data);
+      };
+      injectMessage(writeToTarget, content, undefined, {
         getOutputBytes: () => buffer.getTotalBytes(),
         log: (msg) => this.log(msg),
         // Dedup un-poisoning: the hash above was recorded BEFORE the async
@@ -370,11 +578,11 @@ export class AgentProcess {
         // all verify retries saw zero output — the 2026-07-01/02 Enter-swallow
         // class), forget the hash so a re-send of the identical content is not
         // silently DEDUPED into permanent message loss.
-        onFailed: () => {
+        onFailed: (error) => {
           this.log('Inject submit failed — forgetting dedup hash so a re-send can go through');
-          this.dedup.forget(content);
-          onDeliveryFailed?.();
+          failDelivery(error);
         },
+        onAccepted: acceptDelivery,
       });
     }
     return { ok: true };
@@ -623,6 +831,7 @@ export class AgentProcess {
       sessionStart: this.sessionStart?.toISOString(),
       crashCount: this.crashCount,
       model: this.config.model,
+      lastError: this.lastError,
     };
   }
 
@@ -650,10 +859,11 @@ export class AgentProcess {
    * Write raw data to the agent's PTY.
    * Used for TUI navigation (key sequences).
    */
-  write(data: string): void {
-    if (this.pty) {
-      this.pty.write(data);
-    }
+  write(data: string): boolean {
+    const targetPty = this.pty;
+    if (!targetPty || this.status !== 'running' || !targetPty.isAlive()) return false;
+    targetPty.write(data);
+    return true;
   }
 
   /**
@@ -1266,4 +1476,14 @@ export class AgentProcess {
 
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function sanitizeRuntimeError(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return message
+    .replace(/\b\d{5,}:[A-Za-z0-9_-]{20,}\b/g, '[redacted-token]')
+    .replace(/(token|secret|password|api[_-]?key)\s*[:=]\s*[^\s,;]+/gi, '$1=[redacted]')
+    .replace(/[\r\n\t]+/g, ' ')
+    .trim()
+    .slice(0, 300) || 'runtime failed to start';
 }

@@ -1,4 +1,4 @@
-export { atomicWriteSync, ensureDir } from './atomic.js';
+export { atomicWriteDurableSync, atomicWriteSync, ensureDir } from './atomic.js';
 export { acquireLock, releaseLock } from './lock.js';
 export { resolvePaths, getIpcPath } from './paths.js';
 export { resolveEnv, writeCortextosEnv, sourceEnvFile } from './env.js';

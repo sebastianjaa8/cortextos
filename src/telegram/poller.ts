@@ -1,262 +1,303 @@
-import { readFileSync, writeFileSync, existsSync } from 'fs';
+import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
-import type { BusPaths, TelegramUpdate, TelegramMessage, TelegramCallbackQuery, TelegramMessageReaction } from '../types/index.js';
-import { TelegramAPI } from './api.js';
-import { ensureDir } from '../utils/atomic.js';
+import type {
+  BusPaths,
+  TelegramCallbackQuery,
+  TelegramMessage,
+  TelegramMessageReaction,
+  TelegramUpdate,
+} from '../types/index.js';
 import { logEvent } from '../bus/event.js';
+import { atomicWriteDurableSync } from '../utils/atomic.js';
+import { TelegramAPI } from './api.js';
+import {
+  TelegramDeliveryJournal,
+  type TelegramDeliveryHealth,
+  type TelegramDeliveryRecord,
+} from './delivery-journal.js';
 
-export type MessageHandler = (msg: TelegramMessage) => void;
-export type CallbackHandler = (query: TelegramCallbackQuery) => void;
-export type ReactionHandler = (reaction: TelegramMessageReaction) => void;
+export interface TelegramDeliveryContext {
+  deliveryId: string;
+  updateId: number;
+  attempt: number;
+}
+
+export type TelegramDeliveryOutcome =
+  | { ok: true; disposition: 'confirmed' | 'idempotent' | 'deferred' }
+  | { ok: false; retryable: true; error: string };
+
+export type MessageHandler = (
+  msg: TelegramMessage,
+  delivery: TelegramDeliveryContext,
+) => TelegramDeliveryOutcome | void | Promise<TelegramDeliveryOutcome | void>;
+export type CallbackHandler = (
+  query: TelegramCallbackQuery,
+  delivery: TelegramDeliveryContext,
+) => TelegramDeliveryOutcome | void | Promise<TelegramDeliveryOutcome | void>;
+export type ReactionHandler = (
+  reaction: TelegramMessageReaction,
+  delivery: TelegramDeliveryContext,
+) => TelegramDeliveryOutcome | void | Promise<TelegramDeliveryOutcome | void>;
 
 export interface TelegramPollerObservability {
   paths?: BusPaths;
   agentName?: string;
   org?: string;
+  botId?: string;
   log?: (m: string) => void;
 }
 
 /**
- * Telegram polling loop. Replaces the Telegram portion of fast-checker.sh.
- * Polls getUpdates every 1 second and routes messages/callbacks to handlers.
+ * Telegram polling loop with a durable handoff boundary.
+ * Updates are atomically journaled before their Telegram offset is committed.
  */
 export class TelegramPoller {
-  private api: TelegramAPI;
-  private offset: number = 0;
-  private running: boolean = false;
-  private stateDir: string;
-  private offsetFileName: string;
-  private messageHandlers: MessageHandler[] = [];
-  private callbackHandlers: CallbackHandler[] = [];
-  private reactionHandlers: ReactionHandler[] = [];
-  private pollInterval: number;
-  private observability?: TelegramPollerObservability;
-  /**
-   * Why the poll loop last exited. Read by AgentManager's poller-supervisor
-   * (#459 supervision-gap fix) to decide whether to restart:
-   *   - 'stopped-externally': intentional stop() (stopAgent) — do NOT restart.
-   *   - 'conflict-self-die': a Telegram 409 Conflict (another getUpdates
-   *     holder owns the lock, e.g. a not-yet-released connection after a
-   *     daemon crash) — the loop exits so the supervisor can sleep 30s and
-   *     retake the lock instead of hot-looping on Conflict.
-   *   - '' : loop still running / never exited.
-   */
-  lastExitReason: string = '';
+  private offset = 0;
+  private running = false;
+  private readonly offsetFileName: string;
+  private readonly messageHandlers: MessageHandler[] = [];
+  private readonly callbackHandlers: CallbackHandler[] = [];
+  private readonly reactionHandlers: ReactionHandler[] = [];
+  private readonly deliveryJournal: TelegramDeliveryJournal;
+  private readonly routedDeliveryIds = new Set<string>();
+  private runGeneration = 0;
+  private recoveryComplete = false;
 
-  /**
-   * @param api Telegram API client scoped to a single bot token.
-   * @param stateDir Directory for persisted poller state (offset, dedup).
-   * @param pollInterval Milliseconds between getUpdates calls.
-   * @param offsetFileSuffix Optional distinct suffix for the offset file.
-   *   When omitted (default), offset persists to `.telegram-offset`. When
-   *   provided, offset persists to `.telegram-offset-<suffix>`. Use this
-   *   when running a second poller in the same stateDir against a
-   *   different bot token (e.g. an activity-channel bot alongside the
-   *   agent's own bot), so the two pollers do not clobber each other's
-   *   offsets. Without this, two pollers sharing a stateDir would both
-   *   write to `.telegram-offset` and lose track of which bot each
-   *   offset belonged to.
-   */
+  /** Why the poll loop last exited; consumed by AgentManager supervision. */
+  lastExitReason = '';
+
   constructor(
-    api: TelegramAPI,
-    stateDir: string,
-    pollInterval: number = 1000,
+    private readonly api: TelegramAPI,
+    private readonly stateDir: string,
+    private readonly pollInterval: number = 1000,
     offsetFileSuffix?: string,
-    observability?: TelegramPollerObservability,
+    private readonly observability?: TelegramPollerObservability,
   ) {
-    this.api = api;
-    this.stateDir = stateDir;
-    this.pollInterval = pollInterval;
-    this.observability = observability;
     this.offsetFileName = offsetFileSuffix
       ? `.telegram-offset-${offsetFileSuffix}`
       : '.telegram-offset';
+    const apiWithIdentity = api as TelegramAPI & { getBotIdentity?: () => string };
+    this.deliveryJournal = new TelegramDeliveryJournal(stateDir, {
+      agentName: observability?.agentName ?? 'telegram',
+      botId: observability?.botId ?? apiWithIdentity.getBotIdentity?.() ?? offsetFileSuffix ?? 'primary',
+    });
     this.loadOffset();
   }
 
-  /**
-   * Register a handler for incoming messages.
-   */
   onMessage(handler: MessageHandler): void {
     this.messageHandlers.push(handler);
   }
 
-  /**
-   * Register a handler for callback queries.
-   */
   onCallback(handler: CallbackHandler): void {
     this.callbackHandlers.push(handler);
   }
 
-  /**
-   * Register a handler for message_reaction updates. These fire when a
-   * user adds or removes an emoji reaction on a chat message the bot can
-   * see. Requires the bot's getUpdates call to include `message_reaction`
-   * in allowed_updates (handled by TelegramAPI.getUpdates).
-   */
   onReaction(handler: ReactionHandler): void {
     this.reactionHandlers.push(handler);
   }
 
-  /**
-   * Start the polling loop.
-   */
   async start(): Promise<void> {
     this.running = true;
+    const generation = ++this.runGeneration;
     this.lastExitReason = '';
-    while (this.running) {
+
+    while (this.isGenerationActive(generation)) {
       try {
-        await this.pollOnce();
+        await this.pollOnceForGeneration(generation);
       } catch (err) {
-        if (!this.running) {
+        if (!this.isGenerationActive(generation)) {
           this.lastExitReason = 'stopped-externally';
           return;
         }
-        const msg = err instanceof Error ? err.message : String(err);
-        // A 409 Conflict means another getUpdates connection holds the lock
-        // (e.g. a not-yet-released connection lingering ~60s after a daemon
-        // crash). Exit the loop with a distinct reason so the supervisor can
-        // sleep and retake the lock, rather than hot-looping on Conflict.
-        if (/Conflict/i.test(msg)) {
+        const message = err instanceof Error ? err.message : String(err);
+        if (/Conflict/i.test(message)) {
           this.lastExitReason = 'conflict-self-die';
           this.running = false;
           return;
         }
-        // A 401 Unauthorized means the BOT_TOKEN is invalid or not yet loaded.
-        // This is a PERMANENT failure, not transient — retrying getUpdates once
-        // per second never clears it. Exit the loop so the supervisor backs off
-        // instead of hot-looping. (2026-06-22 OOM: a stale token spammed ~1
-        // error/sec for days → 95k errors → 785MB log → daemon killed.)
-        if (/Unauthorized|\b401\b/i.test(msg)) {
-          console.error('[telegram-poller] Auth failure (401 Unauthorized) — BOT_TOKEN invalid or unloaded. Exiting loop; supervisor will back off.');
+        if (/Unauthorized|\b401\b/i.test(message)) {
+          console.error('[telegram-poller] Auth failure (401 Unauthorized) - BOT_TOKEN invalid or unloaded. Exiting loop; supervisor will back off.');
           this.lastExitReason = 'auth-failed';
           this.running = false;
           return;
         }
-        // Other errors are transient — log and continue polling.
         console.error('[telegram-poller] Poll error:', err);
       }
+
+      if (!this.isGenerationActive(generation)) break;
       await sleep(this.pollInterval);
     }
   }
 
-  /**
-   * Stop the polling loop. Marks the exit as intentional so the supervisor
-   * does not restart it.
-   */
+  /** Fence the active run so an in-flight getUpdates cannot commit an offset. */
   stop(): void {
     this.running = false;
+    this.runGeneration++;
     this.lastExitReason = 'stopped-externally';
   }
 
-  /**
-   * Perform a single poll cycle.
-   *
-   * Offset-after-handler semantics: the offset only advances after every
-   * registered handler for an update returns successfully. If any handler
-   * throws, the update is left un-acknowledged (Telegram will re-deliver it
-   * on the next `getUpdates` call) and the remainder of the batch is deferred
-   * to preserve ordering. The offset is persisted after each successful
-   * update so a crash mid-batch does not drop confirmed state.
-   */
+  getDeliveryJournal(): TelegramDeliveryJournal {
+    return this.deliveryJournal;
+  }
+
+  markDeliveryDispatch(deliveryId: string): TelegramDeliveryRecord {
+    return this.deliveryJournal.markDelivering(deliveryId);
+  }
+
+  markDeliveryAccepted(deliveryId: string): TelegramDeliveryRecord {
+    const record = this.deliveryJournal.markAccepted(deliveryId);
+    this.routedDeliveryIds.add(deliveryId);
+    return record;
+  }
+
+  markDeliveryFailure(
+    deliveryId: string,
+    error: unknown,
+    retryable = true,
+  ): TelegramDeliveryRecord {
+    const record = this.deliveryJournal.markFailure(deliveryId, error, retryable);
+    if (record.state === 'retryable') this.routedDeliveryIds.delete(deliveryId);
+    return record;
+  }
+
+  getDeliveryHealth(): TelegramDeliveryHealth {
+    return this.deliveryJournal.getHealth();
+  }
+
+  /** Recover unfinished records after process restart and route ready work. */
+  async recoverPendingDeliveries(): Promise<number> {
+    const records = this.deliveryJournal.recoverPending();
+    this.recoveryComplete = true;
+    return this.routeRecords(records);
+  }
+
   async pollOnce(): Promise<void> {
+    await this.pollOnceForGeneration();
+  }
+
+  private async pollOnceForGeneration(generation?: number): Promise<void> {
+    if (!this.isGenerationActive(generation)) return;
+
+    if (!this.recoveryComplete) {
+      await this.recoverPendingDeliveries();
+    } else {
+      await this.routeRecords(this.deliveryJournal.listReady());
+    }
+    if (!this.isGenerationActive(generation)) return;
+
     const result = await this.api.getUpdates(this.offset, 1);
-    if (!result?.result?.length) return;
+    if (!this.isGenerationActive(generation) || !result?.result?.length) return;
 
     for (const update of result.result as TelegramUpdate[]) {
+      if (!this.isGenerationActive(generation)) return;
+      const { record } = this.deliveryJournal.journalUpdate(update);
+      if (!this.isGenerationActive(generation)) return;
+
       const nextOffset = update.update_id + 1;
-      const updateType = detectUpdateType(update);
-      let handlerFailed = false;
-
-      this.observability?.log?.(`[telegram-poller] update_id=${update.update_id} type=${updateType}`);
-
-      if (update.message) {
-        for (const handler of this.messageHandlers) {
-          try {
-            handler(update.message);
-          } catch (err) {
-            console.error('[telegram-poller] Message handler error:', err);
-            handlerFailed = true;
-            break;
-          }
-        }
-      }
-
-      if (!handlerFailed && update.callback_query) {
-        for (const handler of this.callbackHandlers) {
-          try {
-            handler(update.callback_query);
-          } catch (err) {
-            console.error('[telegram-poller] Callback handler error:', err);
-            handlerFailed = true;
-            break;
-          }
-        }
-      }
-
-      if (!handlerFailed && update.message_reaction) {
-        for (const handler of this.reactionHandlers) {
-          try {
-            handler(update.message_reaction);
-          } catch (err) {
-            console.error('[telegram-poller] Reaction handler error:', err);
-            handlerFailed = true;
-            break;
-          }
-        }
-      }
-
-      if (!update.message && !update.callback_query && !update.message_reaction) {
-        const keys = Object.keys(update);
-        console.warn(`[telegram-poller] UNKNOWN update shape: update_id=${update.update_id} keys=${keys.join(',')}`);
-        if (this.observability?.paths && this.observability.agentName && this.observability.org) {
-          logEvent(this.observability.paths, this.observability.agentName, this.observability.org, 'error', 'telegram_unknown_update', 'warning', {
-            update_id: update.update_id,
-            keys,
-          });
-        }
-      }
-
-      if (handlerFailed) {
-        // Do not advance offset — the update will be redelivered.
-        // Stop processing the rest of this batch to preserve ordering.
-        return;
-      }
-
+      this.saveOffset(nextOffset);
       this.offset = nextOffset;
-      this.saveOffset();
+      await this.routeDelivery(record);
     }
   }
 
-  /**
-   * Load persisted offset from state file.
-   */
+  private async routeRecords(records: TelegramDeliveryRecord[]): Promise<number> {
+    let routed = 0;
+    for (const record of records) {
+      if (this.routedDeliveryIds.has(record.delivery_id)) continue;
+      if (await this.routeDelivery(record)) routed++;
+    }
+    return routed;
+  }
+
+  private async routeDelivery(record: TelegramDeliveryRecord): Promise<boolean> {
+    if (record.state === 'accepted' || record.state === 'dead-letter') return false;
+    if (this.routedDeliveryIds.has(record.delivery_id)) return false;
+
+    const update = record.update;
+    const updateType = detectUpdateType(update);
+    const delivering = this.deliveryJournal.markDelivering(record.delivery_id);
+    const context: TelegramDeliveryContext = {
+      deliveryId: record.delivery_id,
+      updateId: record.update_id,
+      attempt: delivering.attempts,
+    };
+    this.observability?.log?.(
+      `[telegram-poller] update_id=${update.update_id} type=${updateType} delivery_id=${record.delivery_id}`,
+    );
+
+    try {
+      let shouldAccept = false;
+      if (update.message) {
+        if (this.messageHandlers.length === 0) this.deliveryJournal.markAccepted(record.delivery_id);
+        else for (const handler of this.messageHandlers) {
+          const outcome = await handler(update.message, context);
+          if (outcome && !outcome.ok) throw new Error(outcome.error);
+          if (outcome?.ok && outcome.disposition !== 'deferred') shouldAccept = true;
+        }
+      } else if (update.callback_query) {
+        if (this.callbackHandlers.length === 0) this.deliveryJournal.markAccepted(record.delivery_id);
+        else for (const handler of this.callbackHandlers) {
+          const outcome = await handler(update.callback_query, context);
+          if (outcome && !outcome.ok) throw new Error(outcome.error);
+          if (outcome?.ok && outcome.disposition !== 'deferred') shouldAccept = true;
+        }
+      } else if (update.message_reaction) {
+        if (this.reactionHandlers.length === 0) this.deliveryJournal.markAccepted(record.delivery_id);
+        else for (const handler of this.reactionHandlers) {
+          const outcome = await handler(update.message_reaction, context);
+          if (outcome && !outcome.ok) throw new Error(outcome.error);
+          if (outcome?.ok && outcome.disposition !== 'deferred') shouldAccept = true;
+        }
+      } else {
+        this.logUnknownUpdate(update);
+        this.deliveryJournal.markAccepted(record.delivery_id);
+      }
+      if (shouldAccept) this.deliveryJournal.markAccepted(record.delivery_id);
+      this.routedDeliveryIds.add(record.delivery_id);
+      return true;
+    } catch (err) {
+      console.error(`[telegram-poller] ${updateType} handler error:`, err);
+      this.deliveryJournal.markFailure(record.delivery_id, err, true);
+      this.routedDeliveryIds.delete(record.delivery_id);
+      return false;
+    }
+  }
+
+  private logUnknownUpdate(update: TelegramUpdate): void {
+    const keys = Object.keys(update);
+    console.warn(
+      `[telegram-poller] UNKNOWN update shape: update_id=${update.update_id} keys=${keys.join(',')}`,
+    );
+    if (this.observability?.paths && this.observability.agentName && this.observability.org) {
+      logEvent(
+        this.observability.paths,
+        this.observability.agentName,
+        this.observability.org,
+        'error',
+        'telegram_unknown_update',
+        'warning',
+        { update_id: update.update_id, keys },
+      );
+    }
+  }
+
+  private isGenerationActive(generation?: number): boolean {
+    return generation === undefined || (this.running && generation === this.runGeneration);
+  }
+
   private loadOffset(): void {
     const offsetFile = join(this.stateDir, this.offsetFileName);
     try {
-      if (existsSync(offsetFile)) {
-        const content = readFileSync(offsetFile, 'utf-8').trim();
-        const parsed = parseInt(content, 10);
-        if (!isNaN(parsed)) {
-          this.offset = parsed;
-        }
-      }
+      if (!existsSync(offsetFile)) return;
+      const parsed = parseInt(readFileSync(offsetFile, 'utf-8').trim(), 10);
+      if (!Number.isNaN(parsed)) this.offset = parsed;
     } catch {
-      // Start from 0 if can't read
+      // Start from zero when the state file cannot be read.
     }
   }
 
-  /**
-   * Save current offset to state file.
-   */
-  private saveOffset(): void {
-    ensureDir(this.stateDir);
-    const offsetFile = join(this.stateDir, this.offsetFileName);
-    try {
-      writeFileSync(offsetFile, String(this.offset), 'utf-8');
-    } catch {
-      // Ignore write errors
-    }
+  private saveOffset(offset: number): void {
+    atomicWriteDurableSync(join(this.stateDir, this.offsetFileName), String(offset));
   }
 }
 
@@ -264,7 +305,9 @@ function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-function detectUpdateType(update: TelegramUpdate): 'message' | 'callback_query' | 'message_reaction' | 'unknown' {
+function detectUpdateType(
+  update: TelegramUpdate,
+): 'message' | 'callback_query' | 'message_reaction' | 'unknown' {
   if (update.message) return 'message';
   if (update.callback_query) return 'callback_query';
   if (update.message_reaction) return 'message_reaction';

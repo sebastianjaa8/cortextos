@@ -5,6 +5,13 @@ import { spawn as spawnChildProcess, spawnSync, type ChildProcess } from 'child_
 import type { AgentConfig, CtxEnv } from '../types/index.js';
 import { OutputBuffer } from './output-buffer.js';
 import { ensureDir } from '../utils/atomic.js';
+import type { DeliveryCallbacks } from './inject.js';
+import {
+  removeRuntimeProcessRecord,
+  terminateProcessTree,
+  writeRuntimeProcessRecord,
+  type RuntimeProcessRecord,
+} from '../utils/process-ownership.js';
 
 interface CodexLaunch {
   command: string;
@@ -19,6 +26,7 @@ interface CodexExecSessionState {
 }
 
 type ExecMode = 'fresh' | 'continue';
+type ExecQueueItem = { mode: ExecMode; prompt: string; delivery?: DeliveryCallbacks };
 
 const BOOTSTRAP_PATTERN = '[codex-exec] ready';
 const SESSION_STATE_BASENAME = 'codex-exec-session.json';
@@ -41,7 +49,7 @@ export class CodexExecPTY {
   private _alive = false;
   private _executing = false;
   private _currentProcess: ChildProcess | null = null;
-  private _queue: Array<{ mode: ExecMode; prompt: string }> = [];
+  private _queue: ExecQueueItem[] = [];
   private _writeBuffer = '';
   private _sessionParseBuffer = '';
   private _sessionId: string | null = null;
@@ -52,6 +60,7 @@ export class CodexExecPTY {
   private _stateDir: string;
   private _sessionStatePath: string;
   private _cwd: string;
+  private _runtimeProcessRecord: RuntimeProcessRecord | null = null;
 
   constructor(env: CtxEnv, config: AgentConfig, logPath?: string) {
     this._env = env;
@@ -87,13 +96,19 @@ export class CodexExecPTY {
     if (content) this.injectMessage(content);
   }
 
-  injectMessage(content: string): void {
-    if (!this._alive) throw new Error('Codex exec runtime is not spawned');
-    this.enqueueTurn('continue', content);
+  injectMessage(content: string, delivery?: DeliveryCallbacks): void {
+    if (!this._alive) {
+      const error = new Error('Codex exec runtime is not spawned');
+      delivery?.onFailed?.(error);
+      throw error;
+    }
+    this.enqueueTurn('continue', content, delivery);
   }
 
   kill(): void {
     this._alive = false;
+    const error = new Error('Codex exec stopped before queued delivery was submitted');
+    for (const queued of this._queue) queued.delivery?.onFailed?.(error);
     this._queue = [];
     this.stopCurrentProcess();
     this._onExitHandler?.(0, undefined);
@@ -115,8 +130,8 @@ export class CodexExecPTY {
     return this._outputBuffer;
   }
 
-  private enqueueTurn(mode: ExecMode, prompt: string): void {
-    this._queue.push({ mode, prompt });
+  private enqueueTurn(mode: ExecMode, prompt: string, delivery?: DeliveryCallbacks): void {
+    this._queue.push({ mode, prompt, delivery });
     this.drainQueue();
   }
 
@@ -124,11 +139,32 @@ export class CodexExecPTY {
     if (!this._alive || this._executing) return;
     const next = this._queue.shift();
     if (!next) return;
-    this.runTurn(next.mode, next.prompt);
+    try {
+      this.runTurn(next);
+    } catch (err) {
+      const error = err instanceof Error ? err : new Error(String(err));
+      next.delivery?.onFailed?.(error);
+      this._executing = false;
+      this.drainQueue();
+    }
   }
 
-  private runTurn(mode: ExecMode, prompt: string): void {
+  private runTurn(item: ExecQueueItem): void {
     this._executing = true;
+    const { mode, prompt, delivery } = item;
+    let deliverySettled = false;
+    let promptSubmitted = false;
+    let correlatedOutputSeen = false;
+    const acceptDelivery = () => {
+      if (deliverySettled) return;
+      deliverySettled = true;
+      delivery?.onAccepted?.();
+    };
+    const failDelivery = (error: Error) => {
+      if (deliverySettled) return;
+      deliverySettled = true;
+      delivery?.onFailed?.(error);
+    };
     const effectiveMode: ExecMode = mode === 'continue' && this._sessionId ? 'continue' : 'fresh';
     const args = this.buildArgs(effectiveMode);
     const env = this.buildEnv();
@@ -144,25 +180,56 @@ export class CodexExecPTY {
     });
     this._currentProcess = child;
 
+    if (!child.pid) {
+      this._currentProcess = null;
+      this._executing = false;
+      throw new Error('Codex exec child spawned without a process ID');
+    }
+    try {
+      this._runtimeProcessRecord = writeRuntimeProcessRecord(this._stateDir, {
+        instanceId: this._env.instanceId,
+        agentName: this._env.agentName,
+        runtime: 'codex-exec',
+        pid: child.pid,
+      });
+    } catch (err) {
+      this.stopCurrentProcess();
+      throw err;
+    }
+
     const handleOutput = (chunk: Buffer | string) => {
       const data = chunk.toString();
       this._outputBuffer.push(data);
       this.captureSessionId(data);
+      correlatedOutputSeen = true;
+      if (promptSubmitted) acceptDelivery();
     };
     child.stdout?.on('data', handleOutput);
     child.stderr?.on('data', handleOutput);
     child.on('error', (err) => {
       this._outputBuffer.push(`[codex-exec] process error: ${err}\n`);
+      failDelivery(err);
       this.finishTurn(child, 1, undefined);
     });
     child.on('exit', (exitCode, signal) => {
+      if (!deliverySettled && promptSubmitted && (exitCode ?? 0) === 0) {
+        acceptDelivery();
+      } else if (!deliverySettled) {
+        failDelivery(new Error(`Codex exec exited before prompt submission (code=${exitCode ?? 0})`));
+      }
       this.finishTurn(child, exitCode ?? 0, signal ?? undefined);
     });
 
     try {
-      child.stdin?.end(prompt);
+      if (!child.stdin) throw new Error('Codex exec child has no stdin');
+      child.stdin.once('error', failDelivery);
+      child.stdin.end(prompt, () => {
+        promptSubmitted = true;
+        if (correlatedOutputSeen) acceptDelivery();
+      });
     } catch (err) {
       this._outputBuffer.push(`[codex-exec] stdin write failed: ${err}\n`);
+      failDelivery(err instanceof Error ? err : new Error(String(err)));
     }
   }
 
@@ -183,6 +250,7 @@ export class CodexExecPTY {
 
   private finishTurn(child: ChildProcess, exitCode: number, signal?: NodeJS.Signals): void {
     if (this._currentProcess !== child) return;
+    this.clearRuntimeProcessRecord();
     this._currentProcess = null;
     this._executing = false;
     this._outputBuffer.push(`[codex-exec] turn completed code=${exitCode} signal=${signal ?? 'none'}\n`);
@@ -231,6 +299,18 @@ export class CodexExecPTY {
     const child = this._currentProcess;
     this._currentProcess = null;
     this._executing = false;
+    const record = this._runtimeProcessRecord;
+    if (record) {
+      if (terminateProcessTree(record.pid, {
+        pid: record.pid,
+        startIdentity: record.processStartIdentity,
+      })) {
+        this.clearRuntimeProcessRecord();
+      } else {
+        this._outputBuffer.push(`[codex-exec] owned process ${record.pid} survived termination; record retained\n`);
+      }
+      return;
+    }
     if (!child?.pid) return;
 
     try {
@@ -244,6 +324,14 @@ export class CodexExecPTY {
       }
     } catch {
       // Ignore shutdown errors.
+    }
+  }
+
+  private clearRuntimeProcessRecord(): void {
+    const record = this._runtimeProcessRecord;
+    if (!record) return;
+    if (removeRuntimeProcessRecord(this._stateDir, record.ownerToken)) {
+      this._runtimeProcessRecord = null;
     }
   }
 

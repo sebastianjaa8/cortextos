@@ -11,6 +11,7 @@ import { ensureDir, atomicWriteSync } from '../utils/atomic.js';
 import { resolvePaths } from '../utils/paths.js';
 import { logEvent } from '../bus/event.js';
 import { WsUnixJsonRpcClient, type JsonRpcResponse } from '../utils/ws-unix-client.js';
+import type { DeliveryCallbacks } from './inject.js';
 
 type RpcEndpoint = string | { host: string; port: number };
 type AppServerTransport = 'unix' | 'tcp';
@@ -30,8 +31,11 @@ interface CodexLaunch {
 }
 
 interface ThreadState {
+  version: 1;
   threadId: string;
   cwd: string;
+  instanceId: string;
+  agentName: string;
   updatedAt: string;
 }
 
@@ -99,7 +103,7 @@ export class CodexAppServerPTY {
   private _executing = false;
   private _activeTurnId: string | null = null;
   private _writeBuffer = '';
-  private _turnQueue: unknown[][] = [];
+  private _turnQueue: Array<{ input: unknown[]; delivery?: DeliveryCallbacks }> = [];
   private _turnCompletion: {
     resolve: () => void;
     reject: (err: Error) => void;
@@ -185,9 +189,24 @@ export class CodexAppServerPTY {
     }
   }
 
+  injectMessage(content: string, delivery?: DeliveryCallbacks): void {
+    if (!this._alive) {
+      const error = new Error('Codex app-server is not spawned');
+      delivery?.onFailed?.(error);
+      throw error;
+    }
+    this.handleInput(content, delivery).catch((err) => {
+      const error = err instanceof Error ? err : new Error(String(err));
+      this._outputBuffer.push(`[codex-app-server] input failed: ${error}\n`);
+      delivery?.onFailed?.(error);
+    });
+  }
+
   kill(): void {
     this._alive = false;
     this._activeTurnId = null;
+    const error = new Error('Codex app-server stopped before queued delivery was submitted');
+    for (const queued of this._turnQueue) queued.delivery?.onFailed?.(error);
     this._turnQueue = [];
     this.rejectTurnCompletion(new Error('Codex app-server stopped'));
     if (this._rpc) {
@@ -221,24 +240,27 @@ export class CodexAppServerPTY {
     this._chatId = chatId;
   }
 
-  private async handleInput(content: string): Promise<void> {
+  private async handleInput(content: string, delivery?: DeliveryCallbacks): Promise<void> {
     const extracted = this.extractTelegramPayload(content);
     const input = extracted?.payload ?? content;
     const goalCommand = this.parseGoalCommand(input);
     if (goalCommand?.type === 'get') {
       await this.getGoal();
+      delivery?.onAccepted?.();
       return;
     }
     if (goalCommand?.type === 'clear') {
       await this.clearGoal();
+      delivery?.onAccepted?.();
       return;
     }
     if (goalCommand?.type === 'set') {
       await this.setGoal(goalCommand.objective);
+      delivery?.onAccepted?.();
       return;
     }
     if (input.startsWith('$')) {
-      await this.handleSkillInput(input);
+      await this.handleSkillInput(input, delivery);
       return;
     }
     const slashMatch = input.match(SLASH_REWRITE_RE);
@@ -246,13 +268,13 @@ export class CodexAppServerPTY {
       const [, name, trailing] = slashMatch;
       const trimmed = trailing?.trim();
       const rewritten = trimmed ? `$${name} ${trimmed}` : `$${name}`;
-      await this.handleSkillInput(rewritten);
+      await this.handleSkillInput(rewritten, delivery);
       return;
     }
     const turnText = extracted?.replyDirective
       ? `${input}\n\n${extracted.replyDirective}`
       : input;
-    this.queueTurn([{ type: 'text', text: turnText, text_elements: [] }]);
+    this.queueTurn([{ type: 'text', text: turnText, text_elements: [] }], delivery);
   }
 
   private extractTelegramPayload(
@@ -402,6 +424,7 @@ export class CodexAppServerPTY {
         this.cleanupSpawnAttempt();
         this._outputBuffer.push(`[codex-app-server] spawn attempt ${attempt + 1} failed: ${err}\n`);
         if (attempt < delays.length - 1) {
+          if (this._transport === 'tcp') this.rotateTcpEndpoint();
           await sleep(delays[attempt]);
         }
       }
@@ -569,19 +592,7 @@ export class CodexAppServerPTY {
         }
       }
 
-      const latest = await this.findLatestThreadForCwd();
-      if (latest) {
-        const resumed = await this.request<ThreadResponse>('thread/resume', {
-          threadId: latest,
-          cwd: this._cwd,
-          ...THREAD_PERMISSION_OVERRIDES,
-          config: { features: { goals: true } },
-          excludeTurns: true,
-          persistExtendedHistory: true,
-        });
-        this.setThreadId(resumed.result?.thread.id || latest);
-        return;
-      }
+      this._outputBuffer.push('[codex-app-server] no owned persisted thread; starting a fresh thread\n');
     }
 
     const started = await this.request<ThreadResponse>('thread/start', {
@@ -595,17 +606,6 @@ export class CodexAppServerPTY {
     this.setThreadId(started.result!.thread.id);
   }
 
-  private async findLatestThreadForCwd(): Promise<string | null> {
-    const response = await this.request<{ data: Array<{ id: string; cwd?: string }> }>('thread/list', {
-      cwd: this._cwd,
-      limit: 1,
-      sortKey: 'updated_at',
-      sortDirection: 'desc',
-      archived: false,
-    });
-    return response.result?.data?.[0]?.id || null;
-  }
-
   /**
    * Mid-turn parity with the Claude PTY-injection path: while a turn is
    * executing, try `turn/steer` so the message lands in the active turn at the
@@ -614,20 +614,20 @@ export class CodexAppServerPTY {
    * review/compact, NoActiveTurn, transport error) falls back to the queue, so
    * no message is ever lost. CODEX_STEER_DISABLED=1 reverts to pure queueing.
    */
-  private queueTurn(input: unknown[]): void {
+  private queueTurn(input: unknown[], delivery?: DeliveryCallbacks): void {
     if (this._executing && this._activeTurnId && process.env.CODEX_STEER_DISABLED !== '1') {
-      this.steerActiveTurn(input).catch((err) => {
+      this.steerActiveTurn(input, delivery).catch((err) => {
         this._outputBuffer.push(`[codex-app-server] steer path failed: ${err}\n`);
       });
       return;
     }
-    this.enqueueTurn(input);
+    this.enqueueTurn(input, delivery);
   }
 
-  private async steerActiveTurn(input: unknown[]): Promise<void> {
+  private async steerActiveTurn(input: unknown[], delivery?: DeliveryCallbacks): Promise<void> {
     const expectedTurnId = this._activeTurnId;
     if (!this._threadId || !expectedTurnId) {
-      this.enqueueTurn(input);
+      this.enqueueTurn(input, delivery);
       return;
     }
     try {
@@ -637,40 +637,71 @@ export class CodexAppServerPTY {
         input,
       });
       this._outputBuffer.push(`[codex-app-server] steered active turn ${expectedTurnId}\n`);
+      delivery?.onAccepted?.();
     } catch (err) {
+      const error = err instanceof Error ? err : new Error(String(err));
+      if (!this._alive) {
+        this._outputBuffer.push(`[codex-app-server] steer rejected after runtime exit: ${error}\n`);
+        delivery?.onFailed?.(error);
+        return;
+      }
       // Do not retry steer here: the rejection may be a non-steerable turn
       // (review/compact). Queueing guarantees delivery right after it ends.
-      this._outputBuffer.push(`[codex-app-server] steer rejected, queueing: ${err}\n`);
-      this.enqueueTurn(input);
+      this._outputBuffer.push(`[codex-app-server] steer rejected, queueing: ${error}\n`);
+      this.enqueueTurn(input, delivery);
     }
   }
 
-  private enqueueTurn(input: unknown[]): void {
-    this._turnQueue.push(input);
+  private enqueueTurn(input: unknown[], delivery?: DeliveryCallbacks): void {
+    this._turnQueue.push({ input, delivery });
     if (!this._executing) {
       this.drainQueue().catch((err) => {
         this._outputBuffer.push(`[codex-app-server] turn queue failed: ${err}\n`);
+        this.failQueuedDeliveries(err);
       });
     }
   }
 
   private async drainQueue(): Promise<void> {
     while (this._alive && this._turnQueue.length > 0) {
-      const input = this._turnQueue.shift()!;
+      const queued = this._turnQueue.shift()!;
       this._executing = true;
       try {
-        await this.startTurn(input);
+        await this.startTurn(queued.input, queued.delivery);
+      } catch (err) {
+        const error = err instanceof Error ? err : new Error(String(err));
+        queued.delivery?.onFailed?.(error);
+        this._outputBuffer.push(`[codex-app-server] queued turn failed, continuing: ${error}\n`);
       } finally {
         this._executing = false;
       }
     }
   }
 
-  private async startTurn(input: unknown[]): Promise<void> {
+  private async startTurn(input: unknown[], delivery?: DeliveryCallbacks): Promise<void> {
     if (!this._threadId) throw new Error('No Codex app-server thread is active');
     const completion = this.createTurnCompletion();
-    await this.request('turn/start', { threadId: this._threadId, input, ...TURN_PERMISSION_OVERRIDES });
-    await completion;
+    // The request can reject before this function reaches `await completion`.
+    // Attach a rejection observer immediately so clearing the correlated
+    // completion cannot surface as an unhandled rejection.
+    void completion.catch(() => {});
+    try {
+      await this.request('turn/start', { threadId: this._threadId, input, ...TURN_PERMISSION_OVERRIDES });
+    } catch (err) {
+      this.rejectTurnCompletion(err instanceof Error ? err : new Error(String(err)));
+      throw err;
+    }
+    delivery?.onAccepted?.();
+    try {
+      await completion;
+    } catch (err) {
+      this._outputBuffer.push(`[codex-app-server] accepted turn ended abnormally: ${err}\n`);
+    }
+  }
+
+  private failQueuedDeliveries(error: unknown): void {
+    const failure = error instanceof Error ? error : new Error(String(error));
+    for (const queued of this._turnQueue.splice(0)) queued.delivery?.onFailed?.(failure);
   }
 
   /**
@@ -709,10 +740,11 @@ export class CodexAppServerPTY {
     this.replyLocal('[goal] cleared');
   }
 
-  private async handleSkillInput(content: string): Promise<void> {
+  private async handleSkillInput(content: string, delivery?: DeliveryCallbacks): Promise<void> {
     const match = content.match(/^\$([A-Za-z0-9:_-]+)(?:\s+([\s\S]*))?$/);
     if (!match) {
       this.replyLocal('[skill] expected $skill_name [text]');
+      delivery?.onAccepted?.();
       return;
     }
 
@@ -731,6 +763,7 @@ export class CodexAppServerPTY {
       this.replyLocal(matches.length > 0
         ? `[skill] unknown "${skillName}". Did you mean: ${matches.join(', ')}?`
         : `[skill] unknown "${skillName}". No enabled matches found.`);
+      delivery?.onAccepted?.();
       return;
     }
 
@@ -738,7 +771,7 @@ export class CodexAppServerPTY {
     if (trailingText?.trim()) {
       input.push({ type: 'text', text: trailingText.trim(), text_elements: [] });
     }
-    this.queueTurn(input);
+    this.queueTurn(input, delivery);
   }
 
   private handleRpcMessage(message: unknown): void {
@@ -886,11 +919,14 @@ export class CodexAppServerPTY {
   private setThreadId(threadId: string): void {
     this._threadId = threadId;
     const state: ThreadState = {
+      version: 1,
       threadId,
       cwd: this._cwd,
+      instanceId: this._env.instanceId,
+      agentName: this._env.agentName,
       updatedAt: new Date().toISOString(),
     };
-    writeFileSync(this._threadStatePath, `${JSON.stringify(state, null, 2)}\n`, 'utf-8');
+    atomicWriteSync(this._threadStatePath, JSON.stringify(state, null, 2));
   }
 
   /**
@@ -987,7 +1023,13 @@ export class CodexAppServerPTY {
     if (!existsSync(this._threadStatePath)) return null;
     try {
       const parsed = JSON.parse(readFileSync(this._threadStatePath, 'utf-8')) as ThreadState;
-      return parsed.cwd === this._cwd && parsed.threadId ? parsed : null;
+      return parsed.version === 1
+        && parsed.cwd === this._cwd
+        && parsed.instanceId === this._env.instanceId
+        && parsed.agentName === this._env.agentName
+        && parsed.threadId
+        ? parsed
+        : null;
     } catch {
       return null;
     }
@@ -995,6 +1037,15 @@ export class CodexAppServerPTY {
 
   private chooseLoopbackPort(): number {
     return 39000 + (randomBytes(2).readUInt16BE(0) % 20000);
+  }
+
+  private rotateTcpEndpoint(): void {
+    const socket = this.resolveSocketPath();
+    this._socketPath = socket.path;
+    this._socketListenArg = socket.listenArg;
+    this._socketCwd = socket.cwd;
+    this._rpcEndpoint = socket.rpcEndpoint;
+    this._transport = socket.transport;
   }
 
   private resolveSocketPath(): SocketResolution {

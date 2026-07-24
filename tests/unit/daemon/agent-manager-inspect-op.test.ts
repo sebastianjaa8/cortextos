@@ -60,6 +60,17 @@ describe('AgentManager.inspectAgentOp — issue #346 (DEDUPED vs NOT_FOUND)', ()
     }
   });
 
+  it('allows retry when the retained registration records a failed startup', () => {
+    const failedEntry = {
+      process: {
+        getStatus: () => ({ name: 'alice', status: 'stopped', lastError: 'runtime missing' }),
+      },
+    };
+    (am as unknown as { agents: Map<string, unknown> }).agents.set('alice', failedEntry);
+
+    expect(am.inspectAgentOp('start', 'alice')).toEqual({ ok: true });
+  });
+
   it('stop on empty registry: NOT_FOUND (the misreport bug — must distinguish)', () => {
     const r = am.inspectAgentOp('stop', 'ghost');
     expect(r.ok).toBe(false);

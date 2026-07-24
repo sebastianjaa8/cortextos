@@ -1,6 +1,9 @@
 import { createServer, Server, Socket } from 'net';
-import { existsSync, unlinkSync, chmodSync, readFileSync } from 'fs';
+import { existsSync, unlinkSync, chmodSync, readFileSync, writeFileSync, mkdirSync, renameSync } from 'fs';
 import { join, resolve as pathResolve } from 'path';
+import { homedir } from 'os';
+import { randomBytes, timingSafeEqual } from 'crypto';
+import { StringDecoder } from 'string_decoder';
 import type { IPCRequest, IPCResponse, CronSummaryRow, CronDefinition } from '../types/index.js';
 import { AgentManager } from './agent-manager.js';
 import { getIpcPath } from '../utils/paths.js';
@@ -11,6 +14,49 @@ import { parseDurationMs } from '../bus/cron-state.js';
 import { computeHealth, aggregateFleetHealth } from '../utils/cron-health.js';
 
 const WORKER_NAME_REGEX = /^[a-z0-9_-]+$/;
+const IPC_TOKEN_BYTES = 32;
+const IPC_MAX_REQUEST_BYTES = 1024 * 1024;
+const IPC_READ_TIMEOUT_MS = 5_000;
+const IPC_OPERATION_TIMEOUT_MS = 60_000;
+
+function tokensMatch(expected: string, received: string | undefined): boolean {
+  if (!received) return false;
+  const a = Buffer.from(expected, 'utf8');
+  const b = Buffer.from(received, 'utf8');
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
+function readToken(path: string): string | null {
+  try {
+    const token = readFileSync(path, 'utf8').trim();
+    return /^[a-f0-9]{64}$/.test(token) ? token : null;
+  } catch {
+    return null;
+  }
+}
+
+function loadOrCreateServerToken(path: string): string {
+  const existing = readToken(path);
+  if (existing) return existing;
+
+  mkdirSync(join(path, '..'), { recursive: true });
+  if (existsSync(path)) {
+    const quarantine = `${path}.invalid-${Date.now()}`;
+    renameSync(path, quarantine);
+    console.error(`[ipc] Quarantined invalid IPC credential at ${quarantine}`);
+  }
+
+  const token = randomBytes(IPC_TOKEN_BYTES).toString('hex');
+  try {
+    writeFileSync(path, `${token}\n`, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+    try { chmodSync(path, 0o600); } catch { /* best effort on Windows */ }
+    return token;
+  } catch (err) {
+    const raced = readToken(path);
+    if (raced) return raced;
+    throw err;
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Manual fire cooldown — Subtask 4.5
@@ -477,17 +523,21 @@ export function handleRemoveCron(
 export class IPCServer {
   private server: Server | null = null;
   private socketPath: string;
+  private tokenPath: string;
+  private authToken = '';
   private agentManager: AgentManager;
 
-  constructor(agentManager: AgentManager, instanceId: string = 'default') {
+  constructor(agentManager: AgentManager, instanceId: string = 'default', ctxRoot?: string) {
     this.agentManager = agentManager;
     this.socketPath = getIpcPath(instanceId);
+    this.tokenPath = join(ctxRoot ?? join(homedir(), '.cortextos', instanceId), 'config', 'ipc-token');
   }
 
   /**
    * Start listening for IPC connections.
    */
   async start(): Promise<void> {
+    this.authToken = loadOrCreateServerToken(this.tokenPath);
     // Clean up stale socket
     if (process.platform !== 'win32' && existsSync(this.socketPath)) {
       try {
@@ -498,18 +548,46 @@ export class IPCServer {
     }
 
     return new Promise((resolve, reject) => {
-      this.server = createServer((socket: Socket) => {
+      this.server = createServer({ allowHalfOpen: true }, (socket: Socket) => {
+        const decoder = new StringDecoder('utf8');
         let data = '';
+        let receivedBytes = 0;
+        let handled = false;
+        socket.setTimeout(IPC_READ_TIMEOUT_MS, () => socket.destroy());
         socket.on('data', (chunk) => {
-          data += chunk.toString();
+          if (handled) return;
+          receivedBytes += chunk.length;
+          data += decoder.write(chunk);
+          if (receivedBytes > IPC_MAX_REQUEST_BYTES) {
+            handled = true;
+            socket.end(JSON.stringify({
+              success: false,
+              error: 'IPC request exceeds the 1 MiB limit',
+              code: 'PAYLOAD_TOO_LARGE',
+            } satisfies IPCResponse));
+            return;
+          }
           // Try to parse complete JSON messages
           try {
             const request: IPCRequest = JSON.parse(data);
+            handled = true;
             data = '';
-            this.handleRequest(request, socket);
+            socket.setTimeout(IPC_OPERATION_TIMEOUT_MS, () => socket.destroy());
+            void this.handleRequest(request, socket);
           } catch {
             // Incomplete JSON, wait for more data
           }
+        });
+
+        socket.on('end', () => {
+          if (handled) return;
+          data += decoder.end();
+          handled = true;
+          socket.end(JSON.stringify({
+            success: false,
+            error: 'Invalid or incomplete IPC JSON request',
+            code: 'INVALID_INPUT',
+          } satisfies IPCResponse));
         });
 
         socket.on('error', () => {
@@ -567,7 +645,17 @@ export class IPCServer {
   /**
    * Handle an incoming IPC request.
    */
-  private handleRequest(request: IPCRequest, socket: Socket): void {
+  private async handleRequest(request: IPCRequest, socket: Socket): Promise<void> {
+    if (!tokensMatch(this.authToken, request.auth)) {
+      try {
+        socket.end(JSON.stringify({
+          success: false,
+          error: 'Unauthorized IPC request',
+          code: 'UNAUTHORIZED',
+        } satisfies IPCResponse));
+      } catch { /* client disconnected */ }
+      return;
+    }
     // BUG-015: log every incoming IPC request with its source so we can
     // trace which CLI command triggered which daemon action. The source
     // field is populated by CLI clients (cortextos enable / disable / stop
@@ -593,6 +681,14 @@ export class IPCServer {
           };
           break;
 
+        case 'start-all-agents':
+          await this.agentManager.discoverAndStart();
+          response = {
+            success: true,
+            data: this.agentManager.getAllStatuses(),
+          };
+          break;
+
         case 'start-agent':
           if (!request.agent) {
             response = { success: false, error: 'Agent name required', code: 'INVALID_INPUT' };
@@ -602,12 +698,12 @@ export class IPCServer {
             // agent-manager's own dedup logic still runs and is the source of
             // truth; we just give the operator a structured response code.
             const insp = this.agentManager.inspectAgentOp('start', request.agent);
-            this.agentManager.startAgent(
-              request.agent,
-              (request.data?.dir as string) || '',
-            ).catch(err => console.error(`Failed to start ${request.agent}:`, err));
             if (insp.ok) {
-              response = { success: true, data: `Starting ${request.agent}` };
+              await this.agentManager.startAgent(
+                request.agent,
+                (request.data?.dir as string) || '',
+              );
+              response = { success: true, data: `Started ${request.agent}` };
             } else {
               console.log(`[ipc] start-agent ${request.agent}: ${insp.code} — ${insp.message}`);
               response = { success: false, error: insp.message, code: insp.code };
@@ -620,10 +716,9 @@ export class IPCServer {
             response = { success: false, error: 'Agent name required', code: 'INVALID_INPUT' };
           } else {
             const insp = this.agentManager.inspectAgentOp('stop', request.agent);
-            this.agentManager.stopAgent(request.agent)
-              .catch(err => console.error(`Failed to stop ${request.agent}:`, err));
             if (insp.ok) {
-              response = { success: true, data: `Stopping ${request.agent}` };
+              await this.agentManager.stopAgent(request.agent);
+              response = { success: true, data: `Stopped ${request.agent}` };
             } else {
               console.log(`[ipc] stop-agent ${request.agent}: ${insp.code} — ${insp.message}`);
               response = { success: false, error: insp.message, code: insp.code };
@@ -636,10 +731,9 @@ export class IPCServer {
             response = { success: false, error: 'Agent name required', code: 'INVALID_INPUT' };
           } else {
             const insp = this.agentManager.inspectAgentOp('restart', request.agent);
-            this.agentManager.restartAgent(request.agent)
-              .catch(err => console.error(`Failed to restart ${request.agent}:`, err));
             if (insp.ok) {
-              response = { success: true, data: `Restarting ${request.agent}` };
+              await this.agentManager.restartAgent(request.agent);
+              response = { success: true, data: `Restarted ${request.agent}` };
             } else {
               console.log(`[ipc] restart-agent ${request.agent}: ${insp.code} — ${insp.message}`);
               response = { success: false, error: insp.message, code: insp.code };
@@ -677,9 +771,8 @@ export class IPCServer {
             if (!underCtxRoot && !underCwd) {
               response = { success: false, error: 'Invalid worker dir' };
             } else {
-              this.agentManager.spawnWorker(d.name, resolvedDir, d.prompt, d.parent, d.model)
-                .catch(err => console.error(`[ipc] spawn-worker failed:`, err));
-              response = { success: true, data: `Spawning worker ${d.name}` };
+              await this.agentManager.spawnWorker(d.name, resolvedDir, d.prompt, d.parent, d.model);
+              response = { success: true, data: `Spawned worker ${d.name}` };
             }
           }
           break;
@@ -690,9 +783,8 @@ export class IPCServer {
           if (!workerName) {
             response = { success: false, error: 'terminate-worker requires: name' };
           } else {
-            this.agentManager.terminateWorker(workerName)
-              .catch(err => console.error(`[ipc] terminate-worker failed:`, err));
-            response = { success: true, data: `Terminating worker ${workerName}` };
+            await this.agentManager.terminateWorker(workerName);
+            response = { success: true, data: `Terminated worker ${workerName}` };
           }
           break;
         }
@@ -788,6 +880,14 @@ export class IPCServer {
           break;
         }
 
+        case 'telegram-delivery-health': {
+          response = {
+            success: true,
+            data: this.agentManager.getTelegramDeliveryHealth(request.agent),
+          };
+          break;
+        }
+
         case 'list-cron-executions': {
           const execAgent = request.agent;
           const execCronName = request.data?.cronName as string | undefined;
@@ -873,9 +973,11 @@ export class IPCServer {
  */
 export class IPCClient {
   private socketPath: string;
+  private tokenPath: string;
 
-  constructor(instanceId: string = 'default') {
+  constructor(instanceId: string = 'default', ctxRoot?: string) {
     this.socketPath = getIpcPath(instanceId);
+    this.tokenPath = join(ctxRoot ?? join(homedir(), '.cortextos', instanceId), 'config', 'ipc-token');
   }
 
   /**
@@ -886,15 +988,18 @@ export class IPCClient {
 
     return new Promise((resolve, reject) => {
       const socket = createConnection(this.socketPath, () => {
-        socket.write(JSON.stringify(request));
+        const auth = readToken(this.tokenPath) ?? undefined;
+        socket.write(JSON.stringify({ ...request, auth }));
       });
 
+      const decoder = new StringDecoder('utf8');
       let data = '';
       socket.on('data', (chunk: Buffer) => {
-        data += chunk.toString();
+        data += decoder.write(chunk);
       });
 
       socket.on('end', () => {
+        data += decoder.end();
         try {
           resolve(JSON.parse(data));
         } catch {
@@ -913,8 +1018,8 @@ export class IPCClient {
         }
       });
 
-      // Timeout after 5 seconds
-      socket.setTimeout(5000, () => {
+      // Lifecycle operations are completion-aware and may need graceful PTY teardown.
+      socket.setTimeout(IPC_OPERATION_TIMEOUT_MS, () => {
         socket.destroy();
         reject(new Error('IPC request timed out'));
       });

@@ -3,6 +3,12 @@ import { mkdirSync } from 'fs';
 import type { CtxEnv, WorkerStatus, WorkerStatusValue } from '../types/index.js';
 import { AgentPTY } from '../pty/agent-pty.js';
 import { injectMessage } from '../pty/inject.js';
+import {
+  removeRuntimeProcessRecord,
+  terminateProcessTree,
+  writeRuntimeProcessRecord,
+  type RuntimeProcessRecord,
+} from '../utils/process-ownership.js';
 
 /**
  * WorkerProcess — ephemeral Claude Code session for parallelized tasks.
@@ -26,6 +32,8 @@ export class WorkerProcess {
   private exitCode: number | undefined;
   private onDoneCallback: ((name: string, exitCode: number) => void) | null = null;
   private log: (msg: string) => void;
+  private runtimeProcessRecord: RuntimeProcessRecord | null = null;
+  private stateDir: string | null = null;
 
   constructor(
     name: string,
@@ -44,10 +52,14 @@ export class WorkerProcess {
    * Spawn the worker Claude Code session with the given task prompt.
    */
   async spawn(env: CtxEnv, prompt: string, config: { model?: string } = {}): Promise<void> {
+    if (this.pty || this.status === 'running') {
+      throw new Error(`Worker ${this.name} is already starting or running`);
+    }
     // Ensure bus dirs exist so the worker can use cortextos bus commands
+    this.stateDir = join(env.ctxRoot, 'state', this.name);
     try {
       mkdirSync(join(env.ctxRoot, 'inbox', this.name), { recursive: true });
-      mkdirSync(join(env.ctxRoot, 'state', this.name), { recursive: true });
+      mkdirSync(this.stateDir, { recursive: true });
       mkdirSync(join(env.ctxRoot, 'logs', this.name), { recursive: true });
     } catch { /* ignore */ }
 
@@ -55,6 +67,7 @@ export class WorkerProcess {
     this.pty = new AgentPTY(env, config, logPath);
 
     this.pty.onExit((code) => {
+      this.clearRuntimeProcessRecord();
       this.exitCode = code;
       this.status = code === 0 ? 'completed' : 'failed';
       this.log(`Exited with code ${code} → ${this.status}`);
@@ -64,7 +77,31 @@ export class WorkerProcess {
       this.pty = null;
     });
 
-    await this.pty.spawn('fresh', prompt);
+    const ptyForSpawn = this.pty;
+    let spawnSettled = false;
+    const spawnPromise = ptyForSpawn.spawn('fresh', prompt).finally(() => {
+      spawnSettled = true;
+    });
+    const spawnDone = spawnPromise.then(() => undefined, () => undefined);
+    const ownershipPromise = this.captureRuntimeOwnership(
+      ptyForSpawn,
+      env,
+      () => spawnSettled,
+      spawnDone,
+    );
+    try {
+      try {
+        await spawnPromise;
+      } finally {
+        await ownershipPromise;
+      }
+      if (!this.runtimeProcessRecord) throw new Error(`Worker ${this.name} spawned without a process ID`);
+    } catch (err) {
+      try { ptyForSpawn.kill(); } catch { /* best effort */ }
+      this.terminateAndClearRuntimeProcessRecord();
+      this.pty = null;
+      throw err;
+    }
     this.status = 'running';
     this.log(`Running (pid: ${this.pty.getPid()}, dir: ${this.dir})`);
   }
@@ -82,6 +119,55 @@ export class WorkerProcess {
     } catch { /* ignore */ }
     this.status = 'completed';
     this.pty = null;
+    this.terminateAndClearRuntimeProcessRecord();
+  }
+
+  /** Synchronous fatal-exit cleanup; AgentPTY.kill owns the child tree. */
+  forceTerminate(): void {
+    const pty = this.pty;
+    this.pty = null;
+    if (pty) {
+      try { pty.kill(); } catch { /* already exited */ }
+    }
+    this.terminateAndClearRuntimeProcessRecord();
+    this.status = 'completed';
+  }
+
+  private async captureRuntimeOwnership(
+    pty: AgentPTY,
+    env: CtxEnv,
+    isSpawnSettled: () => boolean,
+    spawnDone: Promise<void>,
+  ): Promise<void> {
+    while (true) {
+      if (this.pty !== pty) return;
+      const pid = pty.getPid();
+      if (pid && !this.runtimeProcessRecord) {
+        this.runtimeProcessRecord = writeRuntimeProcessRecord(this.stateDir!, {
+          instanceId: env.instanceId,
+          agentName: this.name,
+          runtime: 'worker',
+          pid,
+        });
+      }
+      if (isSpawnSettled()) return;
+      await Promise.race([spawnDone, sleep(10)]);
+    }
+  }
+
+  private clearRuntimeProcessRecord(): void {
+    const record = this.runtimeProcessRecord;
+    if (!record || !this.stateDir) return;
+    if (removeRuntimeProcessRecord(this.stateDir, record.ownerToken)) {
+      this.runtimeProcessRecord = null;
+    }
+  }
+
+  private terminateAndClearRuntimeProcessRecord(): void {
+    const record = this.runtimeProcessRecord;
+    if (!record) return;
+    const expected = { pid: record.pid, startIdentity: record.processStartIdentity };
+    if (terminateProcessTree(record.pid, expected)) this.clearRuntimeProcessRecord();
   }
 
   /**

@@ -1,4 +1,10 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+
+vi.mock('../../../src/utils/process-ownership.js', () => ({
+  writeRuntimeProcessRecord: vi.fn((_stateDir, input) => ({ ...input, ownerToken: 'a'.repeat(64) })),
+  removeRuntimeProcessRecord: vi.fn(() => true),
+  terminateProcessTree: vi.fn(() => true),
+}));
 import { join } from 'path';
 
 let capturedOnExit: ((exitCode: number, signal?: number) => void) | null = null;

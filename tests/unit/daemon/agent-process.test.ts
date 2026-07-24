@@ -1,6 +1,12 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { normalize } from 'path';
 
+vi.mock('../../../src/utils/process-ownership.js', () => ({
+  writeRuntimeProcessRecord: vi.fn((_stateDir, input) => ({ ...input, ownerToken: 'a'.repeat(64) })),
+  removeRuntimeProcessRecord: vi.fn(() => true),
+  terminateProcessTree: vi.fn(() => true),
+}));
+
 const native = (value: string): string => normalize(value);
 const toPosixPath = (value: unknown): string => String(value).replace(/\\/g, '/');
 
@@ -84,6 +90,8 @@ vi.mock('fs', async () => {
 });
 
 const { AgentProcess } = await import('../../../src/daemon/agent-process.js');
+const { writeRuntimeProcessRecord } = await import('../../../src/utils/process-ownership.js');
+const writeRuntimeProcessRecordMock = vi.mocked(writeRuntimeProcessRecord);
 
 const mockEnv = {
   instanceId: 'test',
@@ -104,6 +112,7 @@ beforeEach(() => {
   mockPty.isAlive.mockReturnValue(true);
   mockPty.onExit.mockClear();
   mockInjectMessage.mockClear();
+  writeRuntimeProcessRecordMock.mockClear();
   fsMocks.existsSync.mockReset().mockReturnValue(false);
   fsMocks.readFileSync.mockReset();
   fsMocks.writeFileSync.mockReset();
@@ -112,6 +121,24 @@ beforeEach(() => {
 });
 
 describe('AgentProcess - BUG-011 fix (stop awaits PTY exit)', () => {
+  it('publishes runtime ownership before the spawn promise settles', async () => {
+    let settleSpawn!: () => void;
+    mockPty.spawn.mockImplementationOnce(() => new Promise<void>((resolve) => {
+      settleSpawn = resolve;
+    }));
+    const ap = new AgentProcess('alice', mockEnv, {});
+
+    const starting = ap.start();
+    await vi.waitFor(() => expect(mockPty.spawn).toHaveBeenCalledTimes(1));
+
+    expect(writeRuntimeProcessRecordMock).toHaveBeenCalledWith(
+      native('/tmp/test-ctx/state/alice'),
+      expect.objectContaining({ pid: 12345 }),
+    );
+    settleSpawn();
+    await starting;
+  });
+
   it('stop() awaits the PTY exit handler before resolving', async () => {
     const ap = new AgentProcess('alice', mockEnv, {});
     await ap.start();
@@ -234,30 +261,28 @@ describe('AgentProcess - BUG-011 fix (stop awaits PTY exit)', () => {
     expect(String(fsMocks.appendFileSync.mock.calls[0][1])).toMatch(/\] CRASH: /);
   });
 
-  it('sessionRefresh() delegates to stop() then start() (in order)', async () => {
+  it('sessionRefresh() serializes teardown before the replacement spawn', async () => {
     const ap = new AgentProcess('alice', mockEnv, {});
     await ap.start();
 
-    // Spy on stop and start so we can verify the delegation
-    const stopSpy = vi.spyOn(ap, 'stop').mockResolvedValue();
-    const startSpy = vi.spyOn(ap, 'start').mockResolvedValue();
+    const stopImplSpy = vi.spyOn(ap as any, 'stopImpl').mockResolvedValue();
+    const startImplSpy = vi.spyOn(ap as any, 'startImpl').mockResolvedValue();
 
     await ap.sessionRefresh();
 
-    expect(stopSpy).toHaveBeenCalled();
-    expect(startSpy).toHaveBeenCalled();
-    // Verify call order: stop must complete before start
-    const stopOrder = stopSpy.mock.invocationCallOrder[0];
-    const startOrder = startSpy.mock.invocationCallOrder[0];
-    expect(stopOrder).toBeLessThan(startOrder);
+    expect(stopImplSpy).toHaveBeenCalledTimes(1);
+    expect(startImplSpy).toHaveBeenCalledTimes(1);
+    expect(stopImplSpy.mock.invocationCallOrder[0]).toBeLessThan(
+      startImplSpy.mock.invocationCallOrder[0],
+    );
   });
 
   it('sessionRefresh() writes .session-refresh marker before stop (false-crash FP fix)', async () => {
     const ap = new AgentProcess('alice', mockEnv, {});
     await ap.start();
 
-    const stopSpy = vi.spyOn(ap, 'stop').mockResolvedValue();
-    vi.spyOn(ap, 'start').mockResolvedValue();
+    const stopImplSpy = vi.spyOn(ap as any, 'stopImpl').mockResolvedValue();
+    vi.spyOn(ap as any, 'startImpl').mockResolvedValue();
     fsMocks.writeFileSync.mockReset();
 
     await ap.sessionRefresh();
@@ -270,7 +295,7 @@ describe('AgentProcess - BUG-011 fix (stop awaits PTY exit)', () => {
     // The marker must be written BEFORE stop() — a SessionEnd hook firing as
     // the PTY dies must already see the marker, or it classifies a false crash.
     const markerWriteOrder = fsMocks.writeFileSync.mock.invocationCallOrder[writeIdx];
-    expect(markerWriteOrder).toBeLessThan(stopSpy.mock.invocationCallOrder[0]);
+    expect(markerWriteOrder).toBeLessThan(stopImplSpy.mock.invocationCallOrder[0]);
   });
 });
 
@@ -368,6 +393,68 @@ describe('AgentProcess - BUG-048 fix (session timer re-reads config)', () => {
     ).length;
     expect(rescheduleCount).toBeLessThan(5);
     expect(refreshSpy).not.toHaveBeenCalled();
+  });
+});
+
+describe('AgentProcess lifecycle serialization', () => {
+  it('collapses concurrent starts into one spawn operation', async () => {
+    const ap = new AgentProcess('alice', mockEnv, {});
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const startImpl = vi.spyOn(ap as any, 'startImpl').mockImplementation(() => gate);
+
+    const first = ap.start();
+    const second = ap.start();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(startImpl).toHaveBeenCalledTimes(1);
+    release();
+    await Promise.all([first, second]);
+    expect(startImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it('orders a concurrent stop after an in-flight start', async () => {
+    const ap = new AgentProcess('alice', mockEnv, {});
+    const events: string[] = [];
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    vi.spyOn(ap as any, 'startImpl').mockImplementation(async () => {
+      events.push('start-begin');
+      await gate;
+      events.push('start-end');
+    });
+    vi.spyOn(ap as any, 'stopImpl').mockImplementation(async () => { events.push('stop'); });
+
+    const starting = ap.start();
+    await Promise.resolve();
+    const stopping = ap.stop();
+    release();
+    await Promise.all([starting, stopping]);
+
+    expect(events).toEqual(['start-begin', 'start-end', 'stop']);
+  });
+
+  it('cancels a session-refresh respawn when a stop arrives during teardown', async () => {
+    const ap = new AgentProcess('alice', mockEnv, {});
+    (ap as any).status = 'running';
+    (ap as any).desiredRunning = true;
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const stopImpl = vi.spyOn(ap as any, 'stopImpl')
+      .mockImplementationOnce(() => gate)
+      .mockResolvedValue(undefined);
+    const startImpl = vi.spyOn(ap as any, 'startImpl').mockResolvedValue(undefined);
+
+    const refreshing = ap.sessionRefresh();
+    await Promise.resolve();
+    await Promise.resolve();
+    const stopping = ap.stop();
+    release();
+    await Promise.all([refreshing, stopping]);
+
+    expect(stopImpl).toHaveBeenCalledTimes(2);
+    expect(startImpl).not.toHaveBeenCalled();
   });
 });
 

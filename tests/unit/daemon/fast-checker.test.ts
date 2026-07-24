@@ -1,6 +1,9 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
-vi.mock('child_process', () => ({ execFile: vi.fn() }));
+vi.mock('child_process', () => ({
+  execFile: vi.fn(),
+  spawnSync: vi.fn(() => ({ status: 1, stdout: '', stderr: '' })),
+}));
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, mkdirSync, existsSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
@@ -14,7 +17,7 @@ function createMockAgent(name = 'test-agent') {
     isBootstrapped: vi.fn().mockReturnValue(true),
     injectMessage: vi.fn().mockReturnValue(true),
     injectMessageDetailed: vi.fn().mockReturnValue({ ok: true }),
-    write: vi.fn(),
+    write: vi.fn().mockReturnValue(true),
   } as any;
 }
 
@@ -280,7 +283,7 @@ describe('FastChecker', () => {
     // sessionRefresh window) dropped them permanently. Inbox messages had
     // the 5-min inflight sweep; Telegram messages had no recovery path.
 
-    it('requeues Telegram messages in order when the agent is NOT_RUNNING', async () => {
+    it('requeues legacy Telegram messages in order and submits each independently', async () => {
       const agent = createMockAgent();
       agent.injectMessageDetailed.mockReturnValue({
         ok: false, code: 'NOT_RUNNING', message: 'agent restarting',
@@ -295,13 +298,12 @@ describe('FastChecker', () => {
       const queue = (checker as any).telegramMessages as Array<{ formatted: string }>;
       expect(queue.map(m => m.formatted)).toEqual(['MSG-A\n', 'MSG-B\n']);
 
-      // Agent comes back: next cycle delivers the same block.
+      // Agent comes back: next cycle delivers each update independently.
       agent.injectMessageDetailed.mockReturnValue({ ok: true });
       await (checker as any).pollCycle();
       expect(queue).toHaveLength(0);
-      const delivered = agent.injectMessageDetailed.mock.calls.at(-1)![0] as string;
-      expect(delivered).toContain('MSG-A');
-      expect(delivered).toContain('MSG-B');
+      const delivered = agent.injectMessageDetailed.mock.calls.slice(-2).map(call => call[0]);
+      expect(delivered).toEqual(['MSG-A\n', 'MSG-B\n']);
     });
 
     it('drops (does not requeue) a DEDUPED batch and acks inbox messages', async () => {
@@ -326,6 +328,80 @@ describe('FastChecker', () => {
       // Inbox message acked (moved to processed) — otherwise it bounces
       // inbox<->inflight every 5 min and re-hits the dedup forever.
       expect(existsSync(join(paths.processed, '2-100-from-alice-abcde.json'))).toBe(true);
+    });
+
+    it('accepts a durable Telegram delivery only through the verified-submit callback', async () => {
+      const agent = createMockAgent();
+      const onDispatch = vi.fn();
+      const onAccepted = vi.fn();
+      const onFailure = vi.fn();
+      agent.injectMessageDetailed.mockImplementation((_text, _failed, accepted) => {
+        accepted?.();
+        return { ok: true };
+      });
+      const checker = new FastChecker(agent, paths, '/tmp/framework');
+      checker.queueTelegramMessage('DURABLE\n', {
+        deliveryId: 'tg-test', onDispatch, onAccepted, onFailure,
+      });
+
+      await (checker as any).pollCycle();
+
+      expect(onDispatch).toHaveBeenCalledTimes(1);
+      expect(onAccepted).toHaveBeenCalledTimes(1);
+      expect(onFailure).not.toHaveBeenCalled();
+      expect(agent.injectMessageDetailed).toHaveBeenCalledWith(
+        'DURABLE\n',
+        expect.any(Function),
+        expect.any(Function),
+        'tg-test',
+      );
+    });
+
+    it('marks delayed verified-submit failure retryable instead of silently dropping it', async () => {
+      const agent = createMockAgent();
+      const onFailure = vi.fn();
+      let failSubmit: (() => void) | undefined;
+      agent.injectMessageDetailed.mockImplementation((_text, failed) => {
+        failSubmit = failed;
+        return { ok: true };
+      });
+      const checker = new FastChecker(agent, paths, '/tmp/framework');
+      checker.queueTelegramMessage('DURABLE\n', {
+        deliveryId: 'tg-test',
+        onDispatch: vi.fn(),
+        onAccepted: vi.fn(),
+        onFailure,
+      });
+
+      await (checker as any).pollCycle();
+      failSubmit?.();
+
+      expect(onFailure).toHaveBeenCalledWith('PTY submission failed');
+    });
+
+    it('fails the current and every shifted journal delivery when dispatch throws synchronously', async () => {
+      const agent = createMockAgent();
+      agent.injectMessageDetailed.mockImplementationOnce(() => {
+        throw new Error('synchronous injection failure');
+      });
+      const checker = new FastChecker(agent, paths, '/tmp/framework');
+      const firstFailure = vi.fn();
+      const secondDispatch = vi.fn();
+      const secondFailure = vi.fn();
+
+      checker.queueTelegramMessage('FIRST\n', {
+        deliveryId: 'tg-first', onDispatch: vi.fn(), onAccepted: vi.fn(), onFailure: firstFailure,
+      });
+      checker.queueTelegramMessage('SECOND\n', {
+        deliveryId: 'tg-second', onDispatch: secondDispatch, onAccepted: vi.fn(), onFailure: secondFailure,
+      });
+
+      await (checker as any).pollCycle();
+
+      expect(firstFailure).toHaveBeenCalledWith(expect.stringContaining('synchronous injection failure'));
+      expect(secondDispatch).not.toHaveBeenCalled();
+      expect(secondFailure).toHaveBeenCalledWith(expect.stringContaining('batch aborted before dispatch'));
+      expect((checker as any).telegramMessages).toHaveLength(0);
     });
   });
 

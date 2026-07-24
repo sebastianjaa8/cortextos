@@ -1,4 +1,4 @@
-import { readdirSync, readFileSync, renameSync, statSync, existsSync } from 'fs';
+import { readdirSync, readFileSync, renameSync, statSync, existsSync, utimesSync } from 'fs';
 import { join } from 'path';
 import { createHmac, timingSafeEqual } from 'crypto';
 import type { InboxMessage, Priority, BusPaths } from '../types/index.js';
@@ -40,8 +40,20 @@ function hmacVerify(key: string, payload: string, sig: string): boolean {
   }
 }
 
-function signPayload(msgId: string, from: string, to: string, text: string): string {
+function legacySignPayload(msgId: string, from: string, to: string, text: string): string {
   return `${msgId}:${from}:${to}:${text}`;
+}
+
+function signPayload(message: InboxMessage): string {
+  return JSON.stringify({
+    id: message.id,
+    from: message.from,
+    to: message.to,
+    priority: message.priority,
+    timestamp: message.timestamp,
+    text: message.text,
+    reply_to: message.reply_to,
+  });
 }
 
 /**
@@ -79,8 +91,11 @@ export function sendMessage(
     timestamp: new Date().toISOString().replace(/\.\d{3}Z$/, '.000Z'),
     text,
     reply_to: replyTo || null,
-    ...(signingKey ? { sig: hmacSign(signingKey, signPayload(msgId, from, to, text)) } : {}),
   };
+  if (signingKey) {
+    message.sig_v = 2;
+    message.sig = hmacSign(signingKey, signPayload(message));
+  }
 
   // Write to target agent's inbox
   const inboxDir = join(paths.ctxRoot, 'inbox', to);
@@ -131,30 +146,33 @@ export function checkInbox(paths: BusPaths): InboxMessage[] {
 
         // Security: Verify HMAC signature against the CLAIMED sender's
         // per-agent key (attribution), falling back to the legacy shared key.
-        const payload = signPayload(msg.id, msg.from, msg.to, msg.text);
+        const payload = msg.sig_v === 2
+          ? signPayload(msg)
+          : legacySignPayload(msg.id, msg.from, msg.to, msg.text);
         const senderKey = loadAgentKey(msg.from);
+        if ((senderKey || signingKey) && !msg.sig) {
+          console.error(`[bus/message] SECURITY: Unsigned message ${msg.id} while bus signing is configured - rejecting`);
+          const errDir = join(inbox, '.errors');
+          ensureDir(errDir);
+          try { renameSync(srcPath, join(errDir, file)); } catch { /* ignore */ }
+          continue;
+        }
         if (senderKey) {
-          if (msg.sig) {
-            if (!hmacVerify(senderKey, payload, msg.sig)) {
-              if (signingKey && hmacVerify(signingKey, payload, msg.sig)) {
-                // Pre-migration in-flight message signed with old shared key.
-                console.warn(`[bus/message] SECURITY: Message ${msg.id} from '${msg.from}' carries a legacy shared-key signature — accepted (transition)`);
-              } else {
-                console.error(`[bus/message] SECURITY: Message ${msg.id} from '${msg.from}' failed HMAC verification against sender's key — rejecting`);
-                const errDir = join(inbox, '.errors');
-                ensureDir(errDir);
-                try { renameSync(srcPath, join(errDir, file)); } catch { /* ignore */ }
-                continue;
-              }
+          if (!hmacVerify(senderKey, payload, msg.sig!)) {
+            if (signingKey && hmacVerify(signingKey, payload, msg.sig!)) {
+              // Pre-migration in-flight message signed with old shared key.
+              console.warn(`[bus/message] SECURITY: Message ${msg.id} from '${msg.from}' carries a legacy shared-key signature — accepted (transition)`);
+            } else {
+              console.error(`[bus/message] SECURITY: Message ${msg.id} from '${msg.from}' failed HMAC verification against sender's key — rejecting`);
+              const errDir = join(inbox, '.errors');
+              ensureDir(errDir);
+              try { renameSync(srcPath, join(errDir, file)); } catch { /* ignore */ }
+              continue;
             }
-          } else {
-            // Sender has a key on file but message is unsigned — flag, don't
-            // hard-reject during rollout.
-            console.warn(`[bus/message] SECURITY: Unsigned message ${msg.id} from '${msg.from}' despite per-agent key on file — accepted with flag`);
           }
-        } else if (signingKey && msg.sig) {
+        } else if (signingKey) {
           // No per-agent key for claimed sender — legacy shared-key path.
-          const valid = hmacVerify(signingKey, payload, msg.sig);
+          const valid = hmacVerify(signingKey, payload, msg.sig!);
           if (!valid) {
             console.error(`[bus/message] SECURITY: Message ${msg.id} from '${msg.from}' failed HMAC verification — rejecting`);
             const errDir = join(inbox, '.errors');
@@ -165,10 +183,7 @@ export function checkInbox(paths: BusPaths): InboxMessage[] {
           // Valid shared-key sig but no per-agent key — unknown/unregistered
           // sender (e.g. dashboard, or the 'cortextos' incident). Never silent.
           console.warn(`[bus/message] SECURITY: Message ${msg.id} claims sender '${msg.from}' which has no per-agent key on file — accepted with flag (shared-key signature valid)`);
-        } else if (signingKey && !msg.sig) {
-          // Signing key exists but message has no sig — legacy message, log warning
-          console.warn(`[bus/message] SECURITY: Unsigned message ${msg.id} from unregistered sender '${msg.from}' — accepted with flag (legacy)`);
-        } else if (!signingKey) {
+        } else {
           // No keys anywhere (legacy install) — flag unknown sender, never silent.
           console.warn(`[bus/message] SECURITY: Message ${msg.id} claims sender '${msg.from}' which has no key on file — accepted with flag (no signing configured)`);
         }
@@ -176,6 +191,8 @@ export function checkInbox(paths: BusPaths): InboxMessage[] {
         // Move to inflight
         const destPath = join(inflight, file);
         renameSync(srcPath, destPath);
+        const claimedAt = new Date();
+        utimesSync(destPath, claimedAt, claimedAt);
         messages.push(msg);
       } catch {
         // Move corrupt files to .errors/

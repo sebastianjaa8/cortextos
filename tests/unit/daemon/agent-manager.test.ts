@@ -105,6 +105,20 @@ describe('AgentManager.discoverAndStart - BUG-028 fix', () => {
     expect(startSpy).toHaveBeenCalledTimes(2);
   });
 
+  it('is idempotent when discovery is requested twice', async () => {
+    const am = new AgentManager('test-instance', ctxRoot, frameworkRoot, 'acme');
+    const registry = (am as unknown as { agents: Map<string, unknown> }).agents;
+    const startSpy = vi.spyOn(am, 'startAgent').mockImplementation(async (name) => {
+      registry.set(name, {});
+    });
+
+    await am.discoverAndStart();
+    await am.discoverAndStart();
+
+    expect(startSpy).toHaveBeenCalledTimes(2);
+    expect([...registry.keys()].sort()).toEqual(['alice', 'bob']);
+  });
+
   it('still respects per-agent config.json enabled: false (existing behavior)', async () => {
     // Per-agent config.json takes precedence — this is the legacy behavior we
     // explicitly preserved in the BUG-028 fix
@@ -249,7 +263,7 @@ describe('AgentManager.restartAgent - BUG-007 fix (rebuild Telegram poller)', ()
     rmSync(testDir, { recursive: true, force: true });
   });
 
-  it('delegates to stopAgent then startAgent (in order)', async () => {
+  it('serializes internal stop then start in order', async () => {
     // BUG-007: previously restartAgent only stopped/started the AgentProcess and
     // FastChecker inline, leaving the TelegramPoller from the previous incarnation
     // running. The fix delegates to stopAgent (which DOES clean up the poller) and
@@ -261,8 +275,8 @@ describe('AgentManager.restartAgent - BUG-007 fix (rebuild Telegram poller)', ()
     // actually running the full startAgent flow
     (am as any).agents.set('alice', { process: {}, checker: {}, poller: { stop() {} } });
 
-    const stopSpy = vi.spyOn(am, 'stopAgent').mockResolvedValue();
-    const startSpy = vi.spyOn(am, 'startAgent').mockResolvedValue();
+    const stopSpy = vi.spyOn(am as any, 'stopAgentNow').mockResolvedValue();
+    const startSpy = vi.spyOn(am as any, 'startAgentNow').mockResolvedValue();
 
     await am.restartAgent('alice');
 

@@ -9,7 +9,8 @@ import { migrateCronsForAgent } from './cron-migration.js';
 import { generateAgentKey } from '../bus/keys.js';
 import type { CronDefinition } from '../types/index.js';
 import { TelegramAPI } from '../telegram/api.js';
-import { TelegramPoller } from '../telegram/poller.js';
+import { TelegramPoller, type TelegramDeliveryContext } from '../telegram/poller.js';
+import type { TelegramDeliveryHealth } from '../telegram/delivery-journal.js';
 import { resolvePaths } from '../utils/paths.js';
 import { resolveEnv } from '../utils/env.js';
 import { recordInboundTelegram, cacheLastSent, logOutboundMessage, buildRecentHistory } from '../telegram/logging.js';
@@ -36,6 +37,8 @@ export class AgentManager {
   private ctxRoot: string;
   private frameworkRoot: string;
   private org: string;
+  private shuttingDown = false;
+  private agentLifecycleOps: Map<string, Promise<void>> = new Map();
 
   // Set true at construction time if any agent in state/ has a stale
   // .daemon-crashed marker, meaning the previous daemon process died
@@ -142,6 +145,7 @@ export class AgentManager {
         console.log(`[agent-manager] Skipping disabled agent: ${name} (enabled-agents.json)`);
         continue;
       }
+      if (this.agents.has(name)) continue;
       // BUG-043 fix: pass the per-agent org so startAgent can use it instead
       // of falling back to `this.org` (the daemon's startup org).
       await this.startAgent(name, dir, config, org);
@@ -241,6 +245,13 @@ export class AgentManager {
     const inRegistry = this.agents.has(name);
     if (op === 'start') {
       if (inRegistry) {
+        const entry = this.agents.get(name);
+        try {
+          const failed = entry?.process?.getStatus?.();
+          if (failed?.status === 'stopped' && failed.lastError) return { ok: true };
+        } catch {
+          // Transitional registry entries remain deduped below.
+        }
         // Include the live registry state in the message. Operators reach
         // for `cortextos start` when list-agents/dashboard shows "stopped" —
         // but that "running" flag is heartbeat-freshness (<10 min), which
@@ -249,7 +260,6 @@ export class AgentManager {
         // fleet restart while heartbeat crons caught up). A bare "deduped"
         // reply looks like a wedged registry; stating pid/uptime shows the
         // truth in the same breath.
-        const entry = this.agents.get(name);
         let detail = 'in-flight start or transitional state (status unavailable)';
         try {
           const live = entry?.process?.getStatus?.();
@@ -272,8 +282,36 @@ export class AgentManager {
     return { ok: true };
   }
 
+  private async runAgentLifecycle(name: string, operation: () => Promise<void>): Promise<void> {
+    const previous = this.agentLifecycleOps.get(name) ?? Promise.resolve();
+    const current = previous.catch(() => undefined).then(operation);
+    this.agentLifecycleOps.set(name, current);
+    try {
+      await current;
+    } finally {
+      if (this.agentLifecycleOps.get(name) === current) this.agentLifecycleOps.delete(name);
+    }
+  }
+
   async startAgent(name: string, agentDir: string, config?: AgentConfig, org?: string): Promise<void> {
-    if (this.agents.has(name)) {
+    if (this.shuttingDown) {
+      console.log(`[agent-manager] Ignoring start for ${name}: daemon shutdown is in progress`);
+      return;
+    }
+    await this.runAgentLifecycle(name, () => this.startAgentNow(name, agentDir, config, org));
+  }
+
+  private async startAgentNow(name: string, agentDir: string, config?: AgentConfig, org?: string): Promise<void> {
+    if (this.shuttingDown) return;
+    const existingEntry = this.agents.get(name);
+    if (existingEntry) {
+      const existingStatus = existingEntry.process.getStatus();
+      if (existingStatus.status === 'stopped' && existingStatus.lastError) {
+        existingEntry.checker.stop();
+        existingEntry.process.forceStop();
+        if (this.agents.get(name) === existingEntry) this.agents.delete(name);
+        console.log(`[agent-manager] Replacing prior failed startup registration for ${name}`);
+      } else {
       // BUG-031: this branch was the workaround for the BUG-011 PTY race
       // (restart-all could send stop+start simultaneously, and the new
       // start would arrive while the old stop's PTY exit was still in
@@ -301,6 +339,7 @@ export class AgentManager {
       }
       this.pendingRestarts.add(name);
       return;
+      }
     }
 
     // BUG-043 fix: resolve the agent's true org instead of using `this.org`.
@@ -436,6 +475,12 @@ export class AgentManager {
 
     // Start agent
     await agentProcess.start();
+    if (agentProcess.getStatus().status !== 'running') {
+      checker.stop();
+      agentProcess.forceStop();
+      log('Startup failed; lifecycle resources rolled back and failure retained in status for a clean retry');
+      return;
+    }
 
     // Subtask 2.2: Auto-migrate crons from config.json → crons.json before
     // starting the scheduler, so the scheduler always has a populated crons.json
@@ -488,8 +533,14 @@ export class AgentManager {
 
       const REJECT_ALERT_THRESHOLD = 3;
       const REJECT_ALERT_COOLDOWN_MS = 30 * 60 * 1000;
+      const deliveryHooks = (delivery: TelegramDeliveryContext) => ({
+        deliveryId: delivery.deliveryId,
+        onDispatch: () => { poller.markDeliveryDispatch(delivery.deliveryId); },
+        onAccepted: () => { poller.markDeliveryAccepted(delivery.deliveryId); },
+        onFailure: (error: string) => { poller.markDeliveryFailure(delivery.deliveryId, error, true); },
+      });
 
-      poller.onMessage((msg) => {
+      poller.onMessage(async (msg, delivery) => {
         // ALLOWED_USER gate: comma-separated list of numeric user IDs.
         // If configured, ignore messages from other users. Always log the
         // rejected user_id + name so operators can discover IDs to whitelist.
@@ -516,6 +567,7 @@ export class AgentManager {
                 }
               }
             }
+            poller.markDeliveryAccepted(delivery.deliveryId);
             return;
           }
         }
@@ -553,12 +605,13 @@ export class AgentManager {
 
         if (isMedia && telegramApi) {
           const downloadDir = join(agentDir, 'telegram-images');
-          processMediaMessage(msg, telegramApi, downloadDir).then((media) => {
+          try {
+            const media = await processMediaMessage(msg, telegramApi, downloadDir);
             if (!media) {
               log('Media processing returned null - falling back to text format');
               const text = stripControlChars(msg.caption || '');
               const formatted = FastChecker.formatTelegramTextMessage(from, effectiveChatId, text, this.frameworkRoot, replyToText);
-              if (!checker.isDuplicate(formatted)) checker.queueTelegramMessage(formatted);
+              checker.queueTelegramMessage(formatted, deliveryHooks(delivery));
               return;
             }
 
@@ -585,18 +638,14 @@ export class AgentManager {
               formatted = FastChecker.formatTelegramVideoMessage(from, effectiveChatId, media.text, relFilePath, media.file_name || '', media.duration, replyToText);
             }
 
-            if (checker.isDuplicate(formatted)) {
-              log('Duplicate Telegram media message suppressed');
-              return;
-            }
             log(`Media message received: type=${media.type}, path=${media.image_path || media.file_path}`);
-            checker.queueTelegramMessage(formatted);
-          }).catch((err) => {
+            checker.queueTelegramMessage(formatted, deliveryHooks(delivery));
+          } catch (err) {
             log(`Media processing error: ${err} - falling back to text format`);
             const text = stripControlChars(msg.caption || '');
             const formatted = FastChecker.formatTelegramTextMessage(from, effectiveChatId, text, this.frameworkRoot, replyToText);
-            if (!checker.isDuplicate(formatted)) checker.queueTelegramMessage(formatted);
-          });
+            checker.queueTelegramMessage(formatted, deliveryHooks(delivery));
+          }
           return;
         }
 
@@ -615,22 +664,16 @@ export class AgentManager {
           recentHistory,
         );
 
-        if (checker.isDuplicate(formatted)) {
-          log('Duplicate Telegram message suppressed');
-          return;
-        }
-        checker.queueTelegramMessage(formatted);
+        checker.queueTelegramMessage(formatted, deliveryHooks(delivery));
       });
 
-      poller.onCallback((query) => {
+      poller.onCallback(async (query, delivery) => {
         // Route to fast-checker for hook response handling (perm_allow/deny, askopt, etc.)
         // handleCallback writes hook-response files and edits Telegram messages
-        checker.handleCallback(query).catch(err => {
-          log(`Callback handling error: ${err}`);
-        });
+        return checker.handleCallback(query);
       });
 
-      poller.onReaction((reaction) => {
+      poller.onReaction((reaction, delivery) => {
         // ALLOWED_USER gate: same multi-user rule as message handler.
         if (allowedUserId) {
           const allowedIds = allowedUserId.split(',').map((s) => parseInt(s.trim(), 10));
@@ -654,6 +697,7 @@ export class AgentManager {
                 }
               }
             }
+            poller.markDeliveryAccepted(delivery.deliveryId);
             return;
           }
         }
@@ -670,11 +714,7 @@ export class AgentManager {
           reaction.old_reaction ?? [],
           reaction.new_reaction ?? [],
         );
-        if (checker.isDuplicate(formatted)) {
-          log('Duplicate Telegram reaction suppressed');
-          return;
-        }
-        checker.queueTelegramMessage(formatted);
+        checker.queueTelegramMessage(formatted, deliveryHooks(delivery));
       });
 
       // Wrap poller.start() in a restart-on-Conflict loop. The poller's
@@ -692,10 +732,8 @@ export class AgentManager {
         // (>1min) resets the counter — without this reset, a poller that
         // runs cleanly for hours and then hits a single Conflict would
         // give up immediately because total runtime already exceeds 5min.
-        const MAX_CONSECUTIVE_CONFLICT_MS = 5 * 60 * 1000;
         const LONG_RUN_RESET_MS = 60_000;
         const MAX_AUTH_BACKOFF_MS = 10 * 60 * 1000;
-        let consecutiveConflictStart: number | null = null;
         let authFailCount = 0;
         while (true) {
           // Pre-check: agent may have been deleted from registry during
@@ -705,15 +743,16 @@ export class AgentManager {
           try {
             await poller.start();
           } catch (err) {
-            log(`Telegram poller threw (will not restart): ${err}`);
-            return;
+            log(`Telegram poller threw: ${err}. Retrying in 60s.`);
+            await new Promise(r => setTimeout(r, 60_000));
+            continue;
           }
           const runDuration = Date.now() - runStart;
           if (poller.lastExitReason === 'stopped-externally') return;
           if (!this.agents.has(name)) return;
           // A poll session that ran for >LONG_RUN_RESET_MS proves the prior
           // failure cleared — reset both retry budgets.
-          if (runDuration > LONG_RUN_RESET_MS) { consecutiveConflictStart = null; authFailCount = 0; }
+          if (runDuration > LONG_RUN_RESET_MS) authFailCount = 0;
           // Auth failure (401): exponential backoff capped at 10min, alert
           // operator ONCE. This stops the hot-loop that caused the 2026-06-22
           // OOM (~1 error/sec → 95k errors → 785MB log → daemon killed). The
@@ -723,7 +762,6 @@ export class AgentManager {
           // Conflict budget too so stale 401 backoff time can't make a later
           // 409 give up instantly.
           if (poller.lastExitReason === 'auth-failed') {
-            consecutiveConflictStart = null;
             authFailCount++;
             const backoffMs = Math.min(30_000 * Math.pow(2, authFailCount - 1), MAX_AUTH_BACKOFF_MS);
             if (authFailCount === 1 && telegramApi && chatId) {
@@ -735,11 +773,6 @@ export class AgentManager {
             log(`Telegram poller for ${name} auth-failed (401, attempt ${authFailCount}). Backing off ${Math.round(backoffMs / 1000)}s before retry.`);
             await new Promise(r => setTimeout(r, backoffMs));
             continue;
-          }
-          if (consecutiveConflictStart === null) consecutiveConflictStart = Date.now();
-          if (Date.now() - consecutiveConflictStart > MAX_CONSECUTIVE_CONFLICT_MS) {
-            log(`Telegram poller for ${name} could not clear Conflict within 5min of consecutive failures — giving up. Inspect for duplicate bot instance.`);
-            return;
           }
           log(`Telegram poller for ${name} exited (${poller.lastExitReason}). Sleeping 30s then restarting to retake getUpdates lock.`);
           await new Promise(r => setTimeout(r, 30_000));
@@ -874,21 +907,20 @@ export class AgentManager {
       log,
     });
 
-    activityPoller.onCallback((query) => {
+    activityPoller.onCallback(async (query, delivery) => {
       const entry = this.agents.get(name);
-      if (!entry) return;
-      entry.checker.handleActivityCallback(query, activityApi).catch((err) => {
-        log(`Activity-channel callback error: ${err}`);
-      });
+      if (!entry) throw new Error(`Agent ${name} is unavailable`);
+      return entry.checker.handleActivityCallback(query, activityApi);
     });
 
     // Best-effort message logger — activity channel is primarily outbound
     // but any inbound chatter (broadcasts, user DMs, etc.) gets logged
     // so operators can see what is flowing. No PTY injection.
-    activityPoller.onMessage((msg) => {
+    activityPoller.onMessage((msg, delivery) => {
       const from = stripControlChars(msg.from?.first_name || msg.from?.username || 'Unknown');
       const text = stripControlChars(msg.text || msg.caption || '');
-      log(`[activity-channel inbound] msg_id=${msg.message_id} from ${from}: ${text.slice(0, 120)}`);
+      log(`[activity-channel inbound] msg_id=${msg.message_id} from=${from} text_bytes=${Buffer.byteLength(text, 'utf8')}`);
+      activityPoller.markDeliveryAccepted(delivery.deliveryId);
     });
 
     // Same Conflict-restart wrapper as the primary poller — activity
@@ -896,27 +928,17 @@ export class AgentManager {
     // 5min retry budget measured against CONSECUTIVE failures; resets
     // after a >1min successful run. See primary poller wrapper for rationale.
     const startActivityPollerWithRestart = async () => {
-      const MAX_CONSECUTIVE_CONFLICT_MS = 5 * 60 * 1000;
-      const LONG_RUN_RESET_MS = 60_000;
-      let consecutiveConflictStart: number | null = null;
       while (true) {
         if (!this.agents.has(name)) return;
-        const runStart = Date.now();
         try {
           await activityPoller.start();
         } catch (err) {
-          log(`Activity-channel poller threw (will not restart): ${err}`);
-          return;
+          log(`Activity-channel poller threw: ${err}. Retrying in 60s.`);
+          await new Promise(r => setTimeout(r, 60_000));
+          continue;
         }
-        const runDuration = Date.now() - runStart;
         if (activityPoller.lastExitReason === 'stopped-externally') return;
         if (!this.agents.has(name)) return;
-        if (runDuration > LONG_RUN_RESET_MS) consecutiveConflictStart = null;
-        if (consecutiveConflictStart === null) consecutiveConflictStart = Date.now();
-        if (Date.now() - consecutiveConflictStart > MAX_CONSECUTIVE_CONFLICT_MS) {
-          log(`Activity-channel poller for ${name} could not clear Conflict within 5min of consecutive failures — giving up.`);
-          return;
-        }
         log(`Activity-channel poller for ${name} exited (${activityPoller.lastExitReason}). Sleeping 30s then restarting.`);
         await new Promise(r => setTimeout(r, 30_000));
       }
@@ -935,6 +957,10 @@ export class AgentManager {
    * Stop a specific agent.
    */
   async stopAgent(name: string): Promise<void> {
+    await this.runAgentLifecycle(name, () => this.stopAgentNow(name));
+  }
+
+  private async stopAgentNow(name: string): Promise<void> {
     const entry = this.agents.get(name);
     if (!entry) {
       console.log(`[agent-manager] Agent ${name} not found`);
@@ -945,7 +971,7 @@ export class AgentManager {
     if (entry.activityPoller) entry.activityPoller.stop();
     entry.checker.stop();
     await entry.process.stop();
-    this.agents.delete(name);
+    if (this.agents.get(name) === entry) this.agents.delete(name);
 
     // Stop and remove the agent's cron scheduler (if one was wired)
     const scheduler = this.cronSchedulers.get(name);
@@ -959,7 +985,7 @@ export class AgentManager {
     // matching warning comment in startAgent(). The honor logic is preserved
     // as a safety net in case BUG-011 regresses; the warn line tells us
     // immediately if it ever does.
-    if (this.pendingRestarts.has(name)) {
+    if (!this.shuttingDown && this.pendingRestarts.has(name)) {
       if (this.daemonJustCrashed) {
         console.log(`[agent-manager] pendingRestarts fired for ${name} (post-crash safety net, expected). Honoring queued restart.`);
       } else {
@@ -985,13 +1011,19 @@ export class AgentManager {
    * Participates in the pendingRestarts race protection used by restart-all.
    */
   async restartAgent(name: string): Promise<void> {
+    if (this.shuttingDown) return;
+    await this.runAgentLifecycle(name, () => this.restartAgentNow(name));
+  }
+
+  private async restartAgentNow(name: string): Promise<void> {
     if (!this.agents.has(name)) {
       console.log(`[agent-manager] Agent ${name} not found — cannot restart`);
       return;
     }
     console.log(`[agent-manager] Restarting ${name}`);
-    await this.stopAgent(name);
-    await this.startAgent(name, '');
+    this.pendingRestarts.delete(name);
+    await this.stopAgentNow(name);
+    if (!this.shuttingDown) await this.startAgentNow(name, '');
     console.log(`[agent-manager] Restart complete for ${name}`);
   }
 
@@ -1002,7 +1034,7 @@ export class AgentManager {
    * state dir BEFORE stopping it. The SessionEnd crash-alert hook
    * (src/hooks/hook-crash-alert.ts) reads this marker and reports a clean
    * `🛑 daemon shutdown` notification instead of a false `🚨 CRASH` alarm.
-   * Without this, every `pm2 restart cortextos-daemon` (or `pm2 stop`)
+   * Without this, every daemon stop (including the unsafe direct PM2 restart path)
    * generates a false crash alarm per agent — trust-destroying.
    *
    * Pattern matches src/cli/bus.ts:1283-1289 and PR #12 (BUG-036). Markers
@@ -1010,6 +1042,8 @@ export class AgentManager {
    * time `pty.kill()` runs, every agent already has its marker on disk.
    */
   async stopAll(): Promise<void> {
+    this.shuttingDown = true;
+    this.pendingRestarts.clear();
     const names = [...this.agents.keys()];
 
     for (const name of names) {
@@ -1025,13 +1059,39 @@ export class AgentManager {
       }
     }
 
-    for (const name of names) {
+    const agentStops = names.map((name) =>
+      this.runAgentLifecycle(name, () => this.stopAgentNow(name)),
+    );
+    const workerStops = [...this.workers.entries()].map(async ([name, worker]) => {
       try {
-        await this.stopAgent(name);
-      } catch (err) {
-        console.error(`[agent-manager] Error stopping ${name}:`, err);
+        await worker.terminate();
+      } finally {
+        if (this.workers.get(name) === worker) this.workers.delete(name);
+      }
+    });
+    const results = await Promise.allSettled([...agentStops, ...workerStops]);
+    for (const result of results) {
+      if (result.status === 'rejected') {
+        console.error('[agent-manager] Error during parallel shutdown:', result.reason);
       }
     }
+  }
+
+  /** Synchronous final cleanup for fatal process exit. Idempotent. */
+  forceStopAll(): void {
+    this.shuttingDown = true;
+    this.pendingRestarts.clear();
+    for (const scheduler of this.cronSchedulers.values()) scheduler.stop();
+    this.cronSchedulers.clear();
+    for (const entry of this.agents.values()) {
+      try { entry.poller?.stop(); } catch { /* best effort */ }
+      try { entry.activityPoller?.stop(); } catch { /* best effort */ }
+      try { entry.checker.stop(); } catch { /* best effort */ }
+      entry.process.forceStop();
+    }
+    this.agents.clear();
+    for (const worker of this.workers.values()) worker.forceTerminate();
+    this.workers.clear();
   }
 
   /**
@@ -1060,6 +1120,14 @@ export class AgentManager {
     return this.agents.get(name)?.checker || null;
   }
 
+  getTelegramDeliveryHealth(name?: string): Record<string, TelegramDeliveryHealth | null> {
+    const entries = name ? [[name, this.agents.get(name)] as const] : [...this.agents.entries()];
+    return Object.fromEntries(entries.map(([agentName, entry]) => [
+      agentName,
+      entry?.poller?.getDeliveryHealth() ?? null,
+    ]));
+  }
+
   /**
    * Get all agent names.
    */
@@ -1081,6 +1149,7 @@ export class AgentManager {
    * Spawn an ephemeral worker session for a parallelized task.
    */
   async spawnWorker(name: string, dir: string, prompt: string, parent?: string, model?: string): Promise<void> {
+    if (this.shuttingDown) throw new Error('Daemon shutdown is in progress');
     if (this.workers.has(name)) {
       throw new Error(`Worker "${name}" is already running`);
     }

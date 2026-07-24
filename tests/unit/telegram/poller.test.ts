@@ -40,7 +40,7 @@ function makeStubApi(updates: TelegramUpdate[]): { api: TelegramAPI; calls: numb
   return { api, calls };
 }
 
-describe('TelegramPoller — offset-after-handler', () => {
+describe('TelegramPoller — durable journal handoff', () => {
   let stateDir: string;
 
   beforeEach(() => {
@@ -67,7 +67,7 @@ describe('TelegramPoller — offset-after-handler', () => {
     expect(persisted).toBe('101');
   });
 
-  it('does NOT advance offset if a message handler throws', async () => {
+  it('advances offset after journaling even when a message handler throws', async () => {
     const { api } = makeStubApi([makeMessageUpdate(200, 'boom')]);
     const poller = new TelegramPoller(api, stateDir);
 
@@ -78,15 +78,12 @@ describe('TelegramPoller — offset-after-handler', () => {
     // Handler errors are caught internally — pollOnce should not throw.
     await expect(poller.pollOnce()).resolves.toBeUndefined();
 
-    // Offset file must not exist (or must still be 0) — update should redeliver.
-    const offsetFile = join(stateDir, '.telegram-offset');
-    if (existsSync(offsetFile)) {
-      const persisted = readFileSync(offsetFile, 'utf-8').trim();
-      expect(persisted).toBe('0');
-    }
+    const persisted = readFileSync(join(stateDir, '.telegram-offset'), 'utf-8').trim();
+    expect(persisted).toBe('201');
+    expect(poller.getDeliveryHealth().counts.retryable).toBe(1);
   });
 
-  it('halts the batch on failure to preserve ordering', async () => {
+  it('journals and routes the rest of a batch after one dispatch failure', async () => {
     const { api } = makeStubApi([
       makeMessageUpdate(10, 'first'),
       makeMessageUpdate(11, 'second-will-fail'),
@@ -104,12 +101,9 @@ describe('TelegramPoller — offset-after-handler', () => {
 
     await poller.pollOnce();
 
-    // First succeeded, second threw, third MUST NOT have run.
-    expect(received).toEqual(['first', 'second-will-fail']);
-
-    // Offset should be advanced past the first (11) but not past the second.
+    expect(received).toEqual(['first', 'second-will-fail', 'third']);
     const persisted = readFileSync(join(stateDir, '.telegram-offset'), 'utf-8').trim();
-    expect(persisted).toBe('11');
+    expect(persisted).toBe('13');
   });
 
   it('persists offset per-update so a mid-batch crash preserves confirmed state', async () => {
@@ -129,8 +123,8 @@ describe('TelegramPoller — offset-after-handler', () => {
 
     await poller.pollOnce();
 
-    // Before processing 50, nothing persisted. Before 51, 51 persisted. Before 52, 52 persisted.
-    expect(offsetsSeenDuringHandling).toEqual(['none', '51', '52']);
+    // Each handler runs only after its update and offset are both durable.
+    expect(offsetsSeenDuringHandling).toEqual(['51', '52', '53']);
 
     const persisted = readFileSync(join(stateDir, '.telegram-offset'), 'utf-8').trim();
     expect(persisted).toBe('53');
@@ -143,16 +137,18 @@ describe('TelegramPoller — offset-after-handler', () => {
     const received: string[] = [];
     poller.onCallback((cb) => {
       received.push(cb.data ?? '');
+      return { ok: true, disposition: 'confirmed' };
     });
 
     await poller.pollOnce();
 
     expect(received).toEqual(['approve']);
+    expect(poller.getDeliveryHealth().counts.accepted).toBe(1);
     const persisted = readFileSync(join(stateDir, '.telegram-offset'), 'utf-8').trim();
     expect(persisted).toBe('301');
   });
 
-  it('does NOT advance offset if a callback handler throws', async () => {
+  it('journals callback failures before advancing the offset', async () => {
     const { api } = makeStubApi([makeCallbackUpdate(400, 'deny')]);
     const poller = new TelegramPoller(api, stateDir);
 
@@ -162,11 +158,20 @@ describe('TelegramPoller — offset-after-handler', () => {
 
     await poller.pollOnce();
 
-    const offsetFile = join(stateDir, '.telegram-offset');
-    if (existsSync(offsetFile)) {
-      const persisted = readFileSync(offsetFile, 'utf-8').trim();
-      expect(persisted).toBe('0');
-    }
+    const persisted = readFileSync(join(stateDir, '.telegram-offset'), 'utf-8').trim();
+    expect(persisted).toBe('401');
+    expect(poller.getDeliveryHealth().counts.retryable).toBe(1);
+  });
+
+  it('keeps an explicit callback failure retryable instead of accepting it', async () => {
+    const { api } = makeStubApi([makeCallbackUpdate(450, 'askopt_0_0')]);
+    const poller = new TelegramPoller(api, stateDir);
+    poller.onCallback(() => ({ ok: false, retryable: true, error: 'agent not running' }));
+
+    await poller.pollOnce();
+
+    expect(poller.getDeliveryHealth().counts.accepted).toBe(0);
+    expect(poller.getDeliveryHealth().counts.retryable).toBe(1);
   });
 
   it('routes message_reaction updates to registered reaction handlers and advances offset', async () => {
@@ -197,7 +202,7 @@ describe('TelegramPoller — offset-after-handler', () => {
     expect(persisted).toBe('501');
   });
 
-  it('does NOT advance offset if a reaction handler throws', async () => {
+  it('journals reaction failures before advancing the offset', async () => {
     const reactionUpdate: TelegramUpdate = {
       update_id: 600,
       message_reaction: {
@@ -216,11 +221,9 @@ describe('TelegramPoller — offset-after-handler', () => {
 
     await poller.pollOnce();
 
-    const offsetFile = join(stateDir, '.telegram-offset');
-    if (existsSync(offsetFile)) {
-      const persisted = readFileSync(offsetFile, 'utf-8').trim();
-      expect(persisted).toBe('0');
-    }
+    const persisted = readFileSync(join(stateDir, '.telegram-offset'), 'utf-8').trim();
+    expect(persisted).toBe('601');
+    expect(poller.getDeliveryHealth().counts.retryable).toBe(1);
   });
 
   it('does not convert an intentional stop during an in-flight Conflict into a restartable conflict exit', async () => {
@@ -240,5 +243,61 @@ describe('TelegramPoller — offset-after-handler', () => {
 
     await expect(running).resolves.toBeUndefined();
     expect(poller.lastExitReason).toBe('stopped-externally');
+  });
+
+  it('awaits asynchronous handlers before pollOnce resolves', async () => {
+    const { api } = makeStubApi([makeMessageUpdate(700, 'await me')]);
+    const poller = new TelegramPoller(api, stateDir);
+    let release: (() => void) | undefined;
+    let settled = false;
+
+    poller.onMessage(async () => {
+      await new Promise<void>((resolve) => { release = resolve; });
+    });
+    const polling = poller.pollOnce().then(() => { settled = true; });
+
+    await vi.waitFor(() => expect(release).toBeTypeOf('function'));
+    expect(settled).toBe(false);
+    release?.();
+    await polling;
+    expect(settled).toBe(true);
+  });
+
+  it('delivers identical text from distinct update IDs as distinct deliveries', async () => {
+    const { api } = makeStubApi([
+      makeMessageUpdate(800, 'same text'),
+      makeMessageUpdate(801, 'same text'),
+    ]);
+    const poller = new TelegramPoller(api, stateDir);
+    const deliveryIds: string[] = [];
+
+    poller.onMessage((_msg, delivery) => {
+      deliveryIds.push(delivery.deliveryId);
+      poller.markDeliveryAccepted(delivery.deliveryId);
+    });
+    await poller.pollOnce();
+
+    expect(deliveryIds).toHaveLength(2);
+    expect(new Set(deliveryIds).size).toBe(2);
+    expect(poller.getDeliveryHealth().counts.accepted).toBe(2);
+  });
+
+  it('fences offset and journal writes when stopped during getUpdates', async () => {
+    let resolvePoll: ((result: { result: TelegramUpdate[] }) => void) | undefined;
+    const api = {
+      getUpdates: vi.fn(() => new Promise<{ result: TelegramUpdate[] }>((resolve) => {
+        resolvePoll = resolve;
+      })),
+    } as unknown as TelegramAPI;
+    const poller = new TelegramPoller(api, stateDir);
+
+    const running = poller.start();
+    await vi.waitFor(() => expect(api.getUpdates).toHaveBeenCalled());
+    poller.stop();
+    resolvePoll?.({ result: [makeMessageUpdate(900, 'too late')] });
+    await running;
+
+    expect(existsSync(join(stateDir, '.telegram-offset'))).toBe(false);
+    expect(poller.getDeliveryHealth().total).toBe(0);
   });
 });

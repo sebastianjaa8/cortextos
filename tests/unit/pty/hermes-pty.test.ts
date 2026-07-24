@@ -28,7 +28,7 @@ vi.mock('node-pty', () => ({
   }),
 }));
 
-const { hermesDbExists, HermesPTY } = await import('../../../src/pty/hermes-pty.js');
+const { hermesDbExists, resolveHermesBinary, HermesPTY } = await import('../../../src/pty/hermes-pty.js');
 
 const mockEnv = {
   instanceId: 'test',
@@ -74,7 +74,14 @@ describe('HermesPTY', () => {
   it('getBinaryName returns "hermes"', () => {
     const pty = new HermesPTY(mockEnv, {});
     // Access protected method via cast
-    expect((pty as unknown as { getBinaryName(): string }).getBinaryName()).toBe('hermes');
+    expect((pty as unknown as { getBinaryName(): string }).getBinaryName())
+      .toBe(process.platform === 'win32' ? 'hermes.exe' : 'hermes');
+  });
+
+  it('resolves a Windows Hermes executable from PATH directories', () => {
+    if (process.platform !== 'win32') return;
+    fsMocks.existsSync.mockImplementation((p: string) => p === join('C:\\tools', 'hermes.exe'));
+    expect(resolveHermesBinary('C:\\missing;C:\\tools')).toBe(join('C:\\tools', 'hermes.exe'));
   });
 
   it('buildClaudeArgs returns [] for fresh mode', () => {

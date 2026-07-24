@@ -156,10 +156,9 @@ describe('CodexAppServerPTY socket path policy', () => {
     expect(socketPath.replace(/\\/g, '/')).toMatch(/\/cas-[a-f0-9]{8}\.sock$/);
     expect((pty as unknown as { _socketListenArg: string })._socketListenArg).toMatch(/^unix:\/\/\.\/cas-[a-f0-9]{8}\.sock$/);
     expect((pty as unknown as { _socketCwd: string })._socketCwd).toBe('/tmp');
-    expect(fsMocks.writeFileSync).toHaveBeenCalledWith(
+    expect(atomicWriteSyncMock).toHaveBeenCalledWith(
       expect.stringContaining('codex-app-server-socket.json'),
       expect.stringContaining('"fallback": true'),
-      'utf-8',
     );
   });
 });
@@ -221,6 +220,42 @@ describe('CodexAppServerPTY command mapping', () => {
     };
     return pty;
   }
+
+  it('accepts a delivery only after turn/start succeeds', async () => {
+    requestMock.mockResolvedValue({ result: {} });
+    const pty = makeReadyPty();
+    const onAccepted = vi.fn();
+    const onFailed = vi.fn();
+
+    pty.injectMessage('durable turn', { onAccepted, onFailed });
+    expect(onAccepted).not.toHaveBeenCalled();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(requestMock).toHaveBeenCalledWith('turn/start', expect.objectContaining({
+      threadId: 'thread-1',
+      input: [{ type: 'text', text: 'durable turn', text_elements: [] }],
+    }));
+    expect(onAccepted).toHaveBeenCalledTimes(1);
+    expect(onFailed).not.toHaveBeenCalled();
+  });
+
+  it('fails a rejected queued turn and continues draining later deliveries', async () => {
+    requestMock
+      .mockRejectedValueOnce(new Error('turn rejected'))
+      .mockResolvedValue({ result: {} });
+    const pty = makeReadyPty();
+    const firstFailed = vi.fn();
+    const secondAccepted = vi.fn();
+
+    pty.injectMessage('first', { onFailed: firstFailed });
+    pty.injectMessage('second', { onAccepted: secondAccepted });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(firstFailed).toHaveBeenCalledWith(expect.objectContaining({ message: 'turn rejected' }));
+    expect(requestMock.mock.calls.filter(([method]) => method === 'turn/start')).toHaveLength(2);
+    expect(secondAccepted).toHaveBeenCalledTimes(1);
+  });
 
   it('maps /goal to thread/goal/get', async () => {
     requestMock.mockResolvedValue({ result: { goal: null } });
@@ -594,9 +629,10 @@ describe('CodexAppServerPTY mid-turn steer', () => {
     const pty = new CodexAppServerPTY(mockEnv, {});
     (pty as unknown as { _alive: boolean })._alive = true;
     (pty as unknown as { _threadId: string })._threadId = 'thread-1';
-    (pty as unknown as { _rpc: { request: typeof requestMock; respondError: typeof respondErrorMock } })._rpc = {
+    (pty as unknown as { _rpc: { request: typeof requestMock; respondError: typeof respondErrorMock; close: () => void } })._rpc = {
       request: requestMock,
       respondError: respondErrorMock,
+      close: vi.fn(),
     };
     return pty;
   }
@@ -679,6 +715,28 @@ describe('CodexAppServerPTY mid-turn steer', () => {
       input: [{ type: 'text', text: 'steer me', text_elements: [] }],
     });
     rpc(pty).handleRpcMessage({ method: 'turn/completed', params: {} });
+  });
+
+  it('fails an in-flight steer rejected after runtime exit instead of requeueing it', async () => {
+    let rejectSteer!: (error: Error) => void;
+    requestMock.mockImplementation((method: string) => {
+      if (method === 'turn/steer') {
+        return new Promise((_resolve, reject) => { rejectSteer = reject; });
+      }
+      return Promise.resolve({ result: {} });
+    });
+    const pty = makeReadyPty();
+    await startExecutingTurn(pty);
+    const onFailed = vi.fn();
+
+    pty.injectMessage('late steer', { onFailed });
+    await Promise.resolve();
+    pty.kill();
+    rejectSteer(new Error('runtime disconnected'));
+    await flush();
+
+    expect(onFailed).toHaveBeenCalledWith(expect.objectContaining({ message: 'runtime disconnected' }));
+    expect(callsTo('turn/start')).toHaveLength(1);
   });
 
   it('preserves ordering across multiple rejected steers', async () => {
@@ -1080,18 +1138,20 @@ describe('CodexAppServerPTY thread lifecycle', () => {
       experimentalRawEvents: false,
       persistExtendedHistory: true,
     });
-    expect(fsMocks.writeFileSync).toHaveBeenCalledWith(
+    expect(atomicWriteSyncMock).toHaveBeenCalledWith(
       expect.stringContaining('codex-app-server-thread.json'),
       expect.stringContaining('"threadId": "fresh-thread"'),
-      'utf-8',
     );
   });
 
   it('resumes the persisted thread in continue mode', async () => {
     fsMocks.existsSync.mockReturnValue(true);
     fsMocks.readFileSync.mockReturnValue(JSON.stringify({
+      version: 1,
       threadId: 'persisted-thread',
       cwd: '/tmp/fw/orgs/acme/agents/codex-app-agent',
+      instanceId: 'test',
+      agentName: 'codex-app-agent',
       updatedAt: '2026-05-07T00:00:00Z',
     }));
     requestMock.mockResolvedValue({ result: { thread: { id: 'persisted-thread' } } });
@@ -1138,11 +1198,31 @@ describe('CodexAppServerPTY thread lifecycle', () => {
       'thread/resume',
       expect.anything(),
     );
-    expect(fsMocks.writeFileSync).toHaveBeenCalledWith(
+    expect(atomicWriteSyncMock).toHaveBeenCalledWith(
       expect.stringContaining('codex-app-server-thread.json'),
       expect.stringContaining('"threadId": "new-fresh-thread"'),
-      'utf-8',
     );
+  });
+
+  it('never attaches the latest same-cwd thread when ownership metadata is missing', async () => {
+    fsMocks.existsSync.mockReturnValue(true);
+    fsMocks.readFileSync.mockReturnValue(JSON.stringify({
+      threadId: 'unowned-thread',
+      cwd: '/tmp/fw/orgs/acme/agents/codex-app-agent',
+      updatedAt: '2026-05-07T00:00:00Z',
+    }));
+    requestMock.mockResolvedValue({ result: { thread: { id: 'owned-new-thread' } } });
+    const pty = new CodexAppServerPTY(mockEnv, {});
+    (pty as unknown as { _rpc: { request: typeof requestMock } })._rpc = { request: requestMock };
+
+    await (pty as unknown as { startOrResumeThread(mode: 'fresh' | 'continue'): Promise<void> }).startOrResumeThread('continue');
+
+    expect(requestMock).toHaveBeenCalledTimes(1);
+    expect(requestMock).toHaveBeenCalledWith('thread/start', expect.objectContaining({
+      cwd: '/tmp/fw/orgs/acme/agents/codex-app-agent',
+    }));
+    expect(requestMock).not.toHaveBeenCalledWith('thread/list', expect.anything());
+    expect(requestMock).not.toHaveBeenCalledWith('thread/resume', expect.anything());
   });
 });
 

@@ -5,8 +5,9 @@ import { spawnSync } from 'child_process';
 import { join } from 'path';
 import { homedir } from 'os';
 import { ensureDir } from '../utils/atomic.js';
-import { acquireLock, releaseLock, touchLock } from '../utils/lock.js';
+import { acquireLock, releaseLock, touchLock, type LockMutationResult } from '../utils/lock.js';
 import { stripBom } from '../utils/strip-bom.js';
+import { reconcileRuntimeProcesses } from '../utils/process-ownership.js';
 
 // Each fast-checker registers a process-level SIGUSR1 handler (see
 // fast-checker.ts:102). With >10 active agents the default Node listener cap
@@ -169,13 +170,35 @@ function sendCrashLoopAlertBestEffort(
     `Last error: ${errStr.slice(0, 500)}\n` +
     `Next alert in 30 min if the pattern continues.`;
   try {
-    const r = spawnSync('curl', [
-      '-s', '--max-time', '3',
-      '-X', 'POST',
-      `https://api.telegram.org/bot${creds.botToken}/sendMessage`,
-      '-d', `chat_id=${creds.chatId}`,
-      '--data-urlencode', `text=${message}`,
-    ], { timeout: TELEGRAM_SEND_TIMEOUT_MS, stdio: 'pipe' });
+    // Secrets are passed over stdin, never argv. Command lines are readable by
+    // same-host process inventory and were previously exposing the bot token.
+    const sender = `
+const https = require('https');
+let raw = '';
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', chunk => { raw += chunk; });
+process.stdin.on('end', () => {
+  const input = JSON.parse(raw);
+  const body = new URLSearchParams({ chat_id: input.chatId, text: input.message }).toString();
+  const req = https.request({
+    hostname: 'api.telegram.org',
+    path: '/bot' + input.botToken + '/sendMessage',
+    method: 'POST',
+    headers: { 'content-type': 'application/x-www-form-urlencoded', 'content-length': Buffer.byteLength(body) },
+  }, response => {
+    response.resume();
+    response.on('end', () => process.exit(response.statusCode >= 200 && response.statusCode < 300 ? 0 : 1));
+  });
+  req.setTimeout(3000, () => req.destroy(new Error('timeout')));
+  req.on('error', () => process.exit(1));
+  req.end(body);
+});`;
+    const r = spawnSync(process.execPath, ['-e', sender], {
+      input: JSON.stringify({ ...creds, message }),
+      timeout: TELEGRAM_SEND_TIMEOUT_MS,
+      stdio: ['pipe', 'pipe', 'pipe'],
+      windowsHide: true,
+    });
     if (r.status === 0) {
       console.error('[daemon] Crash-loop alert sent to operator chat');
       return true;
@@ -235,8 +258,12 @@ export function acquireDaemonInstanceLock(ctxRoot: string): boolean {
   return acquireLock(lockRoot, { staleAfterMs: DAEMON_LOCK_STALE_MS });
 }
 
-export function releaseDaemonInstanceLock(ctxRoot: string): void {
-  releaseLock(join(ctxRoot, '.daemon-instance'));
+export function releaseDaemonInstanceLock(ctxRoot: string): LockMutationResult {
+  return releaseLock(join(ctxRoot, '.daemon-instance'));
+}
+
+export function isPm2ShutdownMessage(message: unknown): boolean {
+  return message === 'shutdown';
 }
 
 class Daemon {
@@ -275,14 +302,73 @@ class Daemon {
       throw new Error(`Another cortextOS daemon is already running for instance "${this.instanceId}"`);
     }
     this.lockHeld = true;
-    this.lockHeartbeat = setInterval(
-      () => touchLock(join(this.ctxRoot, '.daemon-instance')),
-      DAEMON_LOCK_HEARTBEAT_MS,
-    );
+    let lockLossHandled = false;
+    this.lockHeartbeat = setInterval(() => {
+      const result = touchLock(join(this.ctxRoot, '.daemon-instance'));
+      if (result.status === 'ok') return;
+      if (result.status === 'busy') {
+        console.warn('[daemon] Lock heartbeat deferred because the lock guard is busy');
+        return;
+      }
+      if (lockLossHandled) return;
+      lockLossHandled = true;
+      this.lockHeld = false;
+      handleFatal(
+        'uncaughtException',
+        new Error(`Daemon instance-lock ownership lost (${result.status}); terminating to prevent split-brain`),
+        this.ctxRoot,
+        frameworkRoot,
+        true,
+      );
+    }, DAEMON_LOCK_HEARTBEAT_MS);
     this.lockHeartbeat.unref();
+    const pidFile = join(this.ctxRoot, 'daemon.pid');
+    let exitCleanupRan = false;
+    const cleanupForExit = () => {
+      if (exitCleanupRan) return;
+      exitCleanupRan = true;
+      if (this.lockHeartbeat) {
+        clearInterval(this.lockHeartbeat);
+        this.lockHeartbeat = null;
+      }
+      try {
+        if (this.ipcServer) this.ipcServer.stop();
+      } catch (err) {
+        console.error('[daemon] Failed to stop IPC during exit cleanup:', err);
+      }
+      try {
+        this.agentManager?.forceStopAll();
+      } catch (err) {
+        console.error('[daemon] Failed to stop owned processes during exit cleanup:', err);
+      }
+      try {
+        const { unlinkSync } = require('fs');
+        unlinkSync(pidFile);
+      } catch { /* ignore */ }
+      // The instance lock is the lifecycle fence: release it only after every
+      // owned process tree and control-plane endpoint has been torn down.
+      if (this.lockHeld) {
+        releaseDaemonInstanceLock(this.ctxRoot);
+        this.lockHeld = false;
+      }
+    };
+    // Registered immediately after acquisition so startup failures reconcile
+    // through the same ordered path as fatal runtime exits.
+    process.once('exit', cleanupForExit);
+
+    const reconciliation = reconcileRuntimeProcesses(this.ctxRoot, this.instanceId);
+    for (const outcome of reconciliation) {
+      const pid = outcome.pid ? ` pid=${outcome.pid}` : '';
+      console.log(`[daemon] Process reconciliation ${outcome.status}: agent=${outcome.agentName}${pid} ${outcome.detail}`);
+    }
+    const failedReconciliation = reconciliation.filter(outcome => outcome.status === 'failed');
+    if (failedReconciliation.length > 0) {
+      throw new Error(
+        `Refusing to start: ${failedReconciliation.length} prior agent process tree(s) could not be terminated`,
+      );
+    }
 
     // Write PID file
-    const pidFile = join(this.ctxRoot, 'daemon.pid');
     writeFileSync(pidFile, String(process.pid), 'utf-8');
     if (process.platform !== 'win32') {
       try {
@@ -294,17 +380,25 @@ class Daemon {
     this.agentManager = new AgentManager(this.instanceId, this.ctxRoot, frameworkRoot, org);
 
     // Start IPC server
-    this.ipcServer = new IPCServer(this.agentManager, this.instanceId);
+    this.ipcServer = new IPCServer(this.agentManager, this.instanceId, this.ctxRoot);
     await this.ipcServer.start();
 
     // Discover and start agents
     await this.agentManager.discoverAndStart();
+
+    // PM2 wait_ready contract: IPC is bound and discovery has completed.
+    process.send?.('ready');
 
     console.log(`[daemon] Running (pid: ${process.pid})`);
 
     // Handle shutdown signals
     const shutdown = async () => {
       console.log('[daemon] Shutting down...');
+      // Quiesce the control plane before the manager sets its shutdown latch;
+      // no new lifecycle or injection request may enter during teardown.
+      if (this.ipcServer) {
+        this.ipcServer.stop();
+      }
       try {
         if (this.agentManager) {
           await this.agentManager.stopAll();
@@ -312,22 +406,7 @@ class Daemon {
       } catch (err) {
         console.error('[daemon] Error during shutdown:', err);
       }
-      if (this.ipcServer) {
-        this.ipcServer.stop();
-      }
-      // Clean up PID file
-      try {
-        const { unlinkSync } = require('fs');
-        unlinkSync(pidFile);
-      } catch { /* ignore */ }
-      if (this.lockHeartbeat) {
-        clearInterval(this.lockHeartbeat);
-        this.lockHeartbeat = null;
-      }
-      if (this.lockHeld) {
-        releaseDaemonInstanceLock(this.ctxRoot);
-        this.lockHeld = false;
-      }
+      cleanupForExit();
       process.exit(0);
     };
 
@@ -349,19 +428,23 @@ class Daemon {
 
     process.on('SIGINT', handleSignal);
     process.on('SIGTERM', handleSignal);
+    process.on('message', (message) => {
+      if (!isPm2ShutdownMessage(message)) return;
+      console.log('[daemon] PM2 requested graceful shutdown');
+      handleSignal();
+    });
 
     // Global fatal-error handlers. uncaughtException exits for PM2 respawn.
-    // unhandledRejection logs + records but does not exit (rejected promises
-    // shouldn't be fatal by default; matches Node 15+ behavior without
-    // adopting the new strict default). Both paths write .daemon-crashed
-    // markers and increment the crash-loop counter.
+    // Both paths exit through PM2 recovery. Continuing after an unhandled
+    // rejection can leave registry, poller, and PTY state partially mutated.
+    // The synchronous exit hook below force-stops every owned process tree.
     const ctxRootForHandler = this.ctxRoot;
     const frameworkRootForHandler = frameworkRoot;
     process.on('uncaughtException', (err) => {
       handleFatal('uncaughtException', err, ctxRootForHandler, frameworkRootForHandler, true);
     });
     process.on('unhandledRejection', (reason) => {
-      handleFatal('unhandledRejection', reason, ctxRootForHandler, frameworkRootForHandler, false);
+      handleFatal('unhandledRejection', reason, ctxRootForHandler, frameworkRootForHandler, true);
     });
     console.log('[daemon] Fatal-error handlers registered (uncaughtException + unhandledRejection)');
 
@@ -376,20 +459,6 @@ class Daemon {
       console.log('[daemon] SIGUSR2 crash trigger ENABLED (debug mode)');
     }
 
-    // Fallback cleanup on exit (belt-and-suspenders for Windows)
-    process.on('exit', () => {
-      if (this.ipcServer) {
-        this.ipcServer.stop();
-      }
-      try {
-        const { unlinkSync } = require('fs');
-        unlinkSync(pidFile);
-      } catch { /* ignore */ }
-      if (this.lockHeld) {
-        releaseDaemonInstanceLock(this.ctxRoot);
-        this.lockHeld = false;
-      }
-    });
   }
 }
 
@@ -426,7 +495,8 @@ if (require.main === module) {
         const detail = isLockConflict
           ? `Duplicate-daemon lock conflict: PM2 keeps respawning a daemon that dies against the instance lock held by pid ${readPidBestEffort(ctxRoot)}. ` +
             `The fleet may still be running under that orphaned daemon, but PM2 no longer manages it. ` +
-            `Fix: pm2 stop cortextos-daemon, kill the orphan pid (and its process tree), then pm2 start.`
+            `Run the health script, stop the PM2 competitor loop, drain the orphan with cortextos stop --all, ` +
+            `terminate only the exact daemon.pid owner, then run cortextos start --instance ${instanceId}.`
           : errStr;
         if (sendCrashLoopAlertBestEffort(frameworkRoot, recent, detail)) {
           history.lastAlertAt = new Date().toISOString();

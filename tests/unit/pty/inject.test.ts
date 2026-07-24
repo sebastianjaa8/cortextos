@@ -213,6 +213,40 @@ describe('injectMessage — verified submit (Enter retry)', () => {
     expect(onFailed).not.toHaveBeenCalled();
   });
 
+  it('fires onAccepted only after PTY output proves the turn started', () => {
+    const write = () => { /* ok */ };
+    let outputBytes = 0;
+    const onAccepted = vi.fn();
+    const onFailed = vi.fn();
+
+    injectMessage(write, 'msg', 300, {
+      getOutputBytes: () => outputBytes,
+      onAccepted,
+      onFailed,
+    });
+    vi.advanceTimersByTime(300);
+    expect(onAccepted).not.toHaveBeenCalled();
+    outputBytes += 5000;
+    vi.advanceTimersByTime(4000);
+    expect(onAccepted).toHaveBeenCalledTimes(1);
+    expect(onFailed).not.toHaveBeenCalled();
+  });
+
+  it('fires onSubmitted at the Enter write without treating unrelated output as delivery proof', () => {
+    const writes: string[] = [];
+    const onSubmitted = vi.fn();
+    const onAccepted = vi.fn();
+
+    injectMessage((data) => writes.push(data), 'msg', 300, { onSubmitted, onAccepted });
+    vi.advanceTimersByTime(299);
+    expect(onSubmitted).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1);
+
+    expect(writes.at(-1)).toBe(KEYS.ENTER);
+    expect(onSubmitted).toHaveBeenCalledTimes(1);
+    expect(onAccepted).not.toHaveBeenCalled();
+  });
+
   it('scales the default enterDelay with content size', () => {
     const writes: string[] = [];
     const write = (data: string) => { writes.push(data); };
