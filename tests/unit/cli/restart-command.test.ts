@@ -8,7 +8,7 @@
 import { readFileSync } from 'fs';
 import { join } from 'path';
 import { describe, it, expect } from 'vitest';
-import { exactProcessGenerationIsGone, restartCommand } from '../../../src/cli/restart';
+import { DAEMON_STOP_TIMEOUT_MS, exactProcessGenerationIsGone, restartCommand } from '../../../src/cli/restart';
 import { inspectProcessIdentity } from '../../../src/utils/process-ownership';
 
 describe('issue #328: cortextos restart <agent>', () => {
@@ -32,6 +32,10 @@ describe('issue #328: cortextos restart <agent>', () => {
 
   it('exposes the Windows-safe daemon restart mode', () => {
     expect(restartCommand.options.some(option => option.long === '--daemon')).toBe(true);
+  });
+
+  it('waits longer than the configured 60-second PM2 kill timeout', () => {
+    expect(DAEMON_STOP_TIMEOUT_MS).toBeGreaterThan(60_000);
   });
 
   it('warns operators away from direct PM2 restart', () => {

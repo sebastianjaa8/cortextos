@@ -15,6 +15,7 @@ import {
 } from '../utils/process-ownership.js';
 
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+export const DAEMON_STOP_TIMEOUT_MS = 75_000;
 
 export function exactProcessGenerationIsGone(expected: ProcessIdentity): boolean {
   const probe = probeProcessIdentity(expected.pid);
@@ -81,7 +82,7 @@ async function restartDaemon(instance: string): Promise<void> {
     const ipcStopped = !(await new IPCClient(instance).isDaemonRunning());
     const exactOldGenerationGone = exactProcessGenerationIsGone(oldIdentity);
     return pm2Stopped && ipcStopped && exactOldGenerationGone;
-  }, 45_000);
+  }, DAEMON_STOP_TIMEOUT_MS);
   if (!stopped) {
     throw new Error(`Daemon ${oldPid || 'unknown'} did not fully stop; refusing to start a competing generation`);
   }
