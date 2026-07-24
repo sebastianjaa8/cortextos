@@ -1,8 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync } from 'fs';
+import { mkdtempSync, rmSync, utimesSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { acquireLock, releaseLock } from '../../../src/utils/lock';
+import { acquireLock, releaseLock, touchLock } from '../../../src/utils/lock';
 
 describe('mkdir-based locking', () => {
   let testDir: string;
@@ -35,5 +35,37 @@ describe('mkdir-based locking', () => {
     releaseLock(testDir);
     expect(acquireLock(testDir)).toBe(true);
     releaseLock(testDir);
+  });
+
+  describe('staleAfterMs heartbeat reclaim', () => {
+    it('reclaims a lock whose PID is alive but heartbeat is stale', () => {
+      expect(acquireLock(testDir)).toBe(true);
+      // Backdate the pid file's mtime to simulate a holder whose PID got
+      // reused by an unrelated process (our own PID passes the liveness
+      // check, but a real holder would have touched it recently).
+      const pidFile = join(testDir, '.lock.d', 'pid');
+      const old = new Date(Date.now() - 200_000);
+      utimesSync(pidFile, old, old);
+
+      expect(acquireLock(testDir, { staleAfterMs: 90_000 })).toBe(true);
+      releaseLock(testDir);
+    });
+
+    it('does not reclaim a lock whose heartbeat is fresh', () => {
+      expect(acquireLock(testDir)).toBe(true);
+      touchLock(testDir);
+      expect(acquireLock(testDir, { staleAfterMs: 90_000 })).toBe(false);
+      releaseLock(testDir);
+    });
+
+    it('leaves default (no staleAfterMs) behavior unaffected by an old mtime', () => {
+      expect(acquireLock(testDir)).toBe(true);
+      const pidFile = join(testDir, '.lock.d', 'pid');
+      const old = new Date(Date.now() - 200_000);
+      utimesSync(pidFile, old, old);
+
+      expect(acquireLock(testDir)).toBe(false);
+      releaseLock(testDir);
+    });
   });
 });

@@ -5,7 +5,7 @@ import { spawnSync } from 'child_process';
 import { join } from 'path';
 import { homedir } from 'os';
 import { ensureDir } from '../utils/atomic.js';
-import { acquireLock, releaseLock } from '../utils/lock.js';
+import { acquireLock, releaseLock, touchLock } from '../utils/lock.js';
 import { stripBom } from '../utils/strip-bom.js';
 
 // Each fast-checker registers a process-level SIGUSR1 handler (see
@@ -222,10 +222,17 @@ function handleFatal(
  * cortextOS Daemon - single process managing all agents.
  * Run via `pm2 start ecosystem.config.js` or `cortextos ecosystem && pm2 start`.
  */
+// Heartbeat cadence for the daemon-instance lock (see AcquireLockOptions.
+// staleAfterMs in lock.ts for why this exists). 3x margin between touch and
+// stale threshold tolerates a slow tick without a live daemon losing its own
+// lock.
+const DAEMON_LOCK_HEARTBEAT_MS = 30_000;
+const DAEMON_LOCK_STALE_MS = 90_000;
+
 export function acquireDaemonInstanceLock(ctxRoot: string): boolean {
   const lockRoot = join(ctxRoot, '.daemon-instance');
   ensureDir(lockRoot);
-  return acquireLock(lockRoot);
+  return acquireLock(lockRoot, { staleAfterMs: DAEMON_LOCK_STALE_MS });
 }
 
 export function releaseDaemonInstanceLock(ctxRoot: string): void {
@@ -238,6 +245,7 @@ class Daemon {
   private instanceId: string;
   private ctxRoot: string;
   private lockHeld = false;
+  private lockHeartbeat: NodeJS.Timeout | null = null;
 
   constructor() {
     this.instanceId = process.env.CTX_INSTANCE_ID || 'default';
@@ -267,6 +275,11 @@ class Daemon {
       throw new Error(`Another cortextOS daemon is already running for instance "${this.instanceId}"`);
     }
     this.lockHeld = true;
+    this.lockHeartbeat = setInterval(
+      () => touchLock(join(this.ctxRoot, '.daemon-instance')),
+      DAEMON_LOCK_HEARTBEAT_MS,
+    );
+    this.lockHeartbeat.unref();
 
     // Write PID file
     const pidFile = join(this.ctxRoot, 'daemon.pid');
@@ -307,6 +320,10 @@ class Daemon {
         const { unlinkSync } = require('fs');
         unlinkSync(pidFile);
       } catch { /* ignore */ }
+      if (this.lockHeartbeat) {
+        clearInterval(this.lockHeartbeat);
+        this.lockHeartbeat = null;
+      }
       if (this.lockHeld) {
         releaseDaemonInstanceLock(this.ctxRoot);
         this.lockHeld = false;

@@ -1,5 +1,21 @@
-import { mkdirSync, rmdirSync, writeFileSync, readFileSync, rmSync } from 'fs';
+import { mkdirSync, rmdirSync, writeFileSync, readFileSync, rmSync, statSync } from 'fs';
 import { join } from 'path';
+
+export interface AcquireLockOptions {
+  /**
+   * If set, a lock whose holder PID passes the liveness check is still
+   * reclaimed once its pid-file mtime is older than this. Guards against a
+   * holder's PID getting silently reused by an unrelated process — under
+   * cortextOS's process churn (dozens of short-lived agent/MCP node.exe on
+   * Windows) that reuse can happen within seconds of the real holder dying,
+   * which permanently fools a plain `process.kill(pid, 0)` check (2026-07-01
+   * and 2026-07-23 daemon-instance lock incidents: PM2 crash-looped on
+   * "Another daemon already running" until someone manually cleared it).
+   * Callers that hold the lock for a long time must pair this with periodic
+   * `touchLock()` calls so a healthy holder's mtime never goes stale.
+   */
+  staleAfterMs?: number;
+}
 
 /**
  * Acquire a mutex lock using mkdir (atomic on all filesystems).
@@ -8,7 +24,7 @@ import { join } from 'path';
  * Returns true if lock acquired, false if another process holds it.
  * Automatically recovers stale locks (dead process).
  */
-export function acquireLock(dir: string): boolean {
+export function acquireLock(dir: string, opts: AcquireLockOptions = {}): boolean {
   const lockDir = join(dir, '.lock.d');
   const pidFile = join(lockDir, 'pid');
 
@@ -50,6 +66,15 @@ export function acquireLock(dir: string): boolean {
     // Check if process is still alive
     try {
       process.kill(storedPid, 0);
+      // PID exists, but that alone doesn't prove it's still our holder — see
+      // AcquireLockOptions.staleAfterMs. A holder that's still genuinely
+      // running must be touching the pid file more often than this window.
+      if (opts.staleAfterMs !== undefined) {
+        const ageMs = Date.now() - statSync(pidFile).mtimeMs;
+        if (ageMs > opts.staleAfterMs) {
+          throw new Error('stale-heartbeat');
+        }
+      }
       // Process is alive - lock is held
       return false;
     } catch {
@@ -65,6 +90,19 @@ export function acquireLock(dir: string): boolean {
       }
     }
   }
+}
+
+/**
+ * Refresh a held lock's heartbeat mtime. Call periodically from whatever
+ * process holds a long-lived lock acquired with `staleAfterMs` set, or
+ * another process will eventually reclaim it out from under you.
+ * Best-effort: silently no-ops if the lock isn't held (nothing to touch).
+ */
+export function touchLock(dir: string): void {
+  const pidFile = join(join(dir, '.lock.d'), 'pid');
+  try {
+    writeFileSync(pidFile, String(process.pid));
+  } catch { /* not holding the lock (anymore) — nothing to refresh */ }
 }
 
 /**
