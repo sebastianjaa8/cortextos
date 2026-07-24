@@ -112,7 +112,19 @@ describe('CodexExecPTY', () => {
 
     expect(childProcessMocks.spawn).toHaveBeenCalledWith(
       'codex',
-      ['exec', '--skip-git-repo-check', '--model', 'gpt-5.5', '-'],
+      [
+        '-c',
+        'approval_policy="never"',
+        '--sandbox',
+        'workspace-write',
+        '--add-dir',
+        mockEnv.ctxRoot,
+        'exec',
+        '--skip-git-repo-check',
+        '--model',
+        'gpt-5.5',
+        '-',
+      ],
       expect.objectContaining({
         cwd: mockEnv.agentDir,
         stdio: ['pipe', 'pipe', 'pipe'],
@@ -170,7 +182,21 @@ describe('CodexExecPTY', () => {
     expect(childProcessMocks.spawn).toHaveBeenNthCalledWith(
       1,
       'codex',
-      ['exec', 'resume', '--skip-git-repo-check', '--model', 'gpt-5.5', sessionId, '-'],
+      [
+        '-c',
+        'approval_policy="never"',
+        '--sandbox',
+        'workspace-write',
+        '--add-dir',
+        mockEnv.ctxRoot,
+        'exec',
+        'resume',
+        '--skip-git-repo-check',
+        '--model',
+        'gpt-5.5',
+        sessionId,
+        '-',
+      ],
       expect.any(Object),
     );
     expect(first.stdin.end).toHaveBeenCalledWith('boot prompt', expect.any(Function));
@@ -181,7 +207,21 @@ describe('CodexExecPTY', () => {
     expect(childProcessMocks.spawn).toHaveBeenNthCalledWith(
       2,
       'codex',
-      ['exec', 'resume', '--skip-git-repo-check', '--model', 'gpt-5.5', sessionId, '-'],
+      [
+        '-c',
+        'approval_policy="never"',
+        '--sandbox',
+        'workspace-write',
+        '--add-dir',
+        mockEnv.ctxRoot,
+        'exec',
+        'resume',
+        '--skip-git-repo-check',
+        '--model',
+        'gpt-5.5',
+        sessionId,
+        '-',
+      ],
       expect.any(Object),
     );
     expect(second.stdin.end).toHaveBeenCalledWith('queued prompt', expect.any(Function));
@@ -206,6 +246,20 @@ describe('CodexExecPTY', () => {
     expect(ownershipMocks.remove).toHaveBeenCalledWith(
       join(mockEnv.ctxRoot, 'state', mockEnv.agentName),
       'a'.repeat(64),
+    );
+  });
+
+  it('preserves explicit full-bypass mode without safe-mode overrides', async () => {
+    const child = makeMockChildProcess();
+    childProcessMocks.spawn.mockReturnValue(child);
+
+    const pty = new CodexExecPTY(mockEnv, { dangerously_skip_permissions: true });
+    await pty.spawn('fresh', 'hello');
+
+    expect(childProcessMocks.spawn).toHaveBeenCalledWith(
+      'codex',
+      ['exec', '--skip-git-repo-check', '--dangerously-bypass-approvals-and-sandbox', '-'],
+      expect.any(Object),
     );
   });
 

@@ -235,17 +235,27 @@ export class CodexExecPTY {
 
   private buildArgs(mode: ExecMode): string[] {
     const options = ['--skip-git-repo-check'];
+    const globalOptions: string[] = [];
     if (this._config.model) {
       options.push('--model', this._config.model);
     }
     if (this._config.dangerously_skip_permissions !== false) {
       options.push('--dangerously-bypass-approvals-and-sandbox');
+    } else {
+      globalOptions.push(
+        '-c',
+        'approval_policy="never"',
+        '--sandbox',
+        'workspace-write',
+        '--add-dir',
+        this._env.ctxRoot,
+      );
     }
 
     if (mode === 'continue' && this._sessionId) {
-      return ['exec', 'resume', ...options, this._sessionId, '-'];
+      return [...globalOptions, 'exec', 'resume', ...options, this._sessionId, '-'];
     }
-    return ['exec', ...options, '-'];
+    return [...globalOptions, 'exec', ...options, '-'];
   }
 
   private finishTurn(child: ChildProcess, exitCode: number, signal?: NodeJS.Signals): void {
