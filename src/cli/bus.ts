@@ -3,7 +3,7 @@ import { spawnSync, execFileSync } from 'child_process';
 import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { sendMessage, checkInbox, ackInbox } from '../bus/message.js';
-import { validateAgentName, validateTaskId } from '../utils/validate.js';
+import { validateAgentName, validateTaskId, validatePriority } from '../utils/validate.js';
 import { createTask, updateTask, completeTask, claimTask, readTaskAudit, checkTaskDependencies, compactTasks, listTasks, checkStaleTasks, archiveTasks, checkHumanTasks } from '../bus/task.js';
 import { saveOutput } from '../bus/save-output.js';
 import { logEvent } from '../bus/event.js';
@@ -158,6 +158,18 @@ busCommand
   .option('--blocked-by <ids>', 'Comma-separated task IDs that must complete before this task can progress')
   .option('--blocks <ids>', 'Comma-separated task IDs that this new task will block (symmetric reverse edge)')
   .action((title: string, opts: { desc?: string; assignee?: string; priority: string; project?: string; needsApproval?: boolean; blockedBy?: string; blocks?: string }) => {
+    // Validate at the CLI boundary, like update-task / log-event / send-message do.
+    // Without this the throw from createTask()'s validatePriority escaped to the top
+    // level and Node printed a raw stack trace. In a chain of create-task calls that
+    // buried which item failed, so later items looked silently dropped (07-18 incident:
+    // caused real duplicate-cleanup work). Reuses validatePriority rather than
+    // hardcoding a 4th copy of the valid list, so the options can't drift.
+    try {
+      validatePriority(opts.priority);
+    } catch (err) {
+      console.error((err as Error).message);
+      process.exit(1);
+    }
     const env = resolveEnv();
     const paths = resolvePaths(env.agentName, env.instanceId, env.org);
     const parseList = (raw?: string) => (raw ? raw.split(',').map(s => s.trim()).filter(Boolean) : []);
