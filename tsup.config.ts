@@ -4,6 +4,7 @@ export default defineConfig({
   entry: {
     cli: 'src/cli/index.ts',
     daemon: 'src/daemon/index.ts',
+    'daemon-restart-helper': 'src/daemon-restart-helper.ts',
     'hooks/hook-permission-telegram': 'src/hooks/hook-permission-telegram.ts',
     'hooks/hook-ask-telegram': 'src/hooks/hook-ask-telegram.ts',
     'hooks/hook-planmode-telegram': 'src/hooks/hook-planmode-telegram.ts',

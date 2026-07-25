@@ -9,10 +9,14 @@ import { readFileSync } from 'fs';
 import { join } from 'path';
 import { describe, it, expect } from 'vitest';
 import {
+  DAEMON_RESTART_TIMEOUT_MS,
   DAEMON_STOP_TIMEOUT_MS,
+  daemonRestartResultPath,
   exactProcessGenerationIsGone,
   pm2SupervisorSlotIsQuiescent,
+  quoteWindowsCommandLineArg,
   restartCommand,
+  windowsCimLauncherScript,
 } from '../../../src/cli/restart';
 import { inspectProcessIdentity } from '../../../src/utils/process-ownership';
 
@@ -41,6 +45,7 @@ describe('issue #328: cortextos restart <agent>', () => {
 
   it('waits longer than the configured 60-second PM2 kill timeout', () => {
     expect(DAEMON_STOP_TIMEOUT_MS).toBeGreaterThan(60_000);
+    expect(DAEMON_RESTART_TIMEOUT_MS).toBeGreaterThan(DAEMON_STOP_TIMEOUT_MS);
   });
 
   it('accepts PM2 waiting-restart only after the supervised PID is gone', () => {
@@ -81,5 +86,39 @@ describe('issue #328: cortextos restart <agent>', () => {
   it('fresh-registers the stopped daemon before starting the replacement', () => {
     const source = readFileSync(join(process.cwd(), 'src', 'cli', 'restart.ts'), 'utf-8');
     expect(source).toMatch(/runPm2\(\['stop', appName\][\s\S]*runPm2\(\['delete', appName\][\s\S]*runPm2\(\['start', ecosystemPath/);
+  });
+
+  it('delegates daemon restart coordination outside the daemon process tree', () => {
+    const source = readFileSync(join(process.cwd(), 'src', 'cli', 'restart.ts'), 'utf-8');
+    expect(source).toContain("join(projectRoot, 'dist', 'daemon-restart-helper.js')");
+    expect(source).toContain('Invoke-CimMethod -ClassName Win32_Process -MethodName Create');
+    expect(source).not.toMatch(/async function requestDaemonRestart[\s\S]*runPm2\(\['stop', appName\]/);
+  });
+
+  it('quotes Windows helper command arguments without losing trailing slashes or quotes', () => {
+    expect(quoteWindowsCommandLineArg('C:\\Program Files\\nodejs\\node.exe'))
+      .toBe('"C:\\Program Files\\nodejs\\node.exe"');
+    expect(quoteWindowsCommandLineArg('plain')).toBe('plain');
+    expect(quoteWindowsCommandLineArg('a"b')).toBe('"a\\"b"');
+    expect(quoteWindowsCommandLineArg('C:\\path with space\\'))
+      .toBe('"C:\\path with space\\\\"');
+  });
+
+  it('builds a CIM launcher that fails closed when process creation fails', () => {
+    const script = windowsCimLauncherScript('"C:\\Program Files\\node.exe" helper.js');
+    expect(script).toContain('Win32_Process');
+    expect(script).toContain('ReturnValue -ne 0');
+    expect(script).toContain('ProcessId');
+  });
+
+  it('uses a scoped durable result path and rejects malformed request IDs', () => {
+    expect(daemonRestartResultPath('default', '12345678-1234-1234-1234-123456789abc'))
+      .toContain(join('.cortextos', 'default', 'state', 'daemon-restarts'));
+    expect(() => daemonRestartResultPath('default', '..\\escape')).toThrow('Invalid daemon restart request ID');
+  });
+
+  it('builds the restart helper as a standalone entrypoint', () => {
+    const source = readFileSync(join(process.cwd(), 'tsup.config.ts'), 'utf-8');
+    expect(source).toContain("'daemon-restart-helper': 'src/daemon-restart-helper.ts'");
   });
 });

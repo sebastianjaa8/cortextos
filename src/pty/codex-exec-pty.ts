@@ -242,9 +242,11 @@ export class CodexExecPTY {
     if (this._config.dangerously_skip_permissions !== false) {
       options.push('--dangerously-bypass-approvals-and-sandbox');
     } else {
+      globalOptions.push('-c', 'approval_policy="never"');
+      if (process.platform === 'win32') {
+        globalOptions.push('-c', 'windows.sandbox="elevated"');
+      }
       globalOptions.push(
-        '-c',
-        'approval_policy="never"',
         '--sandbox',
         'workspace-write',
         '--add-dir',

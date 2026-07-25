@@ -115,6 +115,7 @@ describe('CodexExecPTY', () => {
       [
         '-c',
         'approval_policy="never"',
+        ...(process.platform === 'win32' ? ['-c', 'windows.sandbox="elevated"'] : []),
         '--sandbox',
         'workspace-write',
         '--add-dir',
@@ -185,6 +186,7 @@ describe('CodexExecPTY', () => {
       [
         '-c',
         'approval_policy="never"',
+        ...(process.platform === 'win32' ? ['-c', 'windows.sandbox="elevated"'] : []),
         '--sandbox',
         'workspace-write',
         '--add-dir',
@@ -210,6 +212,7 @@ describe('CodexExecPTY', () => {
       [
         '-c',
         'approval_policy="never"',
+        ...(process.platform === 'win32' ? ['-c', 'windows.sandbox="elevated"'] : []),
         '--sandbox',
         'workspace-write',
         '--add-dir',

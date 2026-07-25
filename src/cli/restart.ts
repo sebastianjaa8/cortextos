@@ -2,6 +2,8 @@ import { Command } from 'commander';
 import { existsSync, readFileSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
+import { randomUUID } from 'crypto';
+import { spawn, spawnSync } from 'child_process';
 import { IPCClient } from '../daemon/ipc-server.js';
 import { daemonAppName, resolveFrameworkRoot } from './ecosystem.js';
 import {
@@ -21,6 +23,37 @@ import {
 
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 export const DAEMON_STOP_TIMEOUT_MS = 75_000;
+export const DAEMON_RESTART_TIMEOUT_MS = 240_000;
+
+export interface DaemonRestartResult {
+  success: boolean;
+  requestId: string;
+  helperPid: number;
+  oldPid?: number;
+  newPid?: number;
+  completedAt: string;
+  error?: string;
+}
+
+export function daemonRestartResultPath(instance: string, requestId: string): string {
+  validateInstanceId(instance);
+  if (!/^[a-f0-9-]{36}$/.test(requestId)) throw new Error('Invalid daemon restart request ID');
+  return join(homedir(), '.cortextos', instance, 'state', 'daemon-restarts', `${requestId}.json`);
+}
+
+export function quoteWindowsCommandLineArg(value: string): string {
+  if (!/[\s"]/u.test(value)) return value;
+  return `"${value.replace(/(\\*)"/g, '$1$1\\"').replace(/(\\+)$/g, '$1$1')}"`;
+}
+
+export function windowsCimLauncherScript(commandLine: string): string {
+  const escaped = commandLine.replace(/'/g, "''");
+  return [
+    `$result = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = '${escaped}' }`,
+    `if ($result.ReturnValue -ne 0 -or -not $result.ProcessId) { throw "Win32_Process.Create failed: $($result.ReturnValue)" }`,
+    'Write-Output $result.ProcessId',
+  ].join('\n');
+}
 
 export function exactProcessGenerationIsGone(expected: ProcessIdentity): boolean {
   const probe = probeProcessIdentity(expected.pid);
@@ -43,7 +76,7 @@ async function waitUntil(predicate: () => boolean | Promise<boolean>, timeoutMs:
   return false;
 }
 
-async function restartDaemon(instance: string): Promise<void> {
+export async function performDaemonRestart(instance: string): Promise<{ oldPid: number; newPid: number }> {
   validateInstanceId(instance);
   const projectRoot = resolveFrameworkRoot();
   const ecosystemPath = join(projectRoot, 'ecosystem.config.js');
@@ -114,6 +147,89 @@ async function restartDaemon(instance: string): Promise<void> {
   if (!ready) throw new Error(`Daemon ${appName} did not become healthy after the safe restart`);
   runPm2(['save'], projectRoot, env);
   console.log(`Daemon restarted safely: ${appName}`);
+  const newPid = readPm2Processes(env).find(entry => entry.name === appName)?.pid;
+  if (!newPid) throw new Error(`Daemon ${appName} is healthy but PM2 did not publish its PID`);
+  return { oldPid, newPid };
+}
+
+function launchIndependentRestartHelper(
+  helperPath: string,
+  instance: string,
+  requestId: string,
+  projectRoot: string,
+): number {
+  const environment = Buffer.from(JSON.stringify({
+    PATH: process.env.PATH,
+    PATHEXT: process.env.PATHEXT,
+    PM2_HOME: process.env.PM2_HOME,
+    CTX_INSTANCE_ID: instance,
+    CTX_ROOT: process.env.CTX_ROOT,
+    CTX_FRAMEWORK_ROOT: projectRoot,
+    CTX_PROJECT_ROOT: projectRoot,
+    CTX_ORG: process.env.CTX_ORG,
+  }), 'utf8').toString('base64url');
+  const helperArgs = [
+    helperPath,
+    '--instance', instance,
+    '--request-id', requestId,
+    '--environment', environment,
+  ];
+  if (process.platform === 'win32') {
+    const commandLine = [process.execPath, ...helperArgs].map(quoteWindowsCommandLineArg).join(' ');
+    const encoded = Buffer.from(windowsCimLauncherScript(commandLine), 'utf16le').toString('base64');
+    const result = spawnSync(
+      'powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-EncodedCommand', encoded],
+      { encoding: 'utf-8', windowsHide: true, cwd: projectRoot },
+    );
+    if (result.error || result.status !== 0) {
+      throw new Error(`Could not launch independent restart helper: ${(result.stderr || result.error?.message || '').trim()}`);
+    }
+    const helperPid = Number.parseInt(result.stdout.trim().split(/\s+/).at(-1) ?? '', 10);
+    if (!Number.isSafeInteger(helperPid) || helperPid <= 0) {
+      throw new Error('Independent restart helper did not publish a valid PID');
+    }
+    return helperPid;
+  }
+
+  const child = spawn(process.execPath, helperArgs, {
+    cwd: projectRoot,
+    env: process.env,
+    detached: true,
+    stdio: 'ignore',
+  });
+  child.unref();
+  if (!child.pid) throw new Error('Independent restart helper did not publish a valid PID');
+  return child.pid;
+}
+
+async function requestDaemonRestart(instance: string): Promise<void> {
+  validateInstanceId(instance);
+  const projectRoot = resolveFrameworkRoot();
+  const helperPath = join(projectRoot, 'dist', 'daemon-restart-helper.js');
+  if (!existsSync(helperPath)) {
+    throw new Error(`Daemon restart helper missing: ${helperPath}. Run: npm run build`);
+  }
+
+  const requestId = randomUUID();
+  const resultPath = daemonRestartResultPath(instance, requestId);
+  const helperPid = launchIndependentRestartHelper(helperPath, instance, requestId, projectRoot);
+  console.log(`Daemon restart delegated to independent helper ${helperPid} (${requestId})`);
+
+  const completed = await waitUntil(() => existsSync(resultPath), DAEMON_RESTART_TIMEOUT_MS);
+  if (!completed) throw new Error(`Independent helper ${helperPid} did not report completion`);
+
+  let result: DaemonRestartResult;
+  try {
+    result = JSON.parse(readFileSync(resultPath, 'utf-8')) as DaemonRestartResult;
+  } catch {
+    throw new Error(`Independent helper ${helperPid} wrote an invalid result`);
+  }
+  if (result.requestId !== requestId || result.helperPid !== helperPid) {
+    throw new Error(`Independent helper ${helperPid} result identity did not match the request`);
+  }
+  if (!result.success) throw new Error(result.error || `Independent helper ${helperPid} failed`);
+  console.log(`Daemon restarted safely: ${result.oldPid} -> ${result.newPid}`);
 }
 
 export const restartCommand = new Command('restart')
@@ -129,7 +245,7 @@ export const restartCommand = new Command('restart')
         return;
       }
       try {
-        await restartDaemon(options.instance);
+        await requestDaemonRestart(options.instance);
       } catch (err) {
         console.error(`Daemon restart refused: ${(err as Error).message}`);
         process.exitCode = 1;
