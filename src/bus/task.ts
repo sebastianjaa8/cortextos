@@ -517,6 +517,64 @@ export function completeTask(
   }
 }
 
+/** How far back a duplicate counts as "the same dispatch retried". */
+export const DUPLICATE_WINDOW_MS = 10 * 60 * 1000;
+
+/** Open = still actionable. A completed/cancelled twin is history, not a duplicate. */
+const OPEN_STATUSES: TaskStatus[] = ['pending', 'in_progress', 'blocked'];
+
+/**
+ * Normalize a title for duplicate comparison: case- and punctuation-insensitive,
+ * whitespace-collapsed. Deliberately NOT fuzzy (no edit distance) — the failure
+ * this guards against is the same dispatch being sent twice, where titles are
+ * byte-identical or differ only in punctuation. Edit distance would buy
+ * false positives on legitimately similar task names ("Phase 3 plan" vs
+ * "Phase 4 plan") for no gain against the real case.
+ */
+export function normalizeTaskTitle(title: string): string {
+  return title.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+}
+
+/**
+ * Find an open task with the same normalized title, same assignee, created
+ * within `windowMs`. Returns one such task, or null.
+ *
+ * "Which one" is deliberately unspecified when several match. `created_at` is
+ * truncated to whole seconds, so duplicates from a fast retry burst carry
+ * identical timestamps and cannot be ordered by it. Any open twin proves the
+ * point the warning is making, so this does not parse the millisecond epoch out
+ * of the task id to break ties — that would be precision nobody consumes.
+ *
+ * Advisory only — callers warn and proceed. Blocking would be wrong: creating
+ * two genuinely similar tasks in one sitting is legitimate, and a hard block
+ * on a false positive is worse than the duplicate it prevents.
+ *
+ * Context: on 2026-07-18 a retry in the dispatch path re-sent several
+ * create-task calls, producing duplicate open tasks that cost real
+ * cleanup work before anyone noticed.
+ */
+export function findRecentDuplicate(
+  paths: BusPaths,
+  title: string,
+  assignee: string,
+  now: number = Date.now(),
+  windowMs: number = DUPLICATE_WINDOW_MS,
+): Task | null {
+  const target = normalizeTaskTitle(title);
+  if (!target) return null;
+
+  // listTasks returns created_at DESC — newest-first among tasks that differ by
+  // at least a second; same-second peers come back in arbitrary order.
+  for (const task of listTasks(paths, { agent: assignee })) {
+    if (!OPEN_STATUSES.includes(task.status)) continue;
+    if (normalizeTaskTitle(task.title) !== target) continue;
+    const age = now - new Date(task.created_at).getTime();
+    // Guard age >= 0 so a clock-skewed future timestamp can't match forever.
+    if (age >= 0 && age <= windowMs) return task;
+  }
+  return null;
+}
+
 /**
  * List tasks with optional filters.
  * Matches bash list-tasks.sh behavior.

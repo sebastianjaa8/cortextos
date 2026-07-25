@@ -4,7 +4,7 @@ import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { sendMessage, checkInbox, ackInbox } from '../bus/message.js';
 import { validateAgentName, validateTaskId, validatePriority } from '../utils/validate.js';
-import { createTask, updateTask, completeTask, claimTask, readTaskAudit, checkTaskDependencies, compactTasks, listTasks, checkStaleTasks, archiveTasks, checkHumanTasks } from '../bus/task.js';
+import { createTask, updateTask, completeTask, claimTask, readTaskAudit, checkTaskDependencies, compactTasks, listTasks, checkStaleTasks, archiveTasks, checkHumanTasks, findRecentDuplicate } from '../bus/task.js';
 import { saveOutput } from '../bus/save-output.js';
 import { logEvent } from '../bus/event.js';
 import { updateHeartbeat, readAllHeartbeats } from '../bus/heartbeat.js';
@@ -173,6 +173,23 @@ busCommand
     const env = resolveEnv();
     const paths = resolvePaths(env.agentName, env.instanceId, env.org);
     const parseList = (raw?: string) => (raw ? raw.split(',').map(s => s.trim()).filter(Boolean) : []);
+
+    // Duplicate safety net: warn, never block. A retry in the dispatch path on
+    // 2026-07-18 re-sent several create-task calls and the duplicate open tasks
+    // cost real cleanup. Warning goes to stderr so stdout stays exactly the task
+    // id — callers do `TASK_ID=$(cortextos bus create-task ...)`.
+    const effectiveAssignee = opts.assignee ?? env.agentName;
+    const dup = findRecentDuplicate(paths, title, effectiveAssignee);
+    if (dup) {
+      const ageMin = Math.round((Date.now() - new Date(dup.created_at).getTime()) / 60000);
+      console.error(
+        `Warning: ${effectiveAssignee} already has an open task with this title from ${ageMin}m ago — ${dup.id} [${dup.status}] "${dup.title}"`
+      );
+      console.error(
+        `Creating anyway. If this was a retry, cancel one: cortextos bus update-task ${dup.id} cancelled`
+      );
+    }
+
     const taskId = createTask(paths, env.agentName, env.org, title, {
       description: opts.desc,
       assignee: opts.assignee,
