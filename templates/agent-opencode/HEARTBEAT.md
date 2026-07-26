@@ -64,7 +64,10 @@ Full reference: `plugins/cortextos-agent-skills/skills/memory/SKILL.md`
 
 ```bash
 TODAY=$(date -u +%Y-%m-%d)
-LOCAL_TIME=$(date +'%-I:%M %p %Z' 2>/dev/null || date)
+# Local time via node: this shell has no tz database (/usr/share/zoneinfo is
+# absent), so `date` silently ignores TZ and prints UTC labelled GMT. node
+# carries its own tz data and honours CTX_TIMEZONE. Do not "simplify" back to date.
+LOCAL_TIME=$(node -e 'const z=process.env.CTX_TIMEZONE||"UTC";const f=t=>new Date().toLocaleString("en-US",{timeZone:t,hour:"numeric",minute:"2-digit",timeZoneName:"short"});try{console.log(f(z))}catch{console.log(f("UTC"))}' 2>/dev/null || date -u +'%H:%M UTC')
 MEMORY_DIR="$(pwd)/memory"
 mkdir -p "$MEMORY_DIR"
 cat >> "$MEMORY_DIR/$TODAY.md" << MEMORY
