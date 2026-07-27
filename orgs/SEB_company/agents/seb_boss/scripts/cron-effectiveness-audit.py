@@ -19,10 +19,23 @@ recompute nextFireAt from *now* on every daemon restart, so a daemon that
 restarts more often than the interval means the cron NEVER fires (real cases:
 vault_keeper/weekly-lint-gap-finder, brand_writer/nanoneuro-biweekly-update).
 
+Also flags MISSING HEARTBEAT crons (added 2026-07-27): enabled agents (per
+config/enabled-agents.json) whose crons.json has no cron named "heartbeat", or
+has one but it's disabled. Root cause for the finance_tracker 04:00-10:00Z
+delivery gap (2026-07-27): its heartbeat cron was entirely absent from
+crons.json, so wedge-detect's signal-B (cron-no-stamp) had no baseline to
+violate — the session sat on an idle PTY for ~11h silently swallowing 3 real
+work crons (market-tick x2, nightly-maintenance) with zero detection, only
+external-watchdog "alive" pings masking it, until a catch-up burst at 12:48Z.
+This check catches the missing-precondition case itself, distinct from (and a
+prerequisite for) the fire-based silent-cron / overdue checks above, which
+both assume a heartbeat cron exists to establish liveness.
+
 Output:
   - one summary line appended to seb_boss/.watchdog.log
   - one `bus log-event monitoring cron_effectiveness_gap` per flagged cron
   - one `bus log-event metric cron_overdue_gap` per overdue cron
+  - one `bus log-event metric missing_heartbeat_cron` per agent missing one
 
 Always exits 0 in normal mode (watchdog sub-check must never abort the chain).
 Run `--self-test` for the built-in synthetic check.
@@ -69,6 +82,9 @@ WATCHDOG_LOG = os.environ.get(
     "CRON_AUDIT_WATCHDOG_LOG",
     os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".watchdog.log")))
 BUS_ENABLED = os.environ.get("CRON_AUDIT_BUS", "on") != "off"
+ENABLED_AGENTS_PATH = os.environ.get(
+    "CRON_AUDIT_ENABLED_AGENTS",
+    os.path.join(DEFAULT_ROOT, "config", "enabled-agents.json"))
 
 
 def parse_ts(s):
@@ -222,6 +238,38 @@ def audit_overdue(now):
     return flagged
 
 
+def audit_missing_heartbeat():
+    """Flag enabled agents whose crons.json has no ENABLED cron named "heartbeat".
+
+    Returns [(agent, reason), ...] where reason is "no heartbeat cron" or
+    "heartbeat cron disabled". Skips agents not present in enabled-agents.json
+    or explicitly disabled there (e.g. builder_2/builder_opus/hermes, parked
+    by design) — this check only judges agents the fleet expects to be alive.
+    """
+    flagged = []
+    try:
+        with open(ENABLED_AGENTS_PATH, "r", encoding="utf-8") as fh:
+            enabled_agents = json.load(fh)
+    except (OSError, ValueError):
+        return flagged
+    for agent, cfg in enabled_agents.items():
+        if not cfg.get("enabled"):
+            continue
+        path = os.path.join(STATE_DIR, agent, "crons.json")
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                crons = json.load(fh).get("crons", [])
+        except (OSError, ValueError):
+            flagged.append((agent, "no crons.json"))
+            continue
+        hb = next((c for c in crons if c.get("name") == "heartbeat"), None)
+        if hb is None:
+            flagged.append((agent, "no heartbeat cron"))
+        elif not hb.get("enabled"):
+            flagged.append((agent, "heartbeat cron disabled"))
+    return flagged
+
+
 def discover_agents():
     if not os.path.isdir(STATE_DIR):
         return []
@@ -268,6 +316,11 @@ def emit_overdue_event(agent, cron, age_days, never_fired):
            "never_fired": never_fired, "detected_by": "cron-effectiveness-audit"})
 
 
+def emit_missing_heartbeat_event(agent, reason):
+    _emit("missing_heartbeat_cron",
+          {"agent": agent, "reason": reason, "detected_by": "cron-effectiveness-audit"})
+
+
 def _emit(event, payload):
     if not BUS_ENABLED:
         return
@@ -294,6 +347,7 @@ def _emit(event, payload):
 def run(quiet=False):
     now, checked, gaps = audit()
     overdue = audit_overdue(now)
+    missing_hb = audit_missing_heartbeat()
     ts = now.strftime("%Y-%m-%dT%H:%MZ")
     parts = []
     if gaps:
@@ -309,6 +363,11 @@ def run(quiet=False):
         parts.append("%d OVERDUE — %s" % (len(overdue), detail))
         for agent, cron, age_days, never_fired in overdue:
             emit_overdue_event(agent, cron, age_days, never_fired)
+    if missing_hb:
+        detail = ", ".join("%s (%s)" % (a, r) for a, r in missing_hb)
+        parts.append("%d MISSING-HEARTBEAT — %s" % (len(missing_hb), detail))
+        for agent, reason in missing_hb:
+            emit_missing_heartbeat_event(agent, reason)
     if parts:
         line = "[%s] cron-effectiveness-audit: %s" % (ts, "; ".join(parts))
     else:
@@ -428,8 +487,43 @@ def self_test():
         assert ("staleagent", "disabled-old") not in oflag, "disabled cron must NOT flag"
         assert ("staleagent", "tax-jan") not in oflag, "month-restricted cron must NOT flag"
 
-        print("self-test OK: flagged=%s checked=%d broken_streak=%d overdue=%s" % (
-            flagged, checked, broken_streak, sorted(oflag)))
+        # --- missing-heartbeat check fixtures (the finance_tracker 07-27 case) ---
+        def write_crons(agent, crons):
+            d = os.path.join(state, agent)
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, "crons.json"), "w", encoding="utf-8") as fh:
+                json.dump({"crons": crons}, fh)
+
+        # nohb: enabled agent, crons.json has no "heartbeat" entry at all -> FLAG
+        write_crons("nohb", [{"name": "some-other-cron", "schedule": "1h", "enabled": True}])
+        # hbdisabled: heartbeat cron exists but disabled -> FLAG
+        write_crons("hbdisabled", [{"name": "heartbeat", "schedule": "2h", "enabled": False}])
+        # hbfine: heartbeat cron present and enabled -> clean
+        write_crons("hbfine", [{"name": "heartbeat", "schedule": "2h", "enabled": True}])
+        # parked: no heartbeat cron, but disabled at the fleet level -> excluded, no flag
+        write_crons("parked", [{"name": "some-other-cron", "schedule": "1h", "enabled": True}])
+
+        enabled_agents_path = os.path.join(tmp, "enabled-agents.json")
+        with open(enabled_agents_path, "w", encoding="utf-8") as fh:
+            json.dump({
+                "nohb": {"enabled": True},
+                "hbdisabled": {"enabled": True},
+                "hbfine": {"enabled": True},
+                "parked": {"enabled": False},
+            }, fh)
+        os.environ["CRON_AUDIT_ENABLED_AGENTS"] = enabled_agents_path
+        global ENABLED_AGENTS_PATH
+        ENABLED_AGENTS_PATH = enabled_agents_path
+
+        missing_hb = audit_missing_heartbeat()
+        hbflag = dict(missing_hb)
+        assert hbflag.get("nohb") == "no heartbeat cron", "nohb must flag, got %s" % hbflag
+        assert hbflag.get("hbdisabled") == "heartbeat cron disabled", "hbdisabled must flag, got %s" % hbflag
+        assert "hbfine" not in hbflag, "hbfine must NOT flag"
+        assert "parked" not in hbflag, "parked (fleet-disabled) must NOT flag"
+
+        print("self-test OK: flagged=%s checked=%d broken_streak=%d overdue=%s missing_hb=%s" % (
+            flagged, checked, broken_streak, sorted(oflag), sorted(hbflag)))
         return 0
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
