@@ -101,6 +101,32 @@ describe('OutputBuffer redaction', () => {
     expect(buf.isBootstrapped()).toBe(true);
   });
 
+  it('bootstrap stays true after the marker chunk is evicted from the ring (2026-07-28 regression)', () => {
+    // Root cause of the "injected cron prompts don't wake idle sessions"
+    // incident (task_1785280765307): isBootstrapped() used to re-scan the
+    // bounded ring buffer on every call. A long-idle session whose boot-time
+    // marker chunk had scrolled past maxChunks flipped back to false with
+    // nothing left to ever refresh it (idle = no new pushes), permanently
+    // blocking agent-process.ts's queued-cron drain gate. A small maxChunks
+    // here simulates a session old enough for the marker to have scrolled out.
+    const buf = new OutputBuffer(2, '/tmp/fake-stdout.log');
+    buf.push('permissions: bypass\n');
+    expect(buf.isBootstrapped()).toBe(true);
+    buf.push('unrelated turn output 1\n');
+    buf.push('unrelated turn output 2\n');
+    buf.push('unrelated turn output 3\n'); // evicts the "permissions" chunk (maxChunks=2)
+    expect(buf.getRecent()).not.toContain('permissions'); // confirms eviction actually happened
+    expect(buf.isBootstrapped()).toBe(true); // sticky — must NOT flip back to false
+  });
+
+  it('bootstrap is still false before the marker has ever appeared', () => {
+    const buf = new OutputBuffer(1000, '/tmp/fake-stdout.log');
+    buf.push('booting up, nothing ready yet\n');
+    expect(buf.isBootstrapped()).toBe(false);
+    buf.push('permissions: bypass\n');
+    expect(buf.isBootstrapped()).toBe(true);
+  });
+
   it('chunk-boundary edge case is NOT redacted (documents the known limitation)', () => {
     // Split a JWT across two push() calls. Neither chunk matches the
     // regex on its own — the redactor is stateless and chunk-local. This

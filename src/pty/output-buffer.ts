@@ -23,6 +23,7 @@ export class OutputBuffer {
   private logPath: string | null;
   private bootstrapPattern: string;
   private totalBytes = 0;
+  private bootstrapConfirmed = false;
 
   constructor(maxChunks: number = 1000, logPath?: string, bootstrapPattern?: string) {
     this.maxChunks = maxChunks;
@@ -109,8 +110,23 @@ export class OutputBuffer {
    * For Claude Code: looks for the "permissions" status-bar text.
    * For Hermes: looks for the "❯" prompt character (configurable via constructor).
    * The bootstrap pattern is set at construction time by the PTY class.
+   *
+   * STICKY: bootstrap is a one-time event per session lifetime, not a
+   * repeating state — a session never legitimately "un-bootstraps" itself.
+   * Once the marker has been seen, the result is cached and every subsequent
+   * call short-circuits without re-scanning. Before this fix, a long-idle
+   * session whose boot-time marker chunk had scrolled out of the bounded
+   * ring buffer (maxChunks) would flip back to false with nothing to ever
+   * refresh it (idle = no new pushes), permanently blocking
+   * agent-process.ts's drainTick() queued-cron-injection gate — the root
+   * cause of the 2026-07-28 "injected cron prompts don't wake idle sessions"
+   * incident (task_1785280765307): crons queued for 15h, only delivered once
+   * an unrelated interactive message (which bypasses this gate) produced a
+   * fresh repaint that happened to re-populate the marker.
    */
   isBootstrapped(): boolean {
+    if (this.bootstrapConfirmed) return true;
+
     const recent = this.getRecent();
     const cleaned = recent.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '');
 
@@ -122,7 +138,11 @@ export class OutputBuffer {
       }
     }
 
-    return cleaned.includes(this.bootstrapPattern);
+    if (cleaned.includes(this.bootstrapPattern)) {
+      this.bootstrapConfirmed = true;
+      return true;
+    }
+    return false;
   }
 
   /**
