@@ -6,6 +6,7 @@
  */
 
 import { TelegramAPI } from '../telegram/api';
+import { createOutboundDeliveryId, recordOutboundDelivery } from '../telegram/outbound-journal';
 import {
   readStdin,
   parseHookInput,
@@ -63,6 +64,26 @@ async function main(): Promise<void> {
   const env = loadEnv();
 
   if (!env.botToken || !env.chatId) {
+    // Journalled for the same reason as the catch below: this is a fail-open
+    // auto-approval of a plan nobody saw. The first next-cycle check on the
+    // journal found zero hook:planmode records and could not tell "the hook
+    // never fired" from "the hook fired here and returned before the send" --
+    // 9 of 13 agents carrying this hook have no token, so this IS their normal
+    // path, and it was the one leaving no trace. Records the decision only;
+    // the decision itself is unchanged and deliberate.
+    recordOutboundDelivery(env.ctxRoot, env.agentName, {
+      delivery_id: createOutboundDeliveryId(),
+      agent: env.agentName,
+      chat_id: env.chatId || '',
+      // dead-letter, not a new state: nothing was sent and nothing may be
+      // retried, which is exactly what dead-letter already means to a reader.
+      state: 'dead-letter',
+      attempts: 0,
+      kind: 'message',
+      source: 'hook:planmode',
+      error: 'no telegram credentials for this agent; plan auto-approved without review',
+      preview: `(unsent) plan auto-approved, no review: ${tool_input.plan_file || '<plan file not supplied by tool_input>'}`,
+    });
     outputDecision('allow');
     return;
   }
