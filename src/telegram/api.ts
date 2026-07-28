@@ -4,6 +4,12 @@
  */
 
 import { createHash } from 'crypto';
+import {
+  createOutboundDeliveryId,
+  recordOutboundDelivery,
+  classifyOutboundError,
+  type OutboundDeliveryState,
+} from './outbound-journal.js';
 import { existsSync, readFileSync } from 'fs';
 import { basename } from 'path';
 
@@ -89,7 +95,22 @@ export class TelegramAPI {
   // diagnostic emitted at most once per chat_id per process lifetime.
   private warnedSelfChat: Set<string> = new Set();
 
-  constructor(token: string) {
+  /**
+   * Where to journal send attempts. OPTIONAL on purpose: sites that have an
+   * agent identity pass it and get a durable record; sites that do not (setup,
+   * credential validation) simply are not journalled, rather than failing to
+   * compile. That is what makes rolling this out to the other send sites
+   * additive instead of all-or-nothing.
+   *
+   * LIMIT, stated rather than hidden: only sendMessage journals today. The one
+   * approved call site (hook-planmode-telegram) sends nothing else. If you pass
+   * a context and then call sendPhoto/sendDocument, you get no record — wire
+   * them the same way at that point.
+   */
+  private journalCtx?: { ctxRoot: string; agentName: string };
+
+  constructor(token: string, journalCtx?: { ctxRoot: string; agentName: string }) {
+    this.journalCtx = journalCtx;
     this.baseUrl = `https://api.telegram.org/bot${token}`;
     const botId = token.split(':', 1)[0];
     this.botIdentity = /^\d+$/.test(botId)
@@ -204,6 +225,30 @@ export class TelegramAPI {
    * Long messages are split at paragraph/newline boundaries (not raw char
    * offsets) so formatting entities are never cut mid-span.
    */
+  /** No-op unless a journal context was supplied. Never throws: observability must
+   *  not break the send it observes. */
+  private journalDelivery(
+    deliveryId: string,
+    state: OutboundDeliveryState,
+    chatId: string | number,
+    kind: 'message' | 'photo' | 'document',
+    text: string,
+    extra: { message_id?: number; error?: string } = {},
+  ): void {
+    if (!this.journalCtx) return;
+    recordOutboundDelivery(this.journalCtx.ctxRoot, this.journalCtx.agentName, {
+      delivery_id: deliveryId,
+      agent: this.journalCtx.agentName,
+      chat_id: String(chatId),
+      state,
+      attempts: 1,
+      kind,
+      bytes: text.length,
+      preview: text.length > 120 ? text.slice(0, 120) + '…' : text,
+      ...extra,
+    });
+  }
+
   async sendMessage(
     chatId: string | number,
     text: string,
@@ -220,17 +265,34 @@ export class TelegramAPI {
 
     const chunks = this.splitHtml(html, 4096);
 
+    const deliveryId = createOutboundDeliveryId();
+    this.journalDelivery(deliveryId, 'delivering', chatId, 'message', text);
+
     let lastResult: any;
-    for (let i = 0; i < chunks.length; i++) {
-      const chunk = chunks[i];
-      const isLastChunk = i === chunks.length - 1;
-      lastResult = await this.sendChunk(
-        chatId,
-        chunk,
-        plainText ? null : 'HTML',
-        isLastChunk ? replyMarkup : undefined,
-      );
+    try {
+      for (let i = 0; i < chunks.length; i++) {
+        const chunk = chunks[i];
+        const isLastChunk = i === chunks.length - 1;
+        lastResult = await this.sendChunk(
+          chatId,
+          chunk,
+          plainText ? null : 'HTML',
+          isLastChunk ? replyMarkup : undefined,
+        );
+      }
+    } catch (err: any) {
+      // Rethrown unchanged. Callers depend on this throwing -- notably
+      // hook-planmode-telegram, which catches it and AUTO-APPROVES the plan.
+      // Swallowing it here would silently change that decision.
+      const reason = err?.message || String(err);
+      this.journalDelivery(deliveryId, classifyOutboundError(reason), chatId, 'message', text, {
+        error: reason,
+      });
+      throw err;
     }
+    this.journalDelivery(deliveryId, 'accepted', chatId, 'message', text, {
+      message_id: lastResult?.result?.message_id,
+    });
     return lastResult;
   }
 

@@ -101,7 +101,12 @@ async function main(): Promise<void> {
 
   const messageText = `PLAN REVIEW - ${env.agentName}\n\n${planContent}`;
   const keyboard = buildPlanKeyboard(uniqueId);
-  const api = new TelegramAPI(env.botToken);
+  // Journalled: if this send fails, the catch below AUTO-APPROVES a plan
+  // Sebastian never saw. That decision previously left no trace anywhere.
+  const api = new TelegramAPI(env.botToken, {
+    ctxRoot: env.ctxRoot,
+    agentName: env.agentName,
+  });
 
   try {
     await api.sendMessage(env.chatId, messageText, keyboard);

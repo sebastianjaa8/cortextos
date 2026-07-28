@@ -43,6 +43,15 @@ export interface OutboundDeliveryRecord {
   message_id?: number;
   /** Telegram's own description, or the transport error, on a non-accepted state. */
   error?: string;
+  /**
+   * Payload size. Matters because TelegramAPI.sendMessage splits at 4096
+   * (api.ts:219) and sends chunks sequentially: if chunk 2 of 3 fails, chunk 1
+   * ALREADY arrived. A dead-letter with bytes > 4096 may therefore be a PARTIAL
+   * delivery, not a non-delivery. Without this field the journal would report
+   * those identically -- and it would be least accurate for the long messages
+   * most likely to fail in the first place.
+   */
+  bytes?: number;
   /** First 120 chars, so a lost message is identifiable without duplicating the whole log. */
   preview: string;
 }

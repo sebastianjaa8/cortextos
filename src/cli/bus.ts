@@ -1064,6 +1064,7 @@ busCommand
           attempts: 1,
           kind,
           preview,
+        bytes: message.length,
           ...extra,
         });
       }
