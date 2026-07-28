@@ -27,6 +27,7 @@ import { stripBom } from '../utils/strip-bom.js';
 import { IPCClient } from '../daemon/ipc-server.js';
 import { TelegramAPI } from '../telegram/api.js';
 import { logOutboundMessage, cacheLastSent } from '../telegram/logging.js';
+import { createOutboundDeliveryId, recordOutboundDelivery, classifyOutboundError } from '../telegram/outbound-journal.js';
 import type { Priority, Task, TaskStatus, EventCategory, EventSeverity, ApprovalCategory, ApprovalStatus, OrgContext, CronDefinition } from '../types/index.js';
 
 /**
@@ -1045,6 +1046,29 @@ busCommand
     }
 
     const api = new TelegramAPI(botToken);
+    // Journal every ATTEMPT, not just the ones that work. logOutboundMessage
+    // below runs only after a successful await, so outbound-messages.jsonl has
+    // always been a success-only log -- which reads as evidence of health while
+    // hiding every failure. See src/telegram/outbound-journal.ts.
+    const deliveryId = createOutboundDeliveryId();
+    const journalEnv = resolveEnv();
+    const kind: 'message' | 'photo' | 'document' = opts.image ? 'photo' : opts.file ? 'document' : 'message';
+    const preview = message.length > 120 ? message.slice(0, 120) + '…' : message;
+    const journal = (state: 'delivering' | 'accepted' | 'retryable' | 'dead-letter', extra: { message_id?: number; error?: string } = {}) => {
+      if (journalEnv.agentName && journalEnv.ctxRoot) {
+        recordOutboundDelivery(journalEnv.ctxRoot, journalEnv.agentName, {
+          delivery_id: deliveryId,
+          agent: journalEnv.agentName,
+          chat_id: String(chatId),
+          state,
+          attempts: 1,
+          kind,
+          preview,
+          ...extra,
+        });
+      }
+    };
+    journal('delivering');
     try {
       let sentMessageId = 0;
       if (opts.image) {
@@ -1059,6 +1083,7 @@ busCommand
         });
         sentMessageId = result?.result?.message_id ?? 0;
       }
+      journal('accepted', { message_id: sentMessageId });
 
       // Log outbound and cache last-sent for context injection
       const env = resolveEnv();
@@ -1076,9 +1101,13 @@ busCommand
         } catch { /* non-fatal */ }
       }
 
-      console.log('Message sent');
+      // Surface Telegram's own message_id rather than a bare "sent", so the
+      // caller can tell an accepted send from a merely-completed command.
+      console.log(sentMessageId ? `Message sent (telegram message_id=${sentMessageId})` : 'Message sent (no message_id returned)');
     } catch (err: any) {
-      console.error(`Failed to send: ${err.message || err}`);
+      const reason = err?.message || String(err);
+      journal(classifyOutboundError(reason), { error: reason });
+      console.error(`Failed to send: ${reason}`);
       process.exit(1);
     }
   });
