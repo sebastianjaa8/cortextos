@@ -92,8 +92,16 @@ Patterns / user preferences / system behaviors learned this cycle → append.
 ## Step 10: KB re-ingest
 ```bash
 cortextos bus kb-ingest ./MEMORY.md ./memory/$(date -u +%Y-%m-%d).md \
-  --org $CTX_ORG --agent $CTX_AGENT_NAME --scope private --collection memory-$CTX_AGENT_NAME --force
+  --org $CTX_ORG --agent $CTX_AGENT_NAME --scope private --force
 ```
+
+> There is no `--collection` flag. This file previously documented
+> `--collection memory-$CTX_AGENT_NAME`, which the CLI rejects outright with
+> `error: unknown option '--collection'` — so the step failed rather than
+> ingesting anything. The collection name is derived, not passed: private
+> scope lands in `agent-<name>`, not `memory-<name>`, so the documented name
+> was wrong too. Verified against `kb-ingest --help` and `kb-collections`
+> on 2026-07-28.
 Skip if GEMINI_API_KEY unset.
 
 ---

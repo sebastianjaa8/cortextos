@@ -138,8 +138,16 @@ Keep your memory collection searchable and current:
 
 ```bash
 cortextos bus kb-ingest ./MEMORY.md ./memory/$(date -u +%Y-%m-%d).md \
-  --org $CTX_ORG --agent $CTX_AGENT_NAME --scope private --collection memory-$CTX_AGENT_NAME --force
+  --org $CTX_ORG --agent $CTX_AGENT_NAME --scope private --force
 ```
+
+> There is no `--collection` flag. This file previously documented
+> `--collection memory-$CTX_AGENT_NAME`, which the CLI rejects outright with
+> `error: unknown option '--collection'` — so the step failed rather than
+> ingesting anything. The collection name is derived, not passed: private
+> scope lands in `agent-<name>`, not `memory-<name>`, so the documented name
+> was wrong too. Verified against `kb-ingest --help` and `kb-collections`
+> on 2026-07-28.
 
 This runs automatically on every heartbeat cycle. It ensures past experiences, user preferences, and learned patterns are semantically searchable for future tasks. Skip if GEMINI_API_KEY is not configured.
 
