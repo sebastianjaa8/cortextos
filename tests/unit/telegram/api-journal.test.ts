@@ -80,6 +80,16 @@ describe('TelegramAPI journalling', () => {
     expect(rows(root).at(-1)!.error).toMatch(/chat not found/);
   });
 
+  it('names its call site, so a failure can be attributed to a source', async () => {
+    // Without this the records are indistinguishable once written: the first
+    // next-cycle check on this feature could not tell a CLI send from a
+    // planmode-hook send, which is exactly what a retry policy needs to know.
+    vi.stubGlobal('fetch', okFetch());
+    const api = new TelegramAPI('1:t', { ctxRoot: root, agentName: 'a1', source: 'hook:planmode' });
+    await api.sendMessage('42', 'hello');
+    expect(rows(root).every((r) => r.source === 'hook:planmode')).toBe(true);
+  });
+
   it('records payload size, so a failed multi-chunk send is not read as a clean non-delivery', async () => {
     // sendMessage splits at 4096 and sends chunks sequentially: a failure on a
     // later chunk leaves earlier ones already delivered. bytes is what lets a

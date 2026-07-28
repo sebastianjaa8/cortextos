@@ -107,9 +107,12 @@ export class TelegramAPI {
    * a context and then call sendPhoto/sendDocument, you get no record — wire
    * them the same way at that point.
    */
-  private journalCtx?: { ctxRoot: string; agentName: string };
+  private journalCtx?: { ctxRoot: string; agentName: string; source?: string };
 
-  constructor(token: string, journalCtx?: { ctxRoot: string; agentName: string }) {
+  constructor(
+    token: string,
+    journalCtx?: { ctxRoot: string; agentName: string; source?: string },
+  ) {
     this.journalCtx = journalCtx;
     this.baseUrl = `https://api.telegram.org/bot${token}`;
     const botId = token.split(':', 1)[0];
@@ -245,6 +248,7 @@ export class TelegramAPI {
       kind,
       bytes: text.length,
       preview: text.length > 120 ? text.slice(0, 120) + '…' : text,
+      source: this.journalCtx.source,
       ...extra,
     });
   }

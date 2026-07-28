@@ -106,6 +106,7 @@ async function main(): Promise<void> {
   const api = new TelegramAPI(env.botToken, {
     ctxRoot: env.ctxRoot,
     agentName: env.agentName,
+    source: 'hook:planmode',
   });
 
   try {

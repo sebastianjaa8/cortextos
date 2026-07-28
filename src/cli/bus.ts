@@ -1065,6 +1065,7 @@ busCommand
           kind,
           preview,
         bytes: message.length,
+        source: 'cli:send-telegram',
           ...extra,
         });
       }

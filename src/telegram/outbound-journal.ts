@@ -41,6 +41,15 @@ export interface OutboundDeliveryRecord {
   kind: 'message' | 'photo' | 'document';
   /** Telegram's own message_id, present only once accepted. */
   message_id?: number;
+  /**
+   * Which call site produced this record, e.g. 'cli:send-telegram' or
+   * 'hook:planmode'. Added after the first next-cycle check on this feature
+   * could not answer "has the planmode hook ever fired" or "which site is
+   * failing" — the records were indistinguishable once written. That second
+   * question is the one a retry policy depends on, so the journal has to carry
+   * the answer rather than leave it to be inferred from message text.
+   */
+  source?: string;
   /** Telegram's own description, or the transport error, on a non-accepted state. */
   error?: string;
   /**
