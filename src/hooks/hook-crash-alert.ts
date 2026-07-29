@@ -18,6 +18,14 @@ import { existsSync, readFileSync, writeFileSync, appendFileSync, unlinkSync, mk
 import { join } from 'path';
 import { homedir } from 'os';
 import { execFile } from 'child_process';
+// This hook calls fetch directly rather than going through TelegramAPI, so it does
+// NOT inherit the connect-race fix that api.ts applies on import. It matters most
+// here of all the senders: this is the alerter that has to work when something has
+// already gone wrong, and without this line it took the 50-75%-failure path measured
+// on 2026-07-29. See net-tuning.ts.
+import { applyTelegramNetTuning } from '../telegram/net-tuning.js';
+
+applyTelegramNetTuning();
 
 const DEDUP_WINDOW_MS = 10 * 60 * 1000;         // 10 minutes
 const QUIET_HOUR_START_LA = 22;                 // 22:00 America/Los_Angeles

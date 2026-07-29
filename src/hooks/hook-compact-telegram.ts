@@ -12,6 +12,12 @@
  */
 
 import { loadEnv } from './index.js';
+// This hook calls fetch directly rather than going through TelegramAPI, so it does
+// NOT inherit the connect-race fix that api.ts applies on import. Without this line
+// it keeps taking the 50-75%-failure path measured on 2026-07-29. See net-tuning.ts.
+import { applyTelegramNetTuning } from '../telegram/net-tuning.js';
+
+applyTelegramNetTuning();
 
 async function main(): Promise<void> {
   const env = loadEnv();

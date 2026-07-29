@@ -172,8 +172,22 @@ function sendCrashLoopAlertBestEffort(
   try {
     // Secrets are passed over stdin, never argv. Command lines are readable by
     // same-host process inventory and were previously exposing the bot token.
+    // The tuning below is duplicated as source text rather than imported, because
+    // this snippet runs in a SEPARATE node process (`node -e`) with Node defaults —
+    // no module-level fix in the daemon can reach it. Without it, this send races
+    // IPv4 against an unreachable IPv6 and the wedged connect blows the 3s timeout
+    // below. Measured 50-75% failure on 2026-07-29; see src/telegram/net-tuning.ts,
+    // which is the canonical copy and carries the measurements.
+    // Of every sender in the system this is the one that must not be flaky: it is
+    // the daemon telling the operator it is crash-looping.
     const sender = `
 const https = require('https');
+if ((process.env.CORTEXTOS_TELEGRAM_NET_TUNING || '').toLowerCase() !== 'off') {
+  try {
+    require('dns').setDefaultResultOrder('ipv4first');
+    require('net').setDefaultAutoSelectFamily(false);
+  } catch {}
+}
 let raw = '';
 process.stdin.setEncoding('utf8');
 process.stdin.on('data', chunk => { raw += chunk; });
