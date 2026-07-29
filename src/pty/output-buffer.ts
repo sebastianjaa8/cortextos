@@ -26,7 +26,12 @@ export class OutputBuffer {
   private bootstrapConfirmed = false;
 
   constructor(maxChunks: number = 1000, logPath?: string, bootstrapPattern?: string) {
-    this.maxChunks = maxChunks;
+    // push()'s bootstrap-latch guarantee (the newly-pushed chunk survives
+    // long enough for checkBootstrap() to see it) assumes maxChunks >= 1 —
+    // clamp defensively (Codex peer review nit, 2026-07-29): no production
+    // call site passes anything but 1000, but a 0-or-negative value would
+    // otherwise evict the chunk before it could ever be checked.
+    this.maxChunks = Math.max(1, maxChunks);
     this.logPath = logPath || null;
     this.bootstrapPattern = bootstrapPattern || 'permissions';
   }
