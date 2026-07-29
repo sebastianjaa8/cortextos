@@ -12,6 +12,107 @@ import {
 } from './outbound-journal.js';
 import { existsSync, readFileSync } from 'fs';
 import { basename } from 'path';
+import { applyTelegramNetTuning } from './net-tuning.js';
+
+// Applied at module load: every process that talks to Telegram imports this file,
+// so one call site covers the CLI, the daemon and the hooks without each entry
+// point having to remember. Idempotent, and opt-out via env. See net-tuning.ts for
+// the measurements behind it.
+applyTelegramNetTuning();
+
+/**
+ * How a failed request should be treated for retry purposes.
+ *
+ *  never_sent — proven that no request bytes reached Telegram, so re-sending
+ *    CANNOT duplicate anything. Safe to retry even for sendMessage.
+ *  ambiguous — the request may have arrived and only the response was lost.
+ *    Retrying sendMessage here could deliver the same text twice, and Telegram
+ *    has no idempotency key to prevent it, so only read-only/idempotent methods
+ *    are retried.
+ *  fatal — Telegram answered and rejected it (bad token, chat not found, bad
+ *    markup). Retrying re-asks a question already answered.
+ */
+export type TransportFailureKind = 'never_sent' | 'ambiguous' | 'fatal';
+
+/** Codes that cannot have written a request body, by their nature. */
+const PRE_WRITE_CODES = new Set([
+  'ENOTFOUND',   // DNS gave nothing
+  'EAI_AGAIN',   // transient DNS failure
+  'ECONNREFUSED',
+  'ENETUNREACH',
+  'EHOSTUNREACH',
+  'UND_ERR_CONNECT_TIMEOUT',
+]);
+
+/** Flatten an AggregateError (what happy-eyeballs produces) to its legs. */
+function causeLegs(cause: any): any[] {
+  if (!cause) return [];
+  return Array.isArray(cause.errors) && cause.errors.length ? cause.errors : [cause];
+}
+
+/**
+ * Classify a thrown error for retry.
+ *
+ * The load-bearing discriminator is `syscall === 'connect'`. Node system errors
+ * carry the failing syscall, and a failure DURING connect proves the socket was
+ * never established, therefore no request bytes were written. That is what makes
+ * retrying a sendMessage safe in the case we actually hit: the real-world failure
+ * is an AggregateError whose every leg is
+ *   { code: 'ETIMEDOUT'|'ENETUNREACH', syscall: 'connect' }
+ * A bare ETIMEDOUT with no syscall could equally be a lost response, so it is
+ * deliberately classified ambiguous rather than assumed safe.
+ */
+export function classifyTransportFailure(err: any): TransportFailureKind {
+  const msg = err instanceof Error ? err.message : String(err);
+  // Telegram answered. Not a transport problem at all.
+  if (msg.startsWith('Telegram API error')) return 'fatal';
+
+  // Our OWN AbortSignal budget elapsed. Deliberately not retried: the request
+  // already consumed a full 15s, and re-waiting that budget twice more turns a 15s
+  // stall into 45s+ while the caller sits there. getUpdates callers (the poller)
+  // recover on the next tick anyway, which is cheaper than blocking here. Caught by
+  // the pre-existing "throws a timeout error when fetch hangs indefinitely" test —
+  // an earlier version of this classifier called it ambiguous, and because getUpdates
+  // is idempotent it was retried, tripling the stall.
+  if (/timed out after \d+s/.test(msg)) return 'fatal';
+
+  const legs = causeLegs(err?.cause);
+  if (legs.length) {
+    // ALL legs must prove non-delivery. If any leg got far enough that we cannot
+    // rule out a write, the whole failure is ambiguous.
+    const allSafe = legs.every(
+      (l) => l?.syscall === 'connect' || PRE_WRITE_CODES.has(String(l?.code)),
+    );
+    if (allSafe) return 'never_sent';
+    return 'ambiguous';
+  }
+
+  if (PRE_WRITE_CODES.has(String(err?.code))) return 'never_sent';
+  // Our own AbortSignal.timeout, or an unrecognised transport error: the request
+  // may have been written and the reply lost.
+  return 'ambiguous';
+}
+
+/**
+ * Bot API methods that may be re-sent after an AMBIGUOUS failure: read-only or
+ * naturally idempotent, so a duplicate execution is not observable.
+ *
+ * sendMessage / sendPhoto / sendDocument are deliberately ABSENT. They are still
+ * retried on a `never_sent` failure — which is the case this change exists to fix —
+ * but never on an ambiguous one, because the cost of being wrong is Sebastian
+ * receiving the same message twice.
+ */
+const IDEMPOTENT_METHODS = new Set([
+  'getMe',
+  'getChat',
+  'getUpdates',
+  'getFile',
+  'setMyCommands',
+  'sendChatAction',
+  'setMessageReaction',
+  'editMessageText',
+  'answerCallbackQuery',
+]);
 
 /**
  * Result of TelegramAPI.validateCredentials. Tagged union so callers can
@@ -236,20 +337,21 @@ export class TelegramAPI {
     chatId: string | number,
     kind: 'message' | 'photo' | 'document',
     text: string,
-    extra: { message_id?: number; error?: string } = {},
+    extra: { message_id?: number; error?: string; attempts?: number } = {},
   ): void {
     if (!this.journalCtx) return;
+    const { attempts, ...rest } = extra;
     recordOutboundDelivery(this.journalCtx.ctxRoot, this.journalCtx.agentName, {
       delivery_id: deliveryId,
       agent: this.journalCtx.agentName,
       chat_id: String(chatId),
       state,
-      attempts: 1,
+      attempts: attempts ?? 1,
       kind,
       bytes: text.length,
       preview: text.length > 120 ? text.slice(0, 120) + '…' : text,
       source: this.journalCtx.source,
-      ...extra,
+      ...rest,
     });
   }
 
@@ -273,6 +375,9 @@ export class TelegramAPI {
     this.journalDelivery(deliveryId, 'delivering', chatId, 'message', text);
 
     let lastResult: any;
+    // Summed across chunks so the journal reports the real cost of the delivery,
+    // not the cost of its final chunk.
+    let attempts = 0;
     try {
       for (let i = 0; i < chunks.length; i++) {
         const chunk = chunks[i];
@@ -283,19 +388,23 @@ export class TelegramAPI {
           plainText ? null : 'HTML',
           isLastChunk ? replyMarkup : undefined,
         );
+        attempts += this.lastAttemptCount;
       }
     } catch (err: any) {
+      attempts += this.lastAttemptCount;
       // Rethrown unchanged. Callers depend on this throwing -- notably
       // hook-planmode-telegram, which catches it and AUTO-APPROVES the plan.
       // Swallowing it here would silently change that decision.
       const reason = err?.message || String(err);
       this.journalDelivery(deliveryId, classifyOutboundError(reason), chatId, 'message', text, {
         error: reason,
+        attempts,
       });
       throw err;
     }
     this.journalDelivery(deliveryId, 'accepted', chatId, 'message', text, {
       message_id: lastResult?.result?.message_id,
+      attempts,
     });
     return lastResult;
   }
@@ -690,9 +799,63 @@ export class TelegramAPI {
   }
 
   /**
-   * Make a POST request to the Telegram API.
+   * Make a POST request to the Telegram API, retrying transport failures.
+   *
+   * Retry lives HERE, at the per-request layer, and deliberately not around
+   * sendMessage: sendMessage splits at 4096 chars and sends chunks sequentially, so
+   * retrying the whole call after a failure on chunk 3 would re-deliver chunks 1
+   * and 2. One post = one chunk, so retrying a post cannot duplicate a chunk that
+   * already landed.
+   *
+   * What is retried is decided by classifyTransportFailure, not by the method being
+   * "a send": a `never_sent` failure is safe for anything, an `ambiguous` one only
+   * for idempotent methods, and a Telegram-level rejection never.
    */
   private async post(method: string, data: object): Promise<any> {
+    const maxAttempts = TelegramAPI.MAX_ATTEMPTS;
+    let lastErr: unknown;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      this.lastAttemptCount = attempt;
+      try {
+        return await this.postOnce(method, data);
+      } catch (err) {
+        lastErr = err;
+        const kind = classifyTransportFailure(err);
+        const mayRetry =
+          kind === 'never_sent' || (kind === 'ambiguous' && IDEMPOTENT_METHODS.has(method));
+        if (!mayRetry || attempt === maxAttempts) throw err;
+
+        // Short backoff with jitter. The failure mode this exists for fails fast
+        // (a wedged connect race), so waiting long buys nothing; jitter keeps a
+        // fleet of agents from retrying in lockstep.
+        const base = TelegramAPI.BACKOFF_MS[attempt - 1] ?? 1200;
+        const delay = base + Math.floor(Math.random() * 200);
+        console.warn(
+          `[telegram] ${method} failed (${kind}, attempt ${attempt}/${maxAttempts}), ` +
+          `retrying in ${delay}ms: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        await new Promise((resolve) => setTimeout(resolve, delay));
+      }
+    }
+    throw lastErr;
+  }
+
+  private static readonly MAX_ATTEMPTS = 3;
+  private static readonly BACKOFF_MS = [300, 1200];
+
+  /**
+   * Attempts spent on the most recent request. Journalled so a record cannot claim
+   * `attempts: 1` for a send that actually took three tries — the delivery journal
+   * is already success-biased and an understated attempt count would hide exactly
+   * the flakiness this change is about. Accumulated across chunks by sendMessage.
+   * Single-flight per instance: sends are awaited sequentially, so this is not
+   * racing a concurrent request on the same client.
+   */
+  private lastAttemptCount = 1;
+
+  /** One attempt. Separated from the retry loop so each try is a clean request. */
+  private async postOnce(method: string, data: object): Promise<any> {
     try {
       const response = await fetch(`${this.baseUrl}/${method}`, {
         method: 'POST',
@@ -715,7 +878,10 @@ export class TelegramAPI {
       if (err instanceof Error && (err.name === 'TimeoutError' || err.name === 'AbortError')) {
         throw new Error(`Telegram API request timed out after 15s: ${method}`);
       }
-      throw new Error(`Telegram API request failed: ${err}`);
+      // Preserve `cause` — classifyTransportFailure reads the AggregateError legs
+      // off it to decide whether a retry is safe. Wrapping without it would make
+      // every transport failure look ambiguous and silently disable retry for sends.
+      throw new Error(`Telegram API request failed: ${err}`, { cause: (err as any)?.cause ?? err });
     }
   }
 
