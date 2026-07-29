@@ -204,7 +204,13 @@ describe('TelegramAPI.validateCredentials', () => {
   });
 
   it('network_error: fetch throws -> reason=network_error (caller treats as WARN)', async () => {
-    queue({ throws: new Error('getaddrinfo ENOTFOUND api.telegram.org') });
+    // getMe is idempotent, so a transport failure is now retried (see
+    // classifyTransportFailure). Queue the SAME failure for every attempt, which is
+    // the production shape when DNS is genuinely down — all attempts fail alike, and
+    // the classification contract below is unchanged.
+    for (let i = 0; i < 3; i++) {
+      queue({ throws: new Error('getaddrinfo ENOTFOUND api.telegram.org') });
+    }
 
     const api = new TelegramAPI('111:AAA');
     const result = await api.validateCredentials('222');
@@ -216,6 +222,9 @@ describe('TelegramAPI.validateCredentials', () => {
       const msg = formatValidateError(result);
       expect(msg).toMatch(/Telegram API/i);
     }
+    // Asserted rather than left implicit: retry is intended here, and it is bounded.
+    // A regression that retried forever, or not at all, changes this number.
+    expect(callLog).toHaveLength(3);
   });
 
   it('rate_limited: getMe 429 -> reason=rate_limited', async () => {
