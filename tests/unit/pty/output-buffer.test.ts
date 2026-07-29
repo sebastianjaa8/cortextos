@@ -119,6 +119,40 @@ describe('OutputBuffer redaction', () => {
     expect(buf.isBootstrapped()).toBe(true); // sticky — must NOT flip back to false
   });
 
+  it('latches on push() even when isBootstrapped() is never called before eviction (Codex review finding, 2026-07-29)', () => {
+    // The first version of this fix only checked the marker inside
+    // isBootstrapped() itself — so a session where NOTHING calls
+    // isBootstrapped() while the marker is still in the window (no queued
+    // cron ever drives drainTick(), FastChecker's bootstrap wait only runs
+    // on initial start not after sessionRefresh()) could still evict the
+    // marker with the flag never latched, permanently false forever —
+    // same bug, narrower window. Fix: push() itself checks on every chunk.
+    // This test asserts that WITHOUT any isBootstrapped() call in between.
+    const buf = new OutputBuffer(2, '/tmp/fake-stdout.log');
+    buf.push('permissions: bypass\n'); // marker arrives — push() must latch it right here
+    buf.push('unrelated turn output 1\n');
+    buf.push('unrelated turn output 2\n'); // evicts the marker chunk (maxChunks=2), zero reads so far
+    expect(buf.getRecent()).not.toContain('permissions'); // confirms eviction actually happened
+    expect(buf.isBootstrapped()).toBe(true); // must still be true — latched at push-time, not read-time
+  });
+
+  it('trust-prompt guard does not block the marker from latching once the real status bar appears', () => {
+    // Codex review flagged: if the trust-folder guard (cleaned.includes('trust')
+    // && !cleaned.includes('> ')) is still tripping when the marker chunk
+    // evicts, readiness could never latch — same permanent-false class.
+    // Push-time checking closes this too: each push is checked as it lands,
+    // so the marker's OWN push (once the trust prompt has resolved and the
+    // real status bar with "> " appears) latches immediately, regardless of
+    // what an earlier, still-evicted trust-prompt chunk looked like.
+    const buf = new OutputBuffer(2, '/tmp/fake-stdout.log');
+    buf.push('Do you trust this folder?\n'); // trust prompt, no "> " yet — guard blocks
+    expect(buf.isBootstrapped()).toBe(false);
+    buf.push('> permissions: bypass\n'); // resolved: real status bar, has "> "
+    expect(buf.isBootstrapped()).toBe(true);
+    buf.push('unrelated turn output\n'); // evicts the trust-prompt chunk (maxChunks=2)
+    expect(buf.isBootstrapped()).toBe(true); // still true — latched when the real marker landed
+  });
+
   it('bootstrap is still false before the marker has ever appeared', () => {
     const buf = new OutputBuffer(1000, '/tmp/fake-stdout.log');
     buf.push('booting up, nothing ready yet\n');

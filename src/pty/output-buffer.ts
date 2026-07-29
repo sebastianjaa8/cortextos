@@ -51,6 +51,22 @@ export class OutputBuffer {
       this.chunks.shift();
     }
 
+    // Check for the boot-marker on EVERY push, not just when isBootstrapped()
+    // happens to be called. Codex peer review (2026-07-29) on the earlier
+    // on-demand-only version: if nothing ever calls isBootstrapped() while
+    // the marker is still in the ring window (e.g. FastChecker's bootstrap
+    // wait only runs on initial start, not after a sessionRefresh(); a
+    // session with no queued cron never drives drainTick() either), the
+    // marker chunk can be evicted with the flag never having latched —
+    // same permanent-false failure the sticky cache was built to close.
+    // Checking here removes that gap entirely: the newest chunk just
+    // pushed is never the one `shift()` evicts (only the oldest is), so
+    // the marker is guaranteed to be examined at least once, at the exact
+    // moment it's still guaranteed present, before any caller has to ask.
+    if (!this.bootstrapConfirmed) {
+      this.checkBootstrap();
+    }
+
     // Stream to log file (replaces tmux pipe-pane)
     if (this.logPath) {
       try {
@@ -105,6 +121,31 @@ export class OutputBuffer {
   }
 
   /**
+   * Scan the current buffer for the boot marker and latch bootstrapConfirmed
+   * if found. Called from push() (so the marker is checked the moment it's
+   * guaranteed present, before it could ever be evicted) AND from
+   * isBootstrapped() (so a buffer seeded before this instance started
+   * observing pushes — e.g. a test constructing content directly — still
+   * gets checked on first read). No-op once already confirmed.
+   */
+  private checkBootstrap(): void {
+    const recent = this.getRecent();
+    const cleaned = recent.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '');
+
+    if (this.bootstrapPattern === 'permissions') {
+      // Claude Code: exclude trust-folder prompt false positives.
+      // The trust prompt shows "trust this folder" before the status bar appears.
+      if (cleaned.includes('trust') && !cleaned.includes('> ')) {
+        return;
+      }
+    }
+
+    if (cleaned.includes(this.bootstrapPattern)) {
+      this.bootstrapConfirmed = true;
+    }
+  }
+
+  /**
    * Check if agent has bootstrapped (ready-for-input signal appeared).
    *
    * For Claude Code: looks for the "permissions" status-bar text.
@@ -123,26 +164,17 @@ export class OutputBuffer {
    * incident (task_1785280765307): crons queued for 15h, only delivered once
    * an unrelated interactive message (which bypasses this gate) produced a
    * fresh repaint that happened to re-populate the marker.
+   *
+   * The cache is latched primarily by push() (see there for why that closes
+   * the gap Codex peer review found in the on-demand-only version: nothing
+   * guarantees isBootstrapped() itself gets called while the marker is still
+   * in the window). This call remains as a fallback for buffers whose
+   * content was seeded before this instance observed any push() (tests
+   * constructing a buffer and writing chunks then immediately asserting).
    */
   isBootstrapped(): boolean {
-    if (this.bootstrapConfirmed) return true;
-
-    const recent = this.getRecent();
-    const cleaned = recent.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '');
-
-    if (this.bootstrapPattern === 'permissions') {
-      // Claude Code: exclude trust-folder prompt false positives.
-      // The trust prompt shows "trust this folder" before the status bar appears.
-      if (cleaned.includes('trust') && !cleaned.includes('> ')) {
-        return false;
-      }
-    }
-
-    if (cleaned.includes(this.bootstrapPattern)) {
-      this.bootstrapConfirmed = true;
-      return true;
-    }
-    return false;
+    if (!this.bootstrapConfirmed) this.checkBootstrap();
+    return this.bootstrapConfirmed;
   }
 
   /**
