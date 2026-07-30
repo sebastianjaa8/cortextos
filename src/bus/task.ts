@@ -771,11 +771,13 @@ export function checkStaleTasks(paths: BusPaths): StaleTaskReport {
   const STALE_IN_PROGRESS = 7200;   // 2 hours
   const STALE_PENDING = 86400;      // 24 hours
   const STALE_HUMAN = 86400;        // 24 hours
+  const STALE_BLOCKED = 86400;      // 24 hours — a re-check cadence, not an alarm threshold
 
   const report: StaleTaskReport = {
     stale_in_progress: [],
     stale_pending: [],
     stale_human: [],
+    stale_blocked: [],
     overdue: [],
   };
 
@@ -824,6 +826,26 @@ export function checkStaleTasks(paths: BusPaths): StaleTaskReport {
       createdAge > STALE_HUMAN
     ) {
       report.stale_human.push(task);
+    }
+
+    // Blocked: waiting on someone else, so nobody is looking. Added 2026-07-30.
+    //
+    // `blocked` was in NO bucket, so a blocked task aged indefinitely and this detector never mentioned
+    // it. Found because a UTF-8 BOM fix made a HIGH task visible to `list-tasks` and it STILL did not
+    // appear here — 49 days blocked, assigned and forgotten.
+    //
+    // Ranked by who is looking: pending is visible and gets picked up, in_progress trips an alarm,
+    // blocked waits on a third party with no one watching. There is also an incentive gradient — telling
+    // someone to move an in_progress item to `blocked` to clear it BOTH silenced the alarm and removed
+    // the task from the report, so the cheapest way to quiet this detector was to hide work in the one
+    // state it could not see.
+    //
+    // Measured by `age` (time since last touch) rather than createdAge: the question is how long it has
+    // sat since anyone did anything, not how old the task is. Deliberately NOT an alarm — callers key
+    // severity off the other buckets, because making a normal waiting state loud is how a detector
+    // trains its reader to skim. `blocked_by` travels on the Task, so the caller can see WHAT it waits on.
+    if (task.status === 'blocked' && age > STALE_BLOCKED) {
+      report.stale_blocked.push(task);
     }
 
     // Overdue: has due_date and it's in the past

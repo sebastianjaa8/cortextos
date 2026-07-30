@@ -929,3 +929,69 @@ describe('UTF-8 BOM tolerance (2026-07-30 incident)', () => {
     expect(notes).toMatch(/PARTIAL: 1 dependency edge\(s\) NOT written/);
   });
 });
+
+describe('stale_blocked bucket (2026-07-30)', () => {
+  // `blocked` was in NO bucket, so a blocked task aged indefinitely and the stale detector never
+  // mentioned it. Real case: a HIGH task blocked 49 days, invisible even after a BOM fix made it
+  // visible to list-tasks. Blocked is the worst status to omit — pending gets picked up, in_progress
+  // trips an alarm, blocked waits on a third party with nobody watching.
+  let dir: string;
+  let p: BusPaths;
+
+  const write = (id: string, over: Record<string, unknown>) => {
+    const t = {
+      id, title: 't', description: '', type: 'agent', needs_approval: false,
+      status: 'pending', assigned_to: 'boris', created_by: 'paul', org: 'acme',
+      priority: 'high', project: '', kpi_key: null,
+      created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-01T00:00:00Z',
+      completed_at: null, due_date: null, archived: false, ...over,
+    };
+    writeFileSync(join(p.taskDir, `${id}.json`), JSON.stringify(t), 'utf-8');
+  };
+  const hoursAgo = (h: number) =>
+    new Date(Date.now() - h * 3600_000).toISOString().replace(/\.\d{3}Z$/, 'Z');
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'cortextos-blocked-test-'));
+    p = {
+      ctxRoot: dir, inbox: join(dir, 'i'), inflight: join(dir, 'f'), processed: join(dir, 'p'),
+      logDir: join(dir, 'l'), stateDir: join(dir, 's'), taskDir: join(dir, 'tasks'),
+      approvalDir: join(dir, 'a'), analyticsDir: join(dir, 'an'), heartbeatDir: join(dir, 'h'),
+    } as BusPaths;
+    mkdirSync(p.taskDir, { recursive: true });
+  });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  it('reports a long-blocked task — it was in no bucket at all before', () => {
+    write('task_blk_old', { status: 'blocked', updated_at: hoursAgo(49 * 24),
+                            blocked_by: ['task_blocker_1'] });
+    const r = checkStaleTasks(p);
+    expect(r.stale_blocked.map((t) => t.id)).toContain('task_blk_old');
+    // blocked_by travels on the Task, so a caller can see WHAT it waits on without a new field.
+    expect(r.stale_blocked[0].blocked_by).toEqual(['task_blocker_1']);
+  });
+
+  it('NEGATIVE CONTROL: a freshly blocked task is NOT reported — this is a re-check cadence', () => {
+    write('task_blk_new', { status: 'blocked', updated_at: hoursAgo(2) });
+    expect(checkStaleTasks(p).stale_blocked).toEqual([]);
+  });
+
+  it('NEGATIVE CONTROL: blocked does NOT leak into the alarm buckets', () => {
+    // If it did, moving an in_progress item to `blocked` would keep tripping the alarm, and callers
+    // that key severity off those buckets would start treating a normal waiting state as a failure.
+    write('task_blk_leak', { status: 'blocked', updated_at: hoursAgo(49 * 24) });
+    const r = checkStaleTasks(p);
+    expect(r.stale_in_progress).toEqual([]);
+    expect(r.stale_pending).toEqual([]);
+    expect(r.stale_human).toEqual([]);
+  });
+
+  it('NEGATIVE CONTROL: the pre-existing buckets still fire — the new branch changed nothing else', () => {
+    write('task_ip', { status: 'in_progress', updated_at: hoursAgo(9) });
+    write('task_pd', { status: 'pending', created_at: hoursAgo(30), updated_at: hoursAgo(30) });
+    const r = checkStaleTasks(p);
+    expect(r.stale_in_progress.map((t) => t.id)).toContain('task_ip');
+    expect(r.stale_pending.map((t) => t.id)).toContain('task_pd');
+  });
+});
+

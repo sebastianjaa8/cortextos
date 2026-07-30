@@ -593,6 +593,13 @@ export interface StaleTaskReport {
   stale_in_progress: Task[];
   stale_pending: Task[];
   stale_human: Task[];
+  /**
+   * Blocked tasks past their re-check age. Added 2026-07-30: `blocked` was excluded from every
+   * bucket, so a blocked task could age indefinitely without the stale detector ever mentioning
+   * it. It is the worst status to omit — pending gets picked up, in_progress trips an alarm,
+   * blocked waits on someone else with nobody looking. Reported, but deliberately NOT an alarm.
+   */
+  stale_blocked: Task[];
   overdue: Task[];
 }
 
