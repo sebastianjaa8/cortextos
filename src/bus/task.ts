@@ -739,10 +739,27 @@ export function checkStaleTasks(paths: BusPaths): StaleTaskReport {
       report.stale_pending.push(task);
     }
 
-    // Human tasks: assigned to "human" or "user", or in human-tasks project
+    // Human tasks: assigned to "human"/"user", in the human-tasks project, OR titled with the
+    // "[HUMAN]" prefix.
+    //
+    // The title check was added 2026-07-30 because this bucket read a FIELD while the fleet writes a
+    // CONVENTION. AGENTS.md prescribes BOTH halves — `create-task "[HUMAN] <what>" --project
+    // human-tasks` — and an agent that writes the title but omits the flag produced a task invisible
+    // here at any age. Measured at the time: 5 live human tasks, 5 of 5 wrote the title, only 4 of 5
+    // set the project. The survivor was a NanoNeuroscience blocker (real TEM sample exports) sitting
+    // 25.4 DAYS old with nobody resurfacing it.
+    //
+    // This bucket's arithmetic was never wrong — 2 was correct for what it could see. That is what made
+    // it dangerous: a correct-looking number is harder to distrust than an obviously dead one, so the
+    // partially-blind case hides better than the fully-blind `overdue` bucket below.
+    //
+    // `startsWith` on a trimmed title rather than a regex: the convention is a PREFIX, so a prefix test
+    // is the precise predicate, and it needs no backslash escaping.
+    const titledHuman = (task.title ?? '').trim().startsWith('[HUMAN]');
     if (
       (['human', 'user'].includes(task.assigned_to ?? '') ||
-        task.project === 'human-tasks') &&
+        task.project === 'human-tasks' ||
+        titledHuman) &&
       createdAge > STALE_HUMAN
     ) {
       report.stale_human.push(task);

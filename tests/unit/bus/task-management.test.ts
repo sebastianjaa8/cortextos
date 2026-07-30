@@ -92,6 +92,52 @@ describe('Advanced Task Management', () => {
       expect(report.stale_in_progress[0].id).toBe('task_001_001');
     });
 
+    // Added 2026-07-30. This bucket read a FIELD while the fleet writes a CONVENTION: AGENTS.md
+    // prescribes both `[HUMAN]` in the title AND `--project human-tasks`, and omitting the flag made a
+    // task invisible at any age. Real cost measured at the time: a NanoNeuroscience blocker sat 25.4
+    // days unseen because its project field was empty.
+    it('counts a [HUMAN]-titled task with NO project set — the convention is the title', () => {
+      createBackdatedTask(paths, {
+        id: 'task_h01_h01',
+        title: '[HUMAN] Get real TEM sample exports',
+        status: 'pending',
+        project: '',
+        created_at: hoursAgo(600),
+      });
+
+      const report = checkStaleTasks(paths);
+      expect(report.stale_human.map((t) => t.id)).toContain('task_h01_h01');
+    });
+
+    it('still respects the 24h threshold for a [HUMAN]-titled task — the title is not a bypass', () => {
+      // Negative control. Without it, a predicate that matched the title and skipped the age gate
+      // would pass the test above while flooding the bucket with brand-new human tasks.
+      createBackdatedTask(paths, {
+        id: 'task_h02_h02',
+        title: '[HUMAN] Filed two hours ago',
+        status: 'pending',
+        project: '',
+        created_at: hoursAgo(2),
+      });
+
+      const report = checkStaleTasks(paths);
+      expect(report.stale_human.map((t) => t.id)).not.toContain('task_h02_h02');
+    });
+
+    it('does NOT treat an ordinary title as a human task', () => {
+      // Second negative control: the prefix must be load-bearing, not incidental word matching.
+      createBackdatedTask(paths, {
+        id: 'task_h03_h03',
+        title: 'Refactor the HUMAN readable log formatter',
+        status: 'pending',
+        project: '',
+        created_at: hoursAgo(600),
+      });
+
+      const report = checkStaleTasks(paths);
+      expect(report.stale_human.map((t) => t.id)).not.toContain('task_h03_h03');
+    });
+
     it('identifies stale pending tasks (>24h)', () => {
       createBackdatedTask(paths, {
         id: 'task_003_003',
