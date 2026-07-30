@@ -262,18 +262,29 @@ const DISCLAIMED_BY =
  * handles chef's ordering and fails on the equally natural "not 8am ET, but 12pm ET". A negator
  * lookback is order-independent, so it subsumes the positional rule rather than complementing it.
  */
-function statedLocalHours(prompt: string): Array<{ hour: number; raw: string }> {
-  const out: Array<{ hour: number; raw: string }> = [];
+function extractLocalHours(prompt: string): {
+  stated: Array<{ hour: number; raw: string }>;
+  disclaimed: number;
+} {
+  const stated: Array<{ hour: number; raw: string }> = [];
+  let disclaimed = 0;
   const re = /\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b[^.\n]{0,20}?\b(ET|EST|EDT|local)\b/gi;
   for (const m of prompt.matchAll(re)) {
     let h = parseInt(m[1], 10);
     if (h < 1 || h > 12) continue;
-    if (DISCLAIMED_BY.test(prompt.slice(Math.max(0, m.index - 40), m.index))) continue;
+    if (DISCLAIMED_BY.test(prompt.slice(Math.max(0, m.index - 40), m.index))) {
+      disclaimed++;
+      continue;
+    }
     if (/pm/i.test(m[3]) && h !== 12) h += 12;
     if (/am/i.test(m[3]) && h === 12) h = 0;
-    out.push({ hour: h, raw: m[0].trim() });
+    stated.push({ hour: h, raw: m[0].trim() });
   }
-  return out;
+  return { stated, disclaimed };
+}
+
+function statedLocalHours(prompt: string): Array<{ hour: number; raw: string }> {
+  return extractLocalHours(prompt).stated;
 }
 
 /** Current UTC-to-local offset in whole hours for the agent timezone (DST-aware). */
@@ -421,50 +432,159 @@ const KIND_ORDER: Record<CronDriftKind, number> = {
  *
  * So "0 findings" is not an honest report. "10 of 14 time-anchored crons state a time, 10 match"
  * is. A DROP in `stating` between runs is itself a finding.
+ *
+ * `disclaimed` GUARDS THE OTHER DIRECTION, and it exists because this metric had a blind spot
+ * pointed at good news. `statedLocalHours` is the shared subject-extractor for BOTH the finding
+ * path and this coverage number, so a defect in it moves both:
+ *
+ *   - extractor UNDER-matches -> `stating` falls -> visible, which is what this function is for.
+ *   - extractor OVER-matches  -> `stating` RISES -> reads as more crons documenting themselves,
+ *     i.e. as improving health.
+ *
+ * The negation defect fixed on 2026-07-30 sat in the second direction: had it been active it would
+ * have inflated this very number. A metric that only guards one direction is not half a guard, it
+ * is a guard plus a blind spot aimed at the reassuring outcome. Counting disclaimed tokens makes an
+ * over-matching extractor surface as a rising `disclaimed` rather than as a healthier `stating`.
  */
-export function statedTimeCoverage(): { timeAnchored: number; stating: number; agents: string[] } {
+export function statedTimeCoverage(): {
+  timeAnchored: number;
+  stating: number;
+  disclaimed: number;
+  agents: string[];
+} {
   let timeAnchored = 0;
   let stating = 0;
+  let disclaimed = 0;
   const agents: string[] = [];
   for (const agentName of listStateAgents()) {
     try {
       for (const cron of readCrons(agentName)) {
         if (cron.schedule.trim().split(/\s+/).length !== 5) continue;
         timeAnchored++;
-        if (statedLocalHours(cron.prompt ?? '').length > 0) {
+        const { stated, disclaimed: d } = extractLocalHours(cron.prompt ?? '');
+        disclaimed += d;
+        if (stated.length > 0) {
           stating++;
           if (!agents.includes(agentName)) agents.push(agentName);
         }
       }
     } catch { /* skip */ }
   }
-  return { timeAnchored, stating, agents };
+  return { timeAnchored, stating, disclaimed, agents };
 }
 
-/** One-line-per-finding summary, used by the CLI and by the consolidated bus message. */
+/**
+ * Kinds where BOTH sides of the comparison are authoritative — the live scheduler against itself,
+ * or against the prompt it actually injects. These are events: something is wrong right now.
+ */
+const LIVE_VS_LIVE: ReadonlySet<CronDriftKind> = new Set<CronDriftKind>([
+  'marker-missing',
+  'schedule-contradicts-prompt',
+]);
+
+/**
+ * Explainer text, printed ONLY when its kind has findings.
+ *
+ * Previously every explainer printed on every run. On a clean fleet that put the two lines naming
+ * the dangerous classes at the bottom of 33 non-actions, every 6 hours — so when one of them
+ * finally fires it arrives looking exactly like the noise the reader has been skimming past for
+ * weeks. An explainer that prints at zero findings trains the reader to skip the line where the
+ * real finding will appear.
+ */
+const KIND_EXPLAINER: Record<CronDriftKind, string> = {
+  'marker-missing':
+    'marker-missing is the assembled trigger for a full crons.json wipe on next boot — fix first.',
+  'schedule-contradicts-prompt':
+    'schedule-contradicts-prompt: the prompt states a time the cron does not fire at (double conversion).',
+  // Deliberately does NOT say "so it never fires", which contradicts the block header and is only
+  // half true. The two readings have opposite meanings and only the owner can tell them apart —
+  // which is precisely why this is reported rather than auto-resolved or suppressed.
+  'missing-live':
+    'missing-live: config.json names a cron with no live counterpart. EITHER it was deliberately ' +
+    'superseded and the entry is stale (delete it from config.json), OR someone added it to ' +
+    'config.json expecting it to fire and it never did (re-add with `bus add-cron`). Owner decides.',
+  'interval-mismatch':
+    'interval-mismatch: config.json and the live scheduler disagree on the rate. The live value ' +
+    'wins. Correct config.json, or change the live one with `bus update-cron`.',
+  'prompt-differs':
+    'prompt-differs: the live prompt was improved while config.json stayed frozen. Usually correct.',
+};
+
+/**
+ * One-line-per-finding summary, used by the CLI and by the consolidated bus message.
+ *
+ * SPLIT BY WHETHER THE COMPARISON HAS A LIVE SOURCE OF TRUTH ON BOTH SIDES, because that split is
+ * the detector's premise rather than a presentation choice. `config.json` stopped being read by
+ * anything on 2026-06-03, when the `.crons-migrated` marker was written. After that, config-vs-live
+ * divergence is the DEFAULT STATE and convergence is the anomaly — so those kinds describe a
+ * CONDITION, while the live-vs-live kinds describe an EVENT.
+ *
+ * Measured on the live fleet 2026-07-30T14:26Z: 33 config-vs-live findings, 0 live-vs-live. Every
+ * real finding this detector has ever produced (chef's two double-converted schedules, three
+ * runtime authoring errors, the wipe trigger) came from the kinds that were silent that day.
+ * Reporting a condition every six hours in the same block as an event is how the event gets
+ * trained out of existence.
+ */
 export function formatDriftFindings(findings: CronDriftFinding[]): string {
-  if (findings.length === 0) return 'No config.json cron drift found.';
+  if (findings.length === 0) {
+    return 'config.json and the live scheduler agree everywhere they can be compared.';
+  }
 
   const sorted = [...findings].sort(
     (a, b) => KIND_ORDER[a.kind] - KIND_ORDER[b.kind] || a.agent.localeCompare(b.agent),
   );
-  const counts = sorted.reduce<Record<string, number>>((acc, f) => {
-    acc[f.kind] = (acc[f.kind] ?? 0) + 1;
-    return acc;
-  }, {});
+  const line = (f: CronDriftFinding) =>
+    `  ${f.agent}/${f.cron}  ${f.kind}: config=${f.configValue} live=${f.liveValue}`;
 
-  const lines = sorted.map(
-    (f) => `  ${f.agent}/${f.cron}  ${f.kind}: config=${f.configValue} live=${f.liveValue}`,
-  );
-  return [
-    `${findings.length} config.json cron edit(s) that are NOT in effect ` +
-      `(${Object.entries(counts).map(([k, n]) => `${n} ${k}`).join(', ')}):`,
-    ...lines,
-    '',
-    'marker-missing is the assembled trigger for a full crons.json wipe on next boot — fix first.',
-    'schedule-contradicts-prompt: the prompt states a time the cron does not fire at (double conversion).',
-    'config.json crons are dead text after the .crons-migrated marker is written.',
-    'missing-live means that cron never fires at all.',
-    'Fix with: cortextos bus update-cron <agent> <cron> --interval <i> --prompt "<p>"',
-  ].join('\n');
+  const liveVsLive = sorted.filter((f) => LIVE_VS_LIVE.has(f.kind));
+  // prompt-differs is demoted to a count: 21 of 33 on the day this was written, structurally the
+  // expected state, and the mildest kind. The COUNT is kept rather than the kind dropped — a sudden
+  // jump means someone is bulk-editing config.json expecting it to take effect, which is the
+  // original eight-week failure. `--json` still emits every finding for anyone doing the cleanup.
+  const configVsLive = sorted.filter((f) => !LIVE_VS_LIVE.has(f.kind) && f.kind !== 'prompt-differs');
+  const promptDiffers = sorted.filter((f) => f.kind === 'prompt-differs');
+
+  const out: string[] = [];
+  const kindsShown = new Set<CronDriftKind>();
+
+  if (liveVsLive.length > 0) {
+    out.push(`${liveVsLive.length} LIVE finding(s) — both sides authoritative, act on these:`);
+    for (const f of liveVsLive) {
+      out.push(line(f));
+      kindsShown.add(f.kind);
+    }
+    out.push('');
+  }
+
+  if (configVsLive.length > 0 || promptDiffers.length > 0) {
+    // "disagrees" rather than the previous "config.json cron edit(s) that are NOT in effect".
+    // Most of these were never edited — the LIVE side diverged from them, which is the opposite
+    // direction. A narrated causal claim in the header of a report about narrated-vs-measured.
+    out.push(
+      `${configVsLive.length + promptDiffers.length} place(s) where config.json disagrees with the ` +
+        `live scheduler (config.json is dead text after the .crons-migrated marker, so EDITING IT ` +
+        `changes nothing that runs — but a missing-live entry may be a cron someone intended and ` +
+        `never got):`,
+    );
+    for (const f of configVsLive) {
+      out.push(line(f));
+      kindsShown.add(f.kind);
+    }
+    if (promptDiffers.length > 0) {
+      out.push(
+        `  ${promptDiffers.length} prompt-differs not listed — a live prompt improved while ` +
+          `config.json stayed frozen is the norm, not an event. Use --json for the full list.`,
+      );
+    }
+    out.push('');
+  }
+
+  // Each explainer names its own action, so the old generic trailer
+  // ("Fix with: bus update-cron ...") is gone — it was wrong for missing-live, where the cron does
+  // not exist to update.
+  for (const kind of Object.keys(KIND_ORDER) as CronDriftKind[]) {
+    if (kindsShown.has(kind)) out.push(KIND_EXPLAINER[kind]);
+  }
+
+  return out.join('\n');
 }

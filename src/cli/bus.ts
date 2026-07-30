@@ -2945,7 +2945,12 @@ busCommand
 Stated-time coverage: ${coverage.stating} of ${coverage.timeAnchored} time-anchored ` +
           `cron(s) state their intended local time and are therefore checkable. A DROP in that ` +
           `first number between runs is itself a finding — a prompt tidied into a doc pointer ` +
-          `removes the only evidence that can catch a wrong schedule.`,
+          `removes the only evidence that can catch a wrong schedule.` +
+          `
+  ${coverage.disclaimed} time token(s) disclaimed by a negation (e.g. "not 8am ET") and correctly ` +
+          `not counted as claims. This guards the OTHER direction: the extractor is shared by the ` +
+          `finding path and by the number above, so an over-matching extractor would RAISE coverage ` +
+          `and read as improving health. A RISE here is the tell.`,
       );
       if (latent.length > 0) {
         console.log(

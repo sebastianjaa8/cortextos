@@ -32,7 +32,8 @@ vi.mock('../../../src/daemon/cron-snapshot.js', async (importOriginal) => {
   };
 });
 
-import { detectConfigCronDrift, detectMissingMigrationMarker, detectScheduleContradictsPrompt } from '../../../src/daemon/cron-drift.js';
+import { detectConfigCronDrift, detectMissingMigrationMarker, detectScheduleContradictsPrompt, formatDriftFindings } from '../../../src/daemon/cron-drift.js';
+import type { CronDriftFinding } from '../../../src/daemon/cron-drift.js';
 import { migrateCronsForAgent } from '../../../src/daemon/cron-migration.js';
 import { CRONS_DIRECTORY } from '../../../src/bus/crons-schema.js';
 import type { CronDefinition } from '../../../src/types/index.js';
@@ -375,5 +376,83 @@ describe('detectScheduleContradictsPrompt', () => {
         ),
       ).toEqual([]);
     });
+  });
+});
+
+/**
+ * The report's job is triage, so its BRANCHES are the behaviour — which line prints, and which
+ * does not, decides whether a real finding is read or skimmed past. Every assertion below is
+ * about an ABSENCE as much as a presence, which is exactly the shape that passes vacuously if
+ * nobody sabotages it (see work/negation-sabotage.mjs for the same discipline on the extractor).
+ */
+describe('formatDriftFindings', () => {
+  const f = (over: Partial<CronDriftFinding>): CronDriftFinding => ({
+    agent: 'someagent',
+    cron: 'somecron',
+    kind: 'prompt-differs',
+    configValue: '100 chars',
+    liveValue: '200 chars',
+    ...over,
+  });
+
+  const MARKER_LINE = 'marker-missing is the assembled trigger';
+  const CONTRADICT_LINE = 'schedule-contradicts-prompt: the prompt states a time';
+
+  it('does NOT print the marker-missing explainer when there are no marker findings', () => {
+    // The whole point of P1. On a clean fleet this line used to print every 6 hours below 33
+    // non-actions, so the day it means something it looks like the noise.
+    const out = formatDriftFindings([f({ kind: 'missing-live', liveValue: '(absent)' })]);
+    expect(out).not.toContain(MARKER_LINE);
+    expect(out).not.toContain(CONTRADICT_LINE);
+  });
+
+  it('DOES print the marker-missing explainer when a marker finding exists', () => {
+    // Both directions. An explainer that can never print is as broken as one that always does.
+    const out = formatDriftFindings([f({ kind: 'marker-missing', configValue: 'marker absent' })]);
+    expect(out).toContain(MARKER_LINE);
+    expect(out).not.toContain(CONTRADICT_LINE);
+  });
+
+  it('separates live-vs-live findings from config-vs-live', () => {
+    const out = formatDriftFindings([
+      f({ kind: 'marker-missing', cron: '(agent-level)' }),
+      f({ kind: 'missing-live', cron: 'ghost', liveValue: '(absent)' }),
+    ]);
+    expect(out).toContain('1 LIVE finding(s)');
+    expect(out).toContain('EDITING IT changes nothing that runs');
+    // Ordering is load-bearing: the actionable block must come first in the string.
+    expect(out.indexOf('LIVE finding(s)')).toBeLessThan(out.indexOf('disagrees with the'));
+  });
+
+  it('does NOT claim config-vs-live findings are all inconsequential', () => {
+    // The first version of the header said "NONE of these affect what runs". Too strong, and it
+    // contradicted the missing-live explainer two lines below: a missing-live entry can be a cron
+    // someone INTENDED and never got, which is the original eight-week failure. The bounded claim
+    // is that EDITING config.json changes nothing — not that nothing is wrong.
+    const out = formatDriftFindings([f({ kind: 'missing-live', cron: 'ghost', liveValue: '(absent)' })]);
+    expect(out).not.toContain('NONE of these affect what runs');
+    expect(out).toContain('may be a cron someone intended and never got');
+  });
+
+  it('collapses prompt-differs to a count instead of one line each', () => {
+    const many = Array.from({ length: 21 }, (_, i) => f({ cron: `c${i}` }));
+    const out = formatDriftFindings(many);
+    expect(out).toContain('21 prompt-differs not listed');
+    expect(out).not.toContain('  someagent/c0  prompt-differs');
+    // The count survives so a JUMP is still visible — that jump is the original 8-week failure.
+    expect(out).toContain('21 place(s) where config.json disagrees');
+  });
+
+  it('still lists missing-live per line — it is demoted in noise, not in importance', () => {
+    const out = formatDriftFindings([f({ kind: 'missing-live', cron: 'ghost', liveValue: '(absent)' })]);
+    expect(out).toContain('someagent/ghost  missing-live');
+  });
+
+  it('the empty report claims only what it compared', () => {
+    // Not "no drift found": the detector cannot see cron EXPRESSIONS or live-only crons at all,
+    // so an unqualified all-clear would overstate its own coverage.
+    expect(formatDriftFindings([])).toBe(
+      'config.json and the live scheduler agree everywhere they can be compared.',
+    );
   });
 });
