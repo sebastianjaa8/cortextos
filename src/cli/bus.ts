@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { Command } from 'commander';
 import { spawnSync, execFileSync } from 'child_process';
 import { existsSync, readFileSync } from 'fs';
@@ -2965,9 +2966,25 @@ Also ${latent.length} agent(s) with no .crons-migrated marker and no live crons 
     try {
       const ctxRoot = process.env.CTX_ROOT;
       if (ctxRoot) {
+        // Fingerprint the finding SET, not just its size. The cron prompt says "if the report is
+        // unchanged since the last run, say so in one line rather than re-listing" — and a count
+        // alone cannot establish that: 34 findings then and 34 now is equally consistent with one
+        // finding resolved and a different one appearing. An equal total masking changed membership
+        // is the same shape as every other sum that stood in for the thing we cared about.
+        const fingerprint = createHash('sha256')
+          .update(
+            [...findings]
+              .map((f) => `${f.agent}/${f.cron}/${f.kind}`)
+              .sort()
+              .join('\n'),
+          )
+          .digest('hex')
+          .slice(0, 16);
         writeRunReceipt(ctxRoot, env.agentName, 'cron-drift-receipt.jsonl', {
           cron: 'cron-drift-daily',
           findings: findings.length,
+          // Compare THIS between runs to claim "unchanged". Identical fingerprint = identical set.
+          findings_fingerprint: fingerprint,
           latent_marker_absent: latent.length,
           stated_time_stating: coverage.stating,
           stated_time_anchored: coverage.timeAnchored,
