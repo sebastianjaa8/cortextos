@@ -260,10 +260,28 @@ export function findTaskFile(paths: BusPaths, taskId: string): string | null {
  * cross-org fallback from findTaskFile so an assignee in one org can drive
  * the lifecycle of a task filed by an orchestrator in a sibling org.
  */
+/**
+ * Update a task's status, and optionally its PRIORITY.
+ *
+ * Priority was create-only until 2026-07-30: `create-task` accepted `--priority` and nothing could
+ * change it afterwards. So every re-prioritisation on the fleet was narrative — seb_boss announced
+ * "moved off low" for a task that stayed `low` in the store, not from carelessness but because the
+ * mechanism did not exist. Unlike `blocked_by`, which can be written retroactively via a new task's
+ * `--blocks` symmetric edge, nothing wrote priority onto an existing task at all.
+ *
+ * That matters more than it sounds: agents pick "the highest priority task", and priority frozen at
+ * creation means they sort by what mattered when the task was FILED, not by what matters now. A task
+ * created `low` months ago stays `low` after it becomes urgent.
+ *
+ * The change is audited rather than silent. A priority edit appends a `from_priority`/`to_priority`
+ * audit entry, because an unlogged mutation to the field that decides work order is exactly the kind
+ * of quiet state change the append-only log exists to prevent.
+ */
 export function updateTask(
   paths: BusPaths,
   taskId: string,
   status: TaskStatus,
+  opts?: { priority?: Priority },
 ): void {
   const filePath = findTaskFile(paths, taskId);
   if (!filePath) {
@@ -272,19 +290,31 @@ export function updateTask(
     );
   }
   let prevStatus: TaskStatus | undefined;
+  let prevPriority: Priority | undefined;
   let assignee: string | undefined;
   try {
     const content = readFileSync(filePath, 'utf-8');
     const task: Task = JSON.parse(content);
     prevStatus = task.status;
+    prevPriority = task.priority;
     assignee = task.assigned_to;
     task.status = status;
+    if (opts?.priority !== undefined) task.priority = opts.priority;
     task.updated_at = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
     atomicWriteSync(filePath, JSON.stringify(task));
   } catch (err) {
     throw new Error(`Task ${taskId} update failed: ${err}`);
   }
-  appendTaskAudit(paths, taskId, { event: 'update', agent: assignee || 'unknown', from: prevStatus, to: status });
+  appendTaskAudit(paths, taskId, {
+    event: 'update',
+    agent: assignee || 'unknown',
+    from: prevStatus,
+    to: status,
+    // Only recorded when it actually changed, so the log does not fill with no-op priority lines.
+    ...(opts?.priority !== undefined && opts.priority !== prevPriority
+      ? { from_priority: prevPriority, to_priority: opts.priority }
+      : {}),
+  });
 }
 
 /**
@@ -298,6 +328,10 @@ export interface TaskAuditEntry {
   agent: string; // who caused the event
   from?: TaskStatus;
   to?: TaskStatus;
+  /** Present only on a priority change (added 2026-07-30) — priority decides work order, so
+   *  changing it silently would hide why an agent started picking a different task. */
+  from_priority?: Priority;
+  to_priority?: Priority;
   note?: string;
 }
 

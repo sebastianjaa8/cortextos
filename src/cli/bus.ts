@@ -214,10 +214,21 @@ busCommand
   .command('update-task')
   .argument('<id>', 'Task ID')
   .argument('<status>', 'New status (pending, in_progress, completed, blocked, cancelled)')
-  .action((id: string, status: string) => {
+  // Priority was CREATE-ONLY until 2026-07-30, so every re-prioritisation was narrative: an agent
+  // could announce "moved off low" while the store kept `low` forever. Agents pick the highest
+  // priority task, so a frozen field means they sort by what mattered when the task was FILED.
+  .option('--priority <p>', 'Also change priority (urgent, high, normal, low) — audited')
+  .action((id: string, status: string, opts: { priority?: string }) => {
     const validStatuses: TaskStatus[] = ['pending', 'in_progress', 'completed', 'blocked', 'cancelled'];
     if (!validStatuses.includes(status as TaskStatus)) {
       console.error(`Invalid status '${status}'. Must be one of: ${validStatuses.join(', ')}`);
+      process.exit(1);
+    }
+    // Same valid set as create-task. Rejecting loudly rather than silently ignoring an unknown value:
+    // a priority that looks applied and is not is the exact failure this option exists to remove.
+    const validPriorities: Priority[] = ['urgent', 'high', 'normal', 'low'];
+    if (opts.priority !== undefined && !validPriorities.includes(opts.priority as Priority)) {
+      console.error(`Invalid priority '${opts.priority}'. Must be one of: ${validPriorities.join(', ')}`);
       process.exit(1);
     }
     const env = resolveEnv();
@@ -234,7 +245,7 @@ busCommand
           process.exit(1);
         }
       }
-      updateTask(paths, id, status as TaskStatus);
+      updateTask(paths, id, status as TaskStatus, { priority: opts.priority as Priority | undefined });
       console.log(`Updated ${id} -> ${status}`);
     } catch (err) {
       console.error(err instanceof Error ? err.message : String(err));
@@ -300,7 +311,16 @@ busCommand
     }
     console.log(`Audit log for ${id} (${entries.length} entries):`);
     for (const e of entries) {
-      const transition = e.from && e.to ? `${e.from} -> ${e.to}` : e.to || '';
+      // Render the priority transition too. Without this the audit entry carries
+      // from_priority/to_priority on disk while the tool people actually READ prints only
+      // "pending -> pending" — recorded but invisible, which is the same defect as not recording it.
+      // Caught 2026-07-30 immediately after adding the field: seb_boss's own attempted re-rank sits
+      // in the log at 07:25:15Z as a no-op `pending -> pending`, because priority was create-only.
+      const prio =
+        e.from_priority !== undefined || e.to_priority !== undefined
+          ? ` [priority ${e.from_priority ?? '?'} -> ${e.to_priority ?? '?'}]`
+          : '';
+      const transition = (e.from && e.to ? `${e.from} -> ${e.to}` : e.to || '') + prio;
       const note = e.note ? ` | ${e.note}` : '';
       console.log(`  ${e.ts}  ${e.event.padEnd(8)}  ${e.agent.padEnd(16)}  ${transition}${note}`);
     }

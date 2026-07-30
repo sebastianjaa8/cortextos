@@ -100,6 +100,43 @@ describe('Task Management', () => {
       const content = JSON.parse(readFileSync(join(paths.taskDir, `${taskId}.json`), 'utf-8'));
       expect(content.status).toBe('in_progress');
     });
+
+    // Priority was CREATE-ONLY until 2026-07-30, which made every re-prioritisation narrative: an
+    // agent could announce "moved off low" while the store kept `low` forever. Agents pick the
+    // highest-priority task, so a frozen field means sorting by what mattered when it was FILED.
+    it('changes priority when asked, and LEAVES IT ALONE when not — both directions', () => {
+      const read = (id: string) =>
+        JSON.parse(readFileSync(join(paths.taskDir, `${id}.json`), 'utf-8'));
+
+      const changed = createTask(paths, 'paul', 'acme', 'Re-ranked', { priority: 'low' });
+      updateTask(paths, changed, 'pending', { priority: 'high' });
+      expect(read(changed).priority).toBe('high');
+
+      // Negative control: a status-only update must not disturb priority. Without this, a bug that
+      // always wrote a default would pass the positive case above.
+      const untouched = createTask(paths, 'paul', 'acme', 'Not re-ranked', { priority: 'low' });
+      updateTask(paths, untouched, 'in_progress');
+      expect(read(untouched).priority).toBe('low');
+    });
+
+    it('AUDITS a priority change, because the field that decides work order must not move silently', () => {
+      const taskId = createTask(paths, 'paul', 'acme', 'Audited', { priority: 'low' });
+      updateTask(paths, taskId, 'pending', { priority: 'urgent' });
+
+      const entry = readTaskAudit(paths, taskId).find((e) => e.event === 'update');
+      expect(entry).toBeDefined();
+      expect(entry?.from_priority).toBe('low');
+      expect(entry?.to_priority).toBe('urgent');
+    });
+
+    it('does NOT write a priority audit entry for a no-op re-assertion of the same value', () => {
+      const taskId = createTask(paths, 'paul', 'acme', 'Same again', { priority: 'high' });
+      updateTask(paths, taskId, 'pending', { priority: 'high' });
+
+      const entry = readTaskAudit(paths, taskId).find((e) => e.event === 'update');
+      expect(entry?.from_priority).toBeUndefined();
+      expect(entry?.to_priority).toBeUndefined();
+    });
   });
 
   describe('completeTask', () => {
