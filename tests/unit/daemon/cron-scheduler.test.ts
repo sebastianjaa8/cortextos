@@ -8,6 +8,9 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { mkdtempSync, rmSync } from 'fs';
+import { join } from 'path';
+import { tmpdir } from 'os';
 
 // ---------------------------------------------------------------------------
 // Mock crons.ts I/O BEFORE importing CronScheduler so the module resolution
@@ -180,8 +183,21 @@ describe('CronScheduler', () => {
   let logs: string[];
   let fired: CronDefinition[];
   let scheduler: CronScheduler;
+  let tmpCtxRoot: string;
+  let originalCtxRoot: string | undefined;
 
   beforeEach(() => {
+    // CTX_ROOT isolation. crons.ts is mocked above, but the execution-LOG writer is not, and it
+    // resolves CTX_ROOT from the environment. Without this, running the suite from a shell where
+    // CTX_ROOT is set — i.e. from inside any cortextOS agent session — appends this test's fake
+    // fires into the LIVE state dir at {CTX_ROOT}/.cortextOS/state/agents/test-agent/.
+    // That is how `test-agent` came to exist as a phantom agent on this install: 1,342 records
+    // dating from 2026-05-15, the most recent written by a test run on 2026-07-30T04:00Z.
+    // Same pattern phase5-performance.test.ts already uses deliberately.
+    originalCtxRoot = process.env.CTX_ROOT;
+    tmpCtxRoot = mkdtempSync(join(tmpdir(), 'cron-scheduler-test-'));
+    process.env.CTX_ROOT = tmpCtxRoot;
+
     vi.useFakeTimers();
     logs   = [];
     fired  = [];
@@ -203,6 +219,9 @@ describe('CronScheduler', () => {
   });
 
   afterEach(() => {
+    if (originalCtxRoot === undefined) delete process.env.CTX_ROOT;
+    else process.env.CTX_ROOT = originalCtxRoot;
+    rmSync(tmpCtxRoot, { recursive: true, force: true });
     scheduler.stop();
     vi.useRealTimers();
   });
