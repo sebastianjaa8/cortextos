@@ -584,3 +584,153 @@ describe('disk round-trip via readCrons()', () => {
     expect(wk!.enabled).toBe(true);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Test 14: pre-overwrite snapshot guard (632df7c)
+//
+// The guard protects the one boot-time write that can destroy live cron state:
+// crons.json holding live crons while .crons-migrated is absent. Shipped with a
+// drift-detector test but none of its own, so until now "the guard is armed"
+// rested on reading it. Merged is not armed; loaded is not exercised.
+//
+// cron-snapshot.ts exists as a separate module specifically so the
+// snapshot-failed branch is reachable by mocking — chmod does not block writes
+// on Windows, which is what made an earlier attempt at that branch vacuous.
+// ---------------------------------------------------------------------------
+
+describe('pre-overwrite snapshot guard', () => {
+  const LIVE: CronDefinition[] = [
+    { name: 'runtime-added-1', prompt: 'p1', schedule: '2h', enabled: true, created_at: '2026-07-01T00:00:00.000Z' },
+    { name: 'runtime-added-2', prompt: 'p2', schedule: '0 9 * * *', enabled: true, created_at: '2026-07-01T00:00:00.000Z' },
+  ];
+
+  /** Seed crons.json with live crons and NO marker — the at-risk state. */
+  async function seedLiveCrons(agentName: string, crons: CronDefinition[] = LIVE) {
+    const { writeCrons } = await import('../../src/bus/crons.js');
+    writeCrons(agentName, crons);
+  }
+
+  /** Snapshot files the guard is supposed to leave behind. */
+  function snapshotFiles(agentName: string): string[] {
+    const dir = join(tmpCtxRoot, CRONS_DIR, agentName);
+    const { readdirSync } = require('fs') as typeof import('fs');
+    if (!existsSync(dir)) return [];
+    return readdirSync(dir).filter((f) => f.startsWith(`${CRONS_FILE}.pre-migration-`));
+  }
+
+  it('snapshots live crons before overwriting them, and escalates', async () => {
+    const agentDir = join(tmpFrameworkRoot, 'orgs', 'testorg', 'agents', 'nu');
+    writeConfigJson(agentDir, [{ name: 'from-config', interval: '6h', prompt: 'Config version.' }]);
+    await seedLiveCrons('nu');
+
+    const onCritical = vi.fn();
+    const result = migrateCronsForAgent('nu', join(agentDir, 'config.json'), tmpCtxRoot, {
+      log: () => {},
+      onCritical,
+    });
+
+    // The artifact, not the log line: a real file, with the real pre-write content.
+    const snaps = snapshotFiles('nu');
+    expect(snaps).toHaveLength(1);
+    const { readFileSync: fsRead } = require('fs') as typeof import('fs');
+    const saved = JSON.parse(fsRead(join(tmpCtxRoot, CRONS_DIR, 'nu', snaps[0]), 'utf-8'));
+    expect(saved.crons.map((c: CronDefinition) => c.name)).toEqual([
+      'runtime-added-1',
+      'runtime-added-2',
+    ]);
+
+    expect(onCritical).toHaveBeenCalledTimes(1);
+    const meta = onCritical.mock.calls[0][1];
+    expect(meta.reason).toBe('pre-migration-overwrite');
+    expect(meta.live_cron_count).toBe(2);
+    expect(meta.crons).toEqual(['runtime-added-1', 'runtime-added-2']);
+
+    // The snapshot is a safety net, not a block: migration still proceeds.
+    expect(result.status).toBe('migrated');
+    expect(readCrons('nu').map((c) => c.name)).toEqual(['from-config']);
+  });
+
+  it('ABORTS without overwriting when the snapshot cannot be verified', async () => {
+    const agentDir = join(tmpFrameworkRoot, 'orgs', 'testorg', 'agents', 'xi');
+    writeConfigJson(agentDir, [{ name: 'from-config', interval: '6h', prompt: 'Config version.' }]);
+    await seedLiveCrons('xi');
+
+    // The whole reason cron-snapshot.ts is its own module.
+    vi.resetModules();
+    vi.doMock('../../src/daemon/cron-snapshot.js', () => ({
+      snapshotLiveCrons: () => false,
+    }));
+    const { migrateCronsForAgent: migrateWithBrokenSnapshot } = await import(
+      '../../src/daemon/cron-migration.js'
+    );
+    const { readCrons: readCronsFresh } = await import('../../src/bus/crons.js');
+
+    const onCritical = vi.fn();
+    migrateWithBrokenSnapshot('xi', join(agentDir, 'config.json'), tmpCtxRoot, {
+      log: () => {},
+      onCritical,
+    });
+    vi.doUnmock('../../src/daemon/cron-snapshot.js');
+
+    // The live crons must still be there. This is the assertion the guard exists for.
+    expect(readCronsFresh('xi').map((c) => c.name)).toEqual([
+      'runtime-added-1',
+      'runtime-added-2',
+    ]);
+    // Marker absent means the next boot retries a blocked overwrite, which is safe.
+    expect(markerExists(tmpCtxRoot, 'xi')).toBe(false);
+
+    expect(onCritical).toHaveBeenCalledTimes(1);
+    expect(onCritical.mock.calls[0][1].reason).toBe('snapshot-unverified');
+  });
+
+  it('does not snapshot or escalate when the marker is present (negative control)', async () => {
+    const agentDir = join(tmpFrameworkRoot, 'orgs', 'testorg', 'agents', 'omicron');
+    writeConfigJson(agentDir, [{ name: 'from-config', interval: '6h', prompt: 'Config version.' }]);
+    await seedLiveCrons('omicron');
+    // Migrate once to lay down the marker, then run again on the same live state.
+    migrateCronsForAgent('omicron', join(agentDir, 'config.json'), tmpCtxRoot, { log: () => {} });
+
+    const onCritical = vi.fn();
+    const result = migrateCronsForAgent('omicron', join(agentDir, 'config.json'), tmpCtxRoot, {
+      log: () => {},
+      onCritical,
+    });
+
+    expect(result.status).toBe('skipped-already-migrated');
+    expect(onCritical).not.toHaveBeenCalled();
+    // Exactly the one snapshot from the first (marker-less) run — no second one.
+    expect(snapshotFiles('omicron')).toHaveLength(1);
+  });
+
+  it('does not snapshot or escalate for a genuinely new agent (negative control)', () => {
+    const agentDir = join(tmpFrameworkRoot, 'orgs', 'testorg', 'agents', 'pi');
+    writeConfigJson(agentDir, [{ name: 'from-config', interval: '6h', prompt: 'Config version.' }]);
+
+    const onCritical = vi.fn();
+    const result = migrateCronsForAgent('pi', join(agentDir, 'config.json'), tmpCtxRoot, {
+      log: () => {},
+      onCritical,
+    });
+
+    expect(result.status).toBe('migrated');
+    expect(onCritical).not.toHaveBeenCalled();
+    expect(snapshotFiles('pi')).toHaveLength(0);
+  });
+
+  it('survives a notifier that throws — a boot must not fail on a notification', async () => {
+    const agentDir = join(tmpFrameworkRoot, 'orgs', 'testorg', 'agents', 'rho');
+    writeConfigJson(agentDir, [{ name: 'from-config', interval: '6h', prompt: 'Config version.' }]);
+    await seedLiveCrons('rho');
+
+    const result = migrateCronsForAgent('rho', join(agentDir, 'config.json'), tmpCtxRoot, {
+      log: () => {},
+      onCritical: () => {
+        throw new Error('bus unavailable');
+      },
+    });
+
+    expect(result.status).toBe('migrated');
+    expect(snapshotFiles('rho')).toHaveLength(1);
+  });
+});
