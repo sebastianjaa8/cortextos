@@ -51,6 +51,17 @@ export type CronDriftKind =
    * of 12:00 UTC lands the local hour back on the config literal 12). Only a human-written
    * "8:30am ET" in the prompt breaks that tie. Found 2026-07-30: two chef crons had been firing
    * four hours late since the 06-03 migration, with their own prompts stating the correct time.
+   *
+   * WHY CARE IS NOT A MITIGATION FOR THIS CLASS. One of the five findings read
+   * `Friday 12pm ET (16:00 UTC)` in its prompt while its schedule said hour 20. The CORRECT UTC
+   * value was sitting two characters from the wrong one, and its author did not see it — because
+   * nothing forces the comparison. So this is not an argument that people should read more
+   * carefully; it is evidence that reading more carefully would not have worked. An automated
+   * comparison is the only thing that catches a contradiction a human eye slides past.
+   *
+   * It is also not a historical cleanup. Three of the five were authored at RUNTIME, one of them
+   * minutes before this check first ran — a local hour typed into a UTC field is a mistake the
+   * fleet is still actively making.
    */
   | 'schedule-contradicts-prompt'
   /** config.json names a cron that has no counterpart in crons.json — it will never fire. */
