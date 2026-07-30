@@ -2966,6 +2966,66 @@ Also ${latent.length} agent(s) with no .crons-migrated marker and no live crons 
     } catch { /* the event above already carries the finding */ }
   });
 
+busCommand
+  .command('check-expectations')
+  .description('Evaluate every agent expectations.json manifest (fleet-wide, cross-agent)')
+  .option('--json', 'Emit raw JSON instead of the formatted report')
+  .option('--notify', 'Send ONE consolidated message to the org orchestrator when a check fails')
+  .action(async (opts: { json?: boolean; notify?: boolean }) => {
+    const { sweepExpectations, formatSweep, writeCheckerReceipt } = await import('../daemon/freshness.js');
+    const env = resolveEnv();
+    const projectRoot = env.projectRoot || env.frameworkRoot || process.cwd();
+
+    const result = sweepExpectations(projectRoot);
+
+    // Written on EVERY run, pass or fail. It is the artifact that lets a different agent notice
+    // this checker going mute — the failure mode that made a second detector the wrong answer.
+    let receiptPath: string | null = null;
+    try {
+      const ctxRoot = process.env.CTX_ROOT;
+      if (ctxRoot) receiptPath = writeCheckerReceipt(ctxRoot, env.agentName, result);
+    } catch { /* a receipt that cannot be written must not suppress the report */ }
+
+    if (opts.json) {
+      console.log(JSON.stringify({ ...result, receipt_path: receiptPath }, null, 2));
+    } else {
+      console.log(formatSweep(result));
+      if (receiptPath) console.log(`\nRun receipt appended: ${receiptPath}`);
+    }
+
+    const paths = resolvePaths(env.agentName, env.instanceId, env.org);
+    if (result.findings.length === 0) return;
+
+    try {
+      logEvent(paths, env.agentName, env.org, 'action', 'expectation_check_failed', 'warning', {
+        finding_count: result.findings.length,
+        agents: [...new Set(result.findings.map((f) => f.agent))],
+        kinds: result.findings.reduce<Record<string, number>>((acc, f) => {
+          acc[f.kind] = (acc[f.kind] ?? 0) + 1;
+          return acc;
+        }, {}),
+        evaluable: result.coverage.evaluable,
+        declared: result.coverage.declared,
+      });
+    } catch { /* non-fatal */ }
+
+    // ONE message for the whole fleet, never one per agent — same rule as check-cron-drift.
+    if (!opts.notify) return;
+    try {
+      const contextPath = join(projectRoot, 'orgs', env.org, 'context.json');
+      if (!existsSync(contextPath)) return;
+      const ctx = JSON.parse(readFileSync(contextPath, 'utf-8'));
+      if (!ctx.orchestrator || ctx.orchestrator === env.agentName) return;
+      sendMessage(
+        paths,
+        env.agentName,
+        ctx.orchestrator,
+        'normal',
+        `Expectation check: ${result.findings.length} failure(s).\n\n${formatSweep(result)}`,
+      );
+    } catch { /* the event above already carries the finding */ }
+  });
+
 function sleepMs(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
