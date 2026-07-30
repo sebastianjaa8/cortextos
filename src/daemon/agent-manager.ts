@@ -601,7 +601,7 @@ export class AgentManager {
           logEvent(paths, name, resolvedOrg, 'error', 'inbound_persistence_failed', 'error', {
             message_id: msg.message_id,
             error: String(err),
-          });
+          }, true); // daemon logging ABOUT the agent — refreshing its heartbeat here would mask the staleness this event exists to surface
           throw err;
         }
 
