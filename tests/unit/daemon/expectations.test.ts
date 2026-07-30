@@ -26,7 +26,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, appendFileSync, utimesSync } from 'fs';
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, appendFileSync, utimesSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 
@@ -53,6 +53,7 @@ import {
   bannerReached,
   findReceipt,
   readTail,
+  writeRunReceipt,
   RECEIPTS_FILENAME,
 } from '../../../src/daemon/cron-receipts.js';
 import { CRONS_DIRECTORY } from '../../../src/bus/crons-schema.js';
@@ -736,6 +737,23 @@ describe('sweepExpectations coverage', () => {
     const res = sweepExpectations(tmp, NOW, probeFrom({}));
     expect(res.findings.map((f) => f.agent)).toEqual(['agent_good']);
     expect(res.coverage.rejected.map((r) => r.agent)).toEqual(['agent_bad']);
+  });
+});
+
+describe('writeRunReceipt', () => {
+  it('appends under state/<agent>/ with the ts first, creating the directory', () => {
+    const p = writeRunReceipt(tmp, 'builder_1', 'cron-drift-receipt.jsonl', { cron: 'x', findings: 0 }, NOW);
+    expect(p).toBe(join(tmp, 'state', 'builder_1', 'cron-drift-receipt.jsonl'));
+    expect(JSON.parse(readFileSync(p, 'utf-8').trim())).toEqual({
+      ts: NOW.toISOString(),
+      cron: 'x',
+      findings: 0,
+    });
+  });
+
+  it('writes on a CLEAN run too — otherwise "ran, found nothing" is indistinguishable from "never ran"', () => {
+    const p = writeRunReceipt(tmp, 'builder_1', 'r.jsonl', { findings: 0 }, NOW);
+    expect(JSON.parse(readFileSync(p, 'utf-8').trim()).findings).toBe(0);
   });
 });
 

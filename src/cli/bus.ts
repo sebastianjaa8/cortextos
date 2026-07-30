@@ -2904,6 +2904,7 @@ busCommand
     const projectRoot = env.projectRoot || env.frameworkRoot || process.cwd();
 
     const findings = sweepConfigCronDrift(projectRoot);
+    const { writeRunReceipt } = await import('../daemon/cron-receipts.js');
 
     // Agents with no marker AND no crons.json are harmless today but prove the marker-absent
     // state occurs here naturally — one runtime add-cron on any of them assembles the full wipe
@@ -2933,6 +2934,26 @@ Also ${latent.length} agent(s) with no .crons-migrated marker and no live crons 
         );
       }
     }
+
+    // Unconditional run receipt, written BEFORE the early return on a clean run.
+    //
+    // This detector previously produced NOTHING on a clean run — no event, no message, no file — so
+    // "ran, found nothing" was byte-identical to "never fired", and it could not be watched by
+    // anything. seb_boss guessed this exact path when adding an expectation for it and flagged that
+    // he had invented it rather than deleting the check. He guessed right about the convention; the
+    // file just did not exist yet. It does now.
+    try {
+      const ctxRoot = process.env.CTX_ROOT;
+      if (ctxRoot) {
+        writeRunReceipt(ctxRoot, env.agentName, 'cron-drift-receipt.jsonl', {
+          cron: 'cron-drift-daily',
+          findings: findings.length,
+          latent_marker_absent: latent.length,
+          stated_time_stating: coverage.stating,
+          stated_time_anchored: coverage.timeAnchored,
+        });
+      }
+    } catch { /* a receipt that cannot be written must not suppress the report */ }
 
     if (findings.length === 0) return;
 

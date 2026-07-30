@@ -29,7 +29,7 @@
  * Enumerating the wrong one produces a clean, confident, wrong report.
  */
 
-import { existsSync, readFileSync, statSync, openSync, readSync, closeSync } from 'fs';
+import { existsSync, readFileSync, statSync, openSync, readSync, closeSync, mkdirSync, appendFileSync } from 'fs';
 import { join } from 'path';
 import { CRONS_DIRECTORY, CRON_EXECUTION_LOG_FILENAME } from '../bus/crons-schema.js';
 import { localDateStamp, resolveCandidatePaths } from './expectations.js';
@@ -38,6 +38,31 @@ import { listTasks } from '../bus/task.js';
 import { resolvePaths } from '../utils/paths.js';
 
 export const RECEIPTS_FILENAME = '.cron-fire-receipts.jsonl';
+
+/**
+ * Append a run receipt for a checker, on EVERY run, pass or fail.
+ *
+ * This is the shape that makes "who watches the watcher" answerable instead of a paradox: the line
+ * written here is an `artifact-fresh` expectation in a DIFFERENT agent's manifest, evaluated by a
+ * different cron on a different schedule. Both have to fail inside the same window to stay silent.
+ *
+ * A checker that only writes something when it finds a problem cannot be watched at all — silence
+ * from "ran, all clean" is byte-identical to silence from "never ran", which is the whole failure
+ * class this harness exists for. So the receipt is unconditional.
+ */
+export function writeRunReceipt(
+  ctxRoot: string,
+  agentName: string,
+  filename: string,
+  payload: Record<string, unknown>,
+  now: Date = new Date(),
+): string {
+  const dir = join(ctxRoot, 'state', agentName);
+  mkdirSync(dir, { recursive: true });
+  const path = join(dir, filename);
+  appendFileSync(path, JSON.stringify({ ts: now.toISOString(), ...payload }) + '\n', 'utf-8');
+  return path;
+}
 
 /** How the receipt was found, weakest-last. `NONE` and `NOT-CHECKED` are NOT the same answer. */
 export type ReceiptKind =

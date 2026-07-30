@@ -11,7 +11,7 @@
  * extra steps.
  */
 
-import { statSync, readFileSync, existsSync, readdirSync, mkdirSync, appendFileSync } from 'fs';
+import { statSync, readFileSync, existsSync, readdirSync } from 'fs';
 import { join } from 'path';
 import { parseDurationMs } from '../bus/cron-state.js';
 import { readCrons } from '../bus/crons.js';
@@ -22,7 +22,7 @@ import type {
   ExpectationRejection,
   PromptMatchesDocExpectation,
 } from './expectations.js';
-import { findReceipt } from './cron-receipts.js';
+import { findReceipt, writeRunReceipt } from './cron-receipts.js';
 import type { ReceiptResult } from './cron-receipts.js';
 import type { CronDefinition } from '../types/index.js';
 
@@ -414,23 +414,20 @@ export function writeCheckerReceipt(
   result: SweepResult,
   now: Date = new Date(),
 ): string {
-  const dir = join(ctxRoot, 'state', agentName);
-  mkdirSync(dir, { recursive: true });
-  const path = join(dir, 'check-expectations-receipt.jsonl');
-  appendFileSync(
-    path,
-    JSON.stringify({
-      ts: now.toISOString(),
+  return writeRunReceipt(
+    ctxRoot,
+    agentName,
+    'check-expectations-receipt.jsonl',
+    {
       cron: 'check-expectations',
       findings: result.findings.length,
       declared: result.coverage.declared,
       evaluable: result.coverage.evaluable,
       receipt_found: result.coverage.receiptFound,
       receipt_declared: result.coverage.receiptDeclared,
-    }) + '\n',
-    'utf-8',
+    },
+    now,
   );
-  return path;
 }
 
 /** One line per finding, plus the coverage the findings alone cannot convey. */
