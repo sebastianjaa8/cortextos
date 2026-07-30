@@ -283,6 +283,10 @@ export class AgentPTY {
       args.push('--model', this.config.model);
     }
 
+    if (this.config.effort) {
+      args.push('--effort', this.config.effort);
+    }
+
     // Local override pattern (feat #20): concatenate {agentDir}/local/*.md files
     // and append as system prompt. The local/ dir is gitignored so users can customize
     // agent behavior without merge conflicts on framework updates.

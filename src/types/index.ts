@@ -166,6 +166,11 @@ export interface AgentConfig {
   crash_window?: { seconds: number; max_crashes?: number };
   model?: string;
   /**
+   * Reasoning effort passed to Claude Code via `--effort` (claude-code runtime only).
+   * One of 'low' | 'medium' | 'high' | 'xhigh' | 'max'. Omit to use the CLI's default.
+   */
+  effort?: string;
+  /**
    * Whether to launch Claude Code with `--dangerously-skip-permissions`.
    * Defaults to true (back-compat: agents run unattended). Set to false to keep
    * Claude Code's permission system engaged so the PermissionRequest hook
