@@ -43,6 +43,16 @@ export type CronDriftKind =
    * that window from the CLI, which is live on build.
    */
   | 'marker-missing'
+  /**
+   * The prompt states an intended wall-clock local time and the live schedule fires at a
+   * different one. This exists because a uniform offset cannot tell a correct timezone
+   * normalisation apart from a DOUBLE conversion of a value that was already UTC — and the
+   * arithmetic fallback has a fixed point exactly where the bug lives (a +4h double conversion
+   * of 12:00 UTC lands the local hour back on the config literal 12). Only a human-written
+   * "8:30am ET" in the prompt breaks that tie. Found 2026-07-30: two chef crons had been firing
+   * four hours late since the 06-03 migration, with their own prompts stating the correct time.
+   */
+  | 'schedule-contradicts-prompt'
   /** config.json names a cron that has no counterpart in crons.json — it will never fire. */
   | 'missing-live'
   /** Both sides use an interval (not a cron expression) and they disagree. */
@@ -201,7 +211,81 @@ export function sweepConfigCronDrift(frameworkRoot: string): CronDriftFinding[] 
   for (const agentName of listStateAgents()) {
     try {
       findings.push(...detectMissingMigrationMarker(agentName));
+      findings.push(...detectScheduleContradictsPrompt(agentName));
     } catch { /* one agent must not abort the sweep */ }
+  }
+
+  return findings;
+}
+
+
+/**
+ * Times a prompt states about itself, e.g. "Sunday 8:30am ET", "fires at 7am ET".
+ * Only local-timezone claims are matched; a prompt saying "09:00 UTC" is already unambiguous.
+ */
+function statedLocalHours(prompt: string): Array<{ hour: number; raw: string }> {
+  const out: Array<{ hour: number; raw: string }> = [];
+  const re = /\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b[^.\n]{0,20}?\b(ET|EST|EDT|local)\b/gi;
+  for (const m of prompt.matchAll(re)) {
+    let h = parseInt(m[1], 10);
+    if (h < 1 || h > 12) continue;
+    if (/pm/i.test(m[3]) && h !== 12) h += 12;
+    if (/am/i.test(m[3]) && h === 12) h = 0;
+    out.push({ hour: h, raw: m[0].trim() });
+  }
+  return out;
+}
+
+/** Current UTC-to-local offset in whole hours for the agent timezone (DST-aware). */
+function localOffsetHours(timeZone: string): number {
+  const now = new Date();
+  const local = new Date(now.toLocaleString('en-US', { timeZone }));
+  const utc = new Date(now.toLocaleString('en-US', { timeZone: 'UTC' }));
+  return Math.round((local.getTime() - utc.getTime()) / 3_600_000);
+}
+
+/**
+ * Flag any live cron whose prompt states an intended local wall-clock hour that the schedule
+ * does not fire at. Silent when the prompt states no time — an absent claim is not a
+ * contradiction, and inventing an expectation is how a detector starts crying wolf.
+ */
+export function detectScheduleContradictsPrompt(
+  agentName: string,
+  liveCronsOverride?: CronDefinition[],
+  timeZoneOverride?: string,
+): CronDriftFinding[] {
+  const tz = timeZoneOverride ?? process.env.CTX_TIMEZONE ?? 'America/New_York';
+  let offset: number;
+  try {
+    offset = localOffsetHours(tz);
+  } catch {
+    return [];
+  }
+
+  const live = liveCronsOverride ?? readCrons(agentName);
+  const findings: CronDriftFinding[] = [];
+
+  for (const cron of live) {
+    const parts = cron.schedule.trim().split(/\s+/);
+    if (parts.length !== 5) continue; // interval crons have no wall-clock time to contradict
+    const stated = statedLocalHours(cron.prompt ?? '');
+    if (stated.length === 0) continue;
+
+    const localHours = parts[1]
+      .split(',')
+      .map((h) => parseInt(h, 10))
+      .filter((h) => !isNaN(h))
+      .map((h) => ((h + offset) % 24 + 24) % 24);
+    if (localHours.length === 0) continue;
+    if (stated.some((s) => localHours.includes(s.hour))) continue;
+
+    findings.push({
+      agent: agentName,
+      cron: cron.name,
+      kind: 'schedule-contradicts-prompt',
+      configValue: `prompt says ${stated.map((s) => s.raw).join('; ')}`,
+      liveValue: `fires ${cron.schedule} = ${localHours.join(',')}:00 ${tz}`,
+    });
   }
 
   return findings;
@@ -279,10 +363,43 @@ export function countLatentMarkerAbsent(): string[] {
  */
 const KIND_ORDER: Record<CronDriftKind, number> = {
   'marker-missing': 0,
-  'missing-live': 1,
-  'interval-mismatch': 2,
-  'prompt-differs': 3,
+  'schedule-contradicts-prompt': 1,
+  'missing-live': 2,
+  'interval-mismatch': 3,
+  'prompt-differs': 4,
 };
+
+
+/**
+ * Coverage for the stated-time check, reported explicitly and for a reason.
+ *
+ * The check has a silent-degradation mode: an agent tidying its prompt — replacing a hardcoded
+ * "8am ET" with a pointer to a doc — removes the check SUBJECT, and coverage drops with no error.
+ * A shrinking denominator looks identical to a clean bill of health. This nearly happened within
+ * an hour of the check being commissioned: chef replaced the very stated time that had exposed the
+ * bug this check exists to catch.
+ *
+ * So "0 findings" is not an honest report. "10 of 14 time-anchored crons state a time, 10 match"
+ * is. A DROP in `stating` between runs is itself a finding.
+ */
+export function statedTimeCoverage(): { timeAnchored: number; stating: number; agents: string[] } {
+  let timeAnchored = 0;
+  let stating = 0;
+  const agents: string[] = [];
+  for (const agentName of listStateAgents()) {
+    try {
+      for (const cron of readCrons(agentName)) {
+        if (cron.schedule.trim().split(/\s+/).length !== 5) continue;
+        timeAnchored++;
+        if (statedLocalHours(cron.prompt ?? '').length > 0) {
+          stating++;
+          if (!agents.includes(agentName)) agents.push(agentName);
+        }
+      }
+    } catch { /* skip */ }
+  }
+  return { timeAnchored, stating, agents };
+}
 
 /** One-line-per-finding summary, used by the CLI and by the consolidated bus message. */
 export function formatDriftFindings(findings: CronDriftFinding[]): string {
@@ -305,6 +422,7 @@ export function formatDriftFindings(findings: CronDriftFinding[]): string {
     ...lines,
     '',
     'marker-missing is the assembled trigger for a full crons.json wipe on next boot — fix first.',
+    'schedule-contradicts-prompt: the prompt states a time the cron does not fire at (double conversion).',
     'config.json crons are dead text after the .crons-migrated marker is written.',
     'missing-live means that cron never fires at all.',
     'Fix with: cortextos bus update-cron <agent> <cron> --interval <i> --prompt "<p>"',

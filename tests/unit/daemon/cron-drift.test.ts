@@ -32,7 +32,7 @@ vi.mock('../../../src/daemon/cron-snapshot.js', async (importOriginal) => {
   };
 });
 
-import { detectConfigCronDrift, detectMissingMigrationMarker } from '../../../src/daemon/cron-drift.js';
+import { detectConfigCronDrift, detectMissingMigrationMarker, detectScheduleContradictsPrompt } from '../../../src/daemon/cron-drift.js';
 import { migrateCronsForAgent } from '../../../src/daemon/cron-migration.js';
 import { CRONS_DIRECTORY } from '../../../src/bus/crons-schema.js';
 import type { CronDefinition } from '../../../src/types/index.js';
@@ -260,5 +260,60 @@ describe('detectMissingMigrationMarker', () => {
     writeLiveCrons();
     writeFileSync(join(stateDir(), '.crons-migrated'), '', 'utf-8');
     expect(detectMissingMigrationMarker(AGENT)).toEqual([]);
+  });
+});
+
+describe('detectScheduleContradictsPrompt', () => {
+  // Fixed offset so the test does not depend on the date it runs. UTC-4 = EDT.
+  const TZ = 'America/New_York';
+
+  it('flags the chef double conversion: prompt says 8:30am ET, cron fires 12:30pm ET', () => {
+    const findings = detectScheduleContradictsPrompt(
+      AGENT,
+      [live({ name: 'atlas-sync', schedule: '30 16 * * 0', prompt: 'Atlas volume sync (Sunday 8:30am ET, fires after sunday-grocery)' })],
+      TZ,
+    );
+    expect(findings).toHaveLength(1);
+    expect(findings[0].kind).toBe('schedule-contradicts-prompt');
+  });
+
+  it('does NOT flag a correct normalisation: prompt says 7am ET, cron fires 11 UTC', () => {
+    expect(
+      detectScheduleContradictsPrompt(
+        AGENT,
+        [live({ name: 'morning-brief', schedule: '0 11 * * *', prompt: 'Morning brief at 7am ET.' })],
+        TZ,
+      ),
+    ).toEqual([]);
+  });
+
+  it('is silent when the prompt states no time — an absent claim is not a contradiction', () => {
+    expect(
+      detectScheduleContradictsPrompt(
+        AGENT,
+        [live({ name: 'x', schedule: '0 16 * * 0', prompt: 'Do the thing. See AGENTS.md for timing.' })],
+        TZ,
+      ),
+    ).toEqual([]);
+  });
+
+  it('ignores interval crons — they have no wall-clock time to contradict', () => {
+    expect(
+      detectScheduleContradictsPrompt(
+        AGENT,
+        [live({ name: 'heartbeat', schedule: '2h', prompt: 'Heartbeat. Night mode starts 8pm ET.' })],
+        TZ,
+      ),
+    ).toEqual([]);
+  });
+
+  it('matches any hour in a multi-hour expression', () => {
+    expect(
+      detectScheduleContradictsPrompt(
+        AGENT,
+        [live({ name: 'relay', schedule: '0 14,20 * * *', prompt: 'Relay at 10am ET and 4pm ET.' })],
+        TZ,
+      ),
+    ).toEqual([]);
   });
 });
