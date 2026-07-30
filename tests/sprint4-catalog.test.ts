@@ -238,13 +238,34 @@ describe('Sprint 4: Community Catalog', () => {
       writeFileSync(join(sourceDir, 'helper.ts'), 'export function help() {}', 'utf-8');
     });
 
-    it('scans clean files with no PII', () => {
+    it('reports clean_partial, not clean, when the caller supplied no names to scan for', () => {
+      // THIS TEST USED TO ASSERT 'clean' AND THAT WAS THE DEFECT. Calling without orgContext or
+      // userNames disables the company-name and person-name checks entirely, and the old status
+      // said `clean` regardless — a scanner reporting a complete pass having never run two of its
+      // checks. The suite was green while concealing it, in the scanner that gates PUBLIC
+      // submission. A partial scan must not be able to spell itself the same as a full one.
       const result = prepareSubmission(ctxRoot, 'skill', sourceDir, 'my-skill');
-      expect(result.status).toBe('clean');
+      expect(result.status).toBe('clean_partial');
       expect(result.name).toBe('my-skill');
       expect(result.file_count).toBe(2);
       expect(result.pii_detected.length).toBe(0);
       expect(existsSync(result.staging_dir)).toBe(true);
+      // The blind spot is named, not merely implied by a status string.
+      expect(result.checks_skipped.map((c) => c.check).sort()).toEqual(['company_name', 'user_name']);
+      expect(result.checks_run).toContain('email');
+    });
+
+    it('reports a plain clean ONLY when every check actually ran', () => {
+      // The must-reach-clean control. A status that can never be plain `clean` would be as useless
+      // as one that is always `clean`; it would just be annoying instead of dangerous.
+      const result = prepareSubmission(ctxRoot, 'skill', sourceDir, 'my-skill', {
+        orgContext: { name: 'Nonmatching Org' },
+        userNames: ['Nonmatching Person'],
+      });
+      expect(result.status).toBe('clean');
+      expect(result.checks_skipped).toEqual([]);
+      expect(result.checks_run).toContain('company_name');
+      expect(result.checks_run).toContain('user_name');
     });
 
     it('detects email addresses', () => {
@@ -295,7 +316,7 @@ describe('Sprint 4: Community Catalog', () => {
 
     it('dry-run cleans up staging dir', () => {
       const result = prepareSubmission(ctxRoot, 'skill', sourceDir, 'my-skill', { dryRun: true });
-      expect(result.status).toBe('clean');
+      expect(result.status).toBe('clean_partial'); // no names supplied — see the status test above
       expect(existsSync(result.staging_dir)).toBe(false);
     });
 

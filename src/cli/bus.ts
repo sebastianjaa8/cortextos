@@ -11,7 +11,7 @@ import { logEvent } from '../bus/event.js';
 import { updateHeartbeat, readAllHeartbeats } from '../bus/heartbeat.js';
 import { selfRestart, hardRestart, autoCommit, checkGoalStaleness, postActivity } from '../bus/system.js';
 import { createExperiment, runExperiment, evaluateExperiment, listExperiments, gatherContext, manageCycle, loadExperimentConfig } from '../bus/experiment.js';
-import { browseCatalog, installCommunityItem, prepareSubmission, submitCommunityItem } from '../bus/catalog.js';
+import { browseCatalog, installCommunityItem, loadPiiNames, prepareSubmission, submitCommunityItem } from '../bus/catalog.js';
 import { collectMetrics, parseUsageOutput, storeUsageData, checkUpstream, collectTelegramCommands, registerTelegramCommands } from '../bus/metrics.js';
 import { createApproval, updateApproval } from '../bus/approval.js';
 import { createReminder, listReminders, ackReminder, pruneReminders } from '../bus/reminders.js';
@@ -1039,8 +1039,18 @@ busCommand
   .option('--dry-run', 'Scan without keeping staged files')
   .action((type: string, sourcePath: string, name: string, opts: { dryRun?: boolean }) => {
     const env = resolveEnv();
+    const piiNames = loadPiiNames(env.ctxRoot);
     const result = prepareSubmission(env.ctxRoot, type, sourcePath, name, {
       dryRun: opts.dryRun,
+      // The org name was declared by prepareSubmission and passed by NOBODY, so the company-name
+      // leak check never ran on any real submission — only in tests, which is how a green suite
+      // concealed it. It is available right here and always was.
+      ...(env.org ? { orgContext: { name: env.org } } : {}),
+      // Real names from Sebastian, read from LOCAL config that never enters this repo
+      // (<ctxRoot>/config/pii-names.json). No hardcoded fallback: a name written here would ship to
+      // the public community catalogue on the next submission, which is exactly what this scanner
+      // exists to prevent. Absent config => user_name reports as skipped, by name.
+      ...(piiNames.length ? { userNames: piiNames } : {}),
     });
     console.log(JSON.stringify(result, null, 2));
   });

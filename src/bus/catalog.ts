@@ -61,6 +61,22 @@ export interface PrepareResult {
   file_count: number;
   files: string[];
   pii_detected: string[];
+  /**
+   * WHICH CHECKS ACTUALLY RAN, and which could not, BY NAME.
+   *
+   * Added 2026-07-30 after `prepareSubmission` was found reporting `status: 'clean'` while two of
+   * its checks had never executed: `orgContext` and `userNames` gate the company-name and
+   * person-name scans, and the only production caller passed neither. Those two keys were supplied
+   * ONLY by the test suite — so the tests proved the checks WORK while nothing in production could
+   * reach them, and a green suite concealed a dead feature in the scanner that gates PUBLIC
+   * submission.
+   *
+   * `clean` from a scanner that silently skipped half its checks is a claim, not a result. A
+   * scanner that NAMES its own blind spot is more trustworthy than one with an unqualified pass —
+   * the same property that makes croncheck's NO_EXPECTATION count useful.
+   */
+  checks_run: string[];
+  checks_skipped: { check: string; reason: string }[];
 }
 
 export interface SubmitResult {
@@ -84,6 +100,66 @@ const PII_PATTERNS = {
   telegram_chat_id: /chat_id[:\s]*[0-9]{6,}/,
   deployment_url: /https?:\/\/[a-z0-9.-]+\.(railway\.app|vercel\.app|herokuapp\.com|netlify\.app)/,
 };
+
+/**
+ * Whole-name, case-insensitive match. NOT a substring test.
+ *
+ * The previous implementation was `content.toLowerCase().includes(name.toLowerCase())`, which for a
+ * real name list is a false-positive generator: a short surname matches every longer word that
+ * contains it, and a short name matches any URL containing those letters. A PII scanner that cries
+ * wolf gets its output scrolled past — and unlike a cron report, the thing being scrolled past here
+ * is the last gate before a public repo.
+ *
+ * Multi-word names are matched WHOLE, never split, so neither half can fire alone.
+ * Internal whitespace is allowed to span a line break or repeated spaces, since a name wrapped by a
+ * formatter is still the name.
+ */
+export function matchesWholeName(content: string, name: string): boolean {
+  // ZERO BACKSLASHES ON PURPOSE. Three attempts to write this with a regex each lost a backslash
+  // in transit and shipped a broken character class; the fix is to need none. Whitespace is
+  // collapsed by comparing against the space character rather than by a class escape.
+  const norm = (s: string) =>
+    Array.from(s.toLowerCase(), (c) => (c <= ' ' ? ' ' : c))
+      .join('')
+      .split(' ')
+      .filter(Boolean)
+      .join(' ');
+  const needle = norm(name);
+  if (!needle) return false;
+  const hay = norm(content);
+  const WORD_CHARS = 'abcdefghijklmnopqrstuvwxyz0123456789_';
+  const isWord = (ch: string | undefined) => ch !== undefined && WORD_CHARS.includes(ch);
+  let from = 0;
+  for (;;) {
+    const i = hay.indexOf(needle, from);
+    if (i === -1) return false;
+    // Boundary on BOTH sides, so a short name cannot fire inside a longer word.
+    if (!isWord(hay[i - 1]) && !isWord(hay[i + needle.length])) return true;
+    from = i + 1;
+  }
+}
+
+/**
+ * The names to scan for, read from LOCAL config that never enters this repo.
+ *
+ * `<ctxRoot>/config/pii-names.json` — outside the source tree by construction, so the list of names
+ * we are trying to keep OUT of a public repo cannot itself be committed into one. There is
+ * deliberately no committed default file and no fallback list in code: a hardcoded name here would
+ * ship to the community catalogue on the next submission, which is the exact failure this scanner
+ * exists to prevent.
+ *
+ * Absent or unreadable returns [], and the caller reports `user_name` in `checks_skipped` by name.
+ * Adding a name is a config edit, never a code change.
+ */
+export function loadPiiNames(ctxRoot: string): string[] {
+  try {
+    const raw = JSON.parse(readFileSync(join(ctxRoot, 'config', 'pii-names.json'), 'utf-8'));
+    const names = Array.isArray(raw) ? raw : raw?.names;
+    return Array.isArray(names) ? names.filter((n) => typeof n === 'string' && n.trim()) : [];
+  } catch {
+    return [];
+  }
+}
 
 // --- Item name validation ---
 
@@ -329,15 +405,15 @@ export function prepareSubmission(
   options: { dryRun?: boolean; orgContext?: { name?: string }; userNames?: string[] } = {},
 ): PrepareResult {
   if (!itemType || !sourcePath || !itemName) {
-    return { status: 'error', name: itemName || '', type: itemType || '', staging_dir: '', file_count: 0, files: [], pii_detected: ['usage: prepare-submission <skill|agent|org> <source-path> <item-name>'] };
+    return { status: 'error', name: itemName || '', type: itemType || '', staging_dir: '', file_count: 0, files: [], checks_run: [], checks_skipped: [{ check: 'all', reason: 'aborted before scanning' }], pii_detected: ['usage: prepare-submission <skill|agent|org> <source-path> <item-name>'] };
   }
 
   if (!isValidItemName(itemName)) {
-    return { status: 'error', name: itemName, type: itemType, staging_dir: '', file_count: 0, files: [], pii_detected: ['invalid item name (allowed: a-zA-Z0-9 _ -)'] };
+    return { status: 'error', name: itemName, type: itemType, staging_dir: '', file_count: 0, files: [], checks_run: [], checks_skipped: [{ check: 'all', reason: 'aborted before scanning' }], pii_detected: ['invalid item name (allowed: a-zA-Z0-9 _ -)'] };
   }
 
   if (!existsSync(sourcePath)) {
-    return { status: 'error', name: itemName, type: itemType, staging_dir: '', file_count: 0, files: [], pii_detected: ['source path not found'] };
+    return { status: 'error', name: itemName, type: itemType, staging_dir: '', file_count: 0, files: [], checks_run: [], checks_skipped: [{ check: 'all', reason: 'aborted before scanning' }], pii_detected: ['source path not found'] };
   }
 
   // Staging directory
@@ -345,7 +421,7 @@ export function prepareSubmission(
 
   // Verify staging path is under community-staging/
   if (!isInsideDir(join(ctxRoot, 'community-staging'), stagingDir)) {
-    return { status: 'error', name: itemName, type: itemType, staging_dir: '', file_count: 0, files: [], pii_detected: ['staging directory resolves outside expected path'] };
+    return { status: 'error', name: itemName, type: itemType, staging_dir: '', file_count: 0, files: [], checks_run: [], checks_skipped: [{ check: 'all', reason: 'aborted before scanning' }], pii_detected: ['staging directory resolves outside expected path'] };
   }
 
   // Clean and create staging
@@ -394,7 +470,7 @@ export function prepareSubmission(
     // Check for known user names
     if (options.userNames) {
       for (const name of options.userNames) {
-        if (content.toLowerCase().includes(name.toLowerCase())) {
+        if (matchesWholeName(content, name)) {
           piiFound.push(`${relPath}:user_name:${name}`);
         }
       }
@@ -402,7 +478,7 @@ export function prepareSubmission(
 
     // Check for company name
     if (options.orgContext?.name) {
-      if (content.toLowerCase().includes(options.orgContext.name.toLowerCase())) {
+      if (matchesWholeName(content, options.orgContext.name)) {
         piiFound.push(`${relPath}:company_name:${options.orgContext.name}`);
       }
     }
@@ -412,14 +488,32 @@ export function prepareSubmission(
     rmSync(stagingDir, { recursive: true, force: true });
   }
 
+  // DERIVED FROM PII_PATTERNS, not typed. My first version of this line listed
+  // ['email','api_key','absolute_path','ip_address','deployment_url'] — three of which DO NOT
+  // EXIST — because I wrote the inventory from memory instead of from the code, inside the very
+  // change whose purpose was to stop this scanner overstating what it checked. Narrated is not
+  // measured, committed in the honesty fix. Deriving it means the report cannot drift from what
+  // actually runs, and adding a pattern updates the report for free.
+  const checksRun = Object.keys(PII_PATTERNS);
+  const checksSkipped: { check: string; reason: string }[] = [];
+  if (options.userNames && options.userNames.length > 0) checksRun.push('user_name');
+  else checksSkipped.push({ check: 'user_name', reason: 'no userNames supplied by the caller — personal names were NOT scanned for' });
+  if (options.orgContext?.name) checksRun.push('company_name');
+  else checksSkipped.push({ check: 'company_name', reason: 'no orgContext.name supplied by the caller — the org name was NOT scanned for' });
+
   return {
-    status: piiFound.length > 0 ? 'pii_detected' : 'clean',
+    // `clean` would overstate a partial scan. A pass with skipped checks is PARTIAL, and the
+    // distinction is the whole point: the previous version reported 'clean' having never run two
+    // of its checks.
+    status: piiFound.length > 0 ? 'pii_detected' : (checksSkipped.length > 0 ? 'clean_partial' : 'clean'),
     name: itemName,
     type: itemType,
     staging_dir: stagingDir,
     file_count: files.length,
     files,
     pii_detected: piiFound,
+    checks_run: checksRun,
+    checks_skipped: checksSkipped,
   };
 }
 
