@@ -37,7 +37,22 @@ Output:
   - one `bus log-event metric cron_overdue_gap` per overdue cron
   - one `bus log-event metric missing_heartbeat_cron` per agent missing one
 
-Always exits 0 in normal mode (watchdog sub-check must never abort the chain).
+EXIT CODE (reversed 2026-07-30 — this used to read "always exits 0 in normal mode, the
+watchdog sub-check must never abort the chain"). Now returns 2 when there are findings, 0
+when clean. The reversal is deliberate and recorded rather than left as drift:
+
+  On 2026-07-30 the 06:30Z run found 10 GAPs and 2 OVERDUE, wrote them to .watchdog.log,
+  printed NOTHING under --quiet, and exited 0. A run WITH findings was byte-identical at
+  the call site to a clean run. The cron prompt tells the agent to send a bus message "if
+  gaps found" — a conditional whose predicate the invocation had already removed. Exit 0
+  plus empty stdout carried no condition to branch on.
+
+  The original reason for always-0 still stands where it applies: if this is ever chained
+  behind `&&`, a non-zero exit WILL abort the chain. The caller must then use `;` or
+  `|| true`. It must NOT be made silent again to protect a chain — a detector that cannot
+  report is worse than a chain that stops.
+
+--quiet suppresses ROUTINE output only. FINDINGS always print, on both channels.
 Run `--self-test` for the built-in synthetic check.
 
 Env overrides (used by --self-test, harmless in prod):
@@ -215,7 +230,11 @@ def audit_overdue(now):
     flagged = []
     if not os.path.isdir(STATE_DIR):
         return flagged
+    enabled_agents = load_enabled_agents()
     for agent in sorted(os.listdir(STATE_DIR)):
+        # Same roster filter as `audit` — retired agents' stalled crons are expected, not news.
+        if not is_expected_productive(agent, enabled_agents):
+            continue
         path = os.path.join(STATE_DIR, agent, "crons.json")
         try:
             with open(path, "r", encoding="utf-8") as fh:
@@ -270,12 +289,63 @@ def audit_missing_heartbeat():
     return flagged
 
 
+def load_enabled_agents():
+    """{agent: cfg} from enabled-agents.json, or {} if unreadable."""
+    try:
+        with open(ENABLED_AGENTS_PATH, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {}
+
+
+def is_expected_productive(agent, enabled_agents):
+    """Should this agent's crons be producing anything at all?
+
+    Added 2026-07-30. `audit_missing_heartbeat` has always applied exactly this rule and
+    documented it; `audit` and `audit_overdue` did not, so the same script judged three
+    checks against two different populations. This is a consistency fix, not a new predicate.
+
+    Two distinct noise classes, ONE predicate covering both — the roster:
+
+      * `test-agent` / `sc2-drift-1000` — ABSENT from the roster. Leaked test fixtures whose
+        fake fires were written into the live state dir by a test that resolved CTX_ROOT from
+        the environment (fixed in cortextOS c8f19c5). 8 of the 10 GAPs on 2026-07-30 were
+        these. Historical records remain and would be counted forever.
+      * `builder_2` / `builder_opus` / `hermes` — PRESENT but `enabled: false`. Retired by
+        design. Both 2026-07-30 OVERDUE findings were these.
+
+    An "is there an orgs/ dir" filter — the first proposal — would have excluded only the
+    first class: both retired agents still HAVE orgs/ dirs. The fact "should this be
+    productive" lives in the roster, not on the filesystem.
+
+    An empty/unreadable roster returns True for everything, so a missing config degrades to
+    the old louder behaviour rather than silently excluding the whole fleet.
+    """
+    if not enabled_agents:
+        return True
+    cfg = enabled_agents.get(agent)
+    if cfg is None:
+        return False
+    return bool(cfg.get("enabled"))
+
+
 def discover_agents():
+    """Agents with a cron-execution.log AND expected to be productive.
+
+    Returns (included, excluded). The excluded list is NOT discarded: it becomes the
+    denominator in the CLEAN line, because an exclusion nobody can see recreates exactly the
+    silence this fix removes — an accidentally-disabled real agent would stop being reported
+    with no trace.
+    """
     if not os.path.isdir(STATE_DIR):
-        return []
-    return sorted(
+        return [], []
+    enabled_agents = load_enabled_agents()
+    physical = sorted(
         a for a in os.listdir(STATE_DIR)
         if os.path.isfile(os.path.join(STATE_DIR, a, "cron-execution.log")))
+    included = [a for a in physical if is_expected_productive(a, enabled_agents)]
+    excluded = [a for a in physical if a not in included]
+    return included, excluded
 
 
 def audit():
@@ -283,7 +353,8 @@ def audit():
     since = now - timedelta(hours=LOOKBACK_HOURS)
     gaps = []  # (agent, cron, streak, total_closed)
     checked = 0
-    for agent in discover_agents():
+    included, excluded = discover_agents()
+    for agent in included:
         fires = load_fires(agent, since)
         if not fires:
             continue
@@ -293,7 +364,7 @@ def audit():
             streak, total = trailing_silent_streak(flist, event_times, now)
             if streak >= SILENT_STREAK_FLAG:
                 gaps.append((agent, cron, streak, total))
-    return now, checked, gaps
+    return now, checked, gaps, included, excluded
 
 
 def log_line(text):
@@ -344,14 +415,40 @@ def _emit(event, payload):
         print("WARN: bus log-event failed: %s" % e, file=sys.stderr)
 
 
+def describe_gap(agent, cron, streak, total_closed):
+    """One gap, with its CENSORING state made explicit.
+
+    Added 2026-07-30. `streak == total_closed` means the silent run reached the edge of the
+    48h LOOKBACK_HOURS window: the streak ran out of WINDOW, not out of DATA, so the count is
+    a LOWER BOUND and the true streak is unknown. Reported as ">=N" for that case.
+
+    This matters because a partial count reads as a complete one. On 2026-07-30 the audit
+    reported "finance_tracker/finance-budget-alerts (6 silent fires)" while finance_tracker
+    independently counted 10 over 22 days. The audit was not wrong — 6 was 100% of what a 48h
+    window can see, and all 6 were silent, so the window was exhausted. But "6 silent fires"
+    reads as the answer, and it was a floor.
+
+    The window is NOT widened to fix this. LOOKBACK_HOURS exists deliberately to avoid judging
+    ancient history, and removing it changes what a trailing streak means. Make the bound
+    VISIBLE, not absent.
+
+    Note the censoring signal was already being computed and thrown away: `audit` returned
+    `total_closed` and the old summary discarded it with an underscore.
+    """
+    if total_closed and streak >= total_closed:
+        return "%s/%s (>=%d silent fires — CENSORED: all %d fires in the %dh window were silent, true streak unknown)" % (
+            agent, cron, streak, total_closed, LOOKBACK_HOURS)
+    return "%s/%s (%d silent fires of %d in window)" % (agent, cron, streak, total_closed)
+
+
 def run(quiet=False):
-    now, checked, gaps = audit()
+    now, checked, gaps, included, excluded = audit()
     overdue = audit_overdue(now)
     missing_hb = audit_missing_heartbeat()
     ts = now.strftime("%Y-%m-%dT%H:%MZ")
     parts = []
     if gaps:
-        detail = ", ".join("%s/%s (%d silent fires)" % (a, c, s) for a, c, s, _ in gaps)
+        detail = ", ".join(describe_gap(a, c, s, t) for a, c, s, t in gaps)
         parts.append("%d GAP(s) — %s" % (len(gaps), detail))
         for agent, cron, streak, _ in gaps:
             emit_bus_event(agent, cron, streak)
@@ -368,15 +465,26 @@ def run(quiet=False):
         parts.append("%d MISSING-HEARTBEAT — %s" % (len(missing_hb), detail))
         for agent, reason in missing_hb:
             emit_missing_heartbeat_event(agent, reason)
+    # Coverage carried on BOTH the findings and the clean line. An exclusion nobody can see
+    # recreates the silence this fix removes: an accidentally-disabled real agent would drop out
+    # of the population with no trace, and a shrinking denominator reads exactly like good news.
+    # A DROP in the agent count between runs is itself a finding.
+    coverage = "%d crons across %d expected-productive agent(s)" % (checked, len(included))
+    if excluded:
+        coverage += "; %d excluded as not-enabled/not-in-roster: %s" % (len(excluded), ", ".join(excluded))
+
     if parts:
-        line = "[%s] cron-effectiveness-audit: %s" % (ts, "; ".join(parts))
+        line = "[%s] cron-effectiveness-audit: %s [%s]" % (ts, "; ".join(parts), coverage)
     else:
-        line = "[%s] cron-effectiveness-audit: CLEAN (%d crons checked, all fires productive within %dmin, none overdue)" % (
-            ts, checked, WINDOW_MIN)
+        line = "[%s] cron-effectiveness-audit: CLEAN (%s; all fires productive within %dmin, none overdue)" % (
+            ts, coverage, WINDOW_MIN)
     log_line(line)
-    if not quiet:
+    # FINDINGS always print; --quiet governs only the routine CLEAN line. The whole defect was
+    # one channel carrying a condition the invocation had already removed, so findings now go out
+    # on two independent channels — stdout AND the exit code — and neither depends on the other.
+    if parts or not quiet:
         print(line)
-    return 0
+    return 2 if parts else 0
 
 
 # --------------------------------------------------------------------------- #
@@ -440,8 +548,46 @@ def self_test():
         global STATE_DIR, EVENTS_DIRS, WATCHDOG_LOG, BUS_ENABLED
         STATE_DIR, EVENTS_DIRS, WATCHDOG_LOG, BUS_ENABLED = state, [events], wlog, False
 
-        _, checked, gaps = audit()
+        # Roster fixture, written HERE rather than further down, because as of 2026-07-30 `audit`
+        # and `audit_overdue` also consult it — not just `audit_missing_heartbeat`. Writing it after
+        # the audit() call left every fire-based fixture absent from the roster and therefore
+        # excluded, which the self-test caught immediately. One fixture, all consumers.
+        enabled_agents_path = os.path.join(tmp, "enabled-agents.json")
+        with open(enabled_agents_path, "w", encoding="utf-8") as fh:
+            json.dump({
+                "broken": {"enabled": True},
+                "healthy": {"enabled": True},
+                "recovered": {"enabled": True},
+                "nohb": {"enabled": True},
+                "hbdisabled": {"enabled": True},
+                "hbfine": {"enabled": True},
+                "staleagent": {"enabled": True},
+                "parked": {"enabled": False},
+                # "leaked-fixture" deliberately ABSENT — see the exclusion assertions below.
+            }, fh)
+        os.environ["CRON_AUDIT_ENABLED_AGENTS"] = enabled_agents_path
+        global ENABLED_AGENTS_PATH
+        ENABLED_AGENTS_PATH = enabled_agents_path
+
+        # A leaked test fixture: real-looking silent fires, absent from the roster. This is the
+        # test-agent shape that produced 8 of 10 GAPs on 2026-07-30, and it must NOT be flagged.
+        write_jsonl(os.path.join(state, "leaked-fixture", "cron-execution.log"), [
+            {"ts": (now - timedelta(hours=h)).strftime("%Y-%m-%dT%H:%M:%SZ"), "cron": "racy", "status": "fired"}
+            for h in (10, 8, 6, 4, 2)
+        ])
+
+        _, checked, gaps, included, excluded = audit()
         flagged = {(a, c) for a, c, _, _ in gaps}
+
+        # --- roster exclusion (added 2026-07-30) ---
+        assert ("leaked-fixture", "racy") not in flagged, \
+            "an agent absent from the roster must NOT be flagged, got %s" % flagged
+        assert "leaked-fixture" in excluded, "excluded list must NAME it, got %s" % excluded
+        assert "broken" in included, "a rostered enabled agent must be included, got %s" % included
+        # positive control on the exclusion itself: without it, this fixture WOULD flag (5 silent
+        # fires, streak >= 3). So the assertion above is not vacuous.
+        assert len(load_fires("leaked-fixture", now - timedelta(hours=LOOKBACK_HOURS))) == 1, \
+            "fixture must actually have loadable fires, else the exclusion test proves nothing"
 
         assert ("broken", "heartbeat") in flagged, "broken cron must flag, got %s" % flagged
         assert ("healthy", "heartbeat") not in flagged, "healthy cron must NOT flag"
@@ -503,18 +649,9 @@ def self_test():
         # parked: no heartbeat cron, but disabled at the fleet level -> excluded, no flag
         write_crons("parked", [{"name": "some-other-cron", "schedule": "1h", "enabled": True}])
 
-        enabled_agents_path = os.path.join(tmp, "enabled-agents.json")
-        with open(enabled_agents_path, "w", encoding="utf-8") as fh:
-            json.dump({
-                "nohb": {"enabled": True},
-                "hbdisabled": {"enabled": True},
-                "hbfine": {"enabled": True},
-                "parked": {"enabled": False},
-            }, fh)
-        os.environ["CRON_AUDIT_ENABLED_AGENTS"] = enabled_agents_path
-        global ENABLED_AGENTS_PATH
-        ENABLED_AGENTS_PATH = enabled_agents_path
-
+        # Roster fixture moved ABOVE the audit() call (2026-07-30) and widened to cover every
+        # fixture agent, because audit/audit_overdue now consult it too. Rewriting the narrower
+        # version here would have excluded broken/healthy/recovered from the later checks.
         missing_hb = audit_missing_heartbeat()
         hbflag = dict(missing_hb)
         assert hbflag.get("nohb") == "no heartbeat cron", "nohb must flag, got %s" % hbflag

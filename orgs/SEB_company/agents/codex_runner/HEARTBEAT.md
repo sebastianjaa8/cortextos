@@ -1,5 +1,13 @@
 # Heartbeat Checklist
 
+## Night Mode
+
+If local time is 00:00-08:00 America/New_York, use a silent heartbeat: touch file, no Telegram, no active execution unless seb_boss explicitly overrides.
+
+## Cap Discipline
+
+Cap discipline: check Codex CLI weekly cap usage; surface to seb_boss via bus at 70% / 85% / 95% thresholds; halt new dispatches at 95%.
+
 Runs every 4h. Execute ALL steps in order — skipping = broken system, dashboard tracks compliance.
 
 ## Step 0: Tier 3 context gate (NEW 2026-05-25)
