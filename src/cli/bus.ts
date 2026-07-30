@@ -2899,7 +2899,7 @@ busCommand
   .option('--json', 'Emit raw JSON instead of the formatted report')
   .option('--notify', 'Send ONE consolidated message to the org orchestrator when drift is found')
   .action(async (opts: { json?: boolean; notify?: boolean }) => {
-    const { sweepConfigCronDrift, formatDriftFindings, countLatentMarkerAbsent } = await import('../daemon/cron-drift.js');
+    const { sweepConfigCronDrift, formatDriftFindings, countLatentMarkerAbsent, statedTimeCoverage } = await import('../daemon/cron-drift.js');
     const env = resolveEnv();
     const projectRoot = env.projectRoot || env.frameworkRoot || process.cwd();
 
@@ -2910,11 +2910,21 @@ busCommand
     // condition by accident. Counted, not listed as findings: two permanent top-of-report entries
     // is how a real finding gets trained out of existence.
     const latent = countLatentMarkerAbsent();
+    // Coverage, not just findings. A prompt tidied into a pointer removes the check subject and
+    // shrinks the denominator silently, which reads exactly like a clean report.
+    const coverage = statedTimeCoverage();
 
     if (opts.json) {
-      console.log(JSON.stringify({ findings, latent_marker_absent: latent }, null, 2));
+      console.log(JSON.stringify({ findings, latent_marker_absent: latent, stated_time_coverage: coverage }, null, 2));
     } else {
       console.log(formatDriftFindings(findings));
+      console.log(
+        `
+Stated-time coverage: ${coverage.stating} of ${coverage.timeAnchored} time-anchored ` +
+          `cron(s) state their intended local time and are therefore checkable. A DROP in that ` +
+          `first number between runs is itself a finding — a prompt tidied into a doc pointer ` +
+          `removes the only evidence that can catch a wrong schedule.`,
+      );
       if (latent.length > 0) {
         console.log(
           `
