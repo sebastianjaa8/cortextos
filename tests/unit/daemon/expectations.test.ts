@@ -53,6 +53,7 @@ import {
   bannerReached,
   findReceipt,
   readTail,
+  readRotatedTail,
   writeRunReceipt,
   RECEIPTS_FILENAME,
 } from '../../../src/daemon/cron-receipts.js';
@@ -410,6 +411,65 @@ describe('readTail', () => {
 
   it('returns empty string for a missing file rather than throwing', () => {
     expect(readTail(join(tmp, 'nope.log'), 100)).toBe('');
+  });
+
+  it('readRotatedTail spans the rotated predecessor, newest content LAST', () => {
+    const dir = join(tmp, 'logs', 'a');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'stdout.log.1'), 'OLDMARK', 'utf-8');
+    writeFileSync(join(dir, 'stdout.log'), 'NEWMARK', 'utf-8');
+    const out = readRotatedTail(dir, 'stdout.log', 1000);
+    expect(out).toBe('OLDMARKNEWMARK');
+    // negative control: the same call must NOT invent content when the rotated file is absent.
+    const dir2 = join(tmp, 'logs', 'b');
+    mkdirSync(dir2, { recursive: true });
+    writeFileSync(join(dir2, 'stdout.log'), 'ONLYNEW', 'utf-8');
+    expect(readRotatedTail(dir2, 'stdout.log', 1000)).toBe('ONLYNEW');
+  });
+
+  it('readRotatedTail spends the budget NEWEST-first and never exceeds it', () => {
+    const dir = join(tmp, 'logs', 'c');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'stdout.log.1'), 'O'.repeat(500), 'utf-8');
+    writeFileSync(join(dir, 'stdout.log'), 'N'.repeat(500), 'utf-8');
+    const out = readRotatedTail(dir, 'stdout.log', 600);
+    expect(out.length).toBe(600);
+    // 500 newest bytes kept in full, only the remaining 100 spent on the older file.
+    expect(out.endsWith('N'.repeat(500))).toBe(true);
+    expect(out.startsWith('O'.repeat(100))).toBe(true);
+  });
+
+  it('REGRESSION: a banner living only in the ROTATED log still counts as a receipt', () => {
+    // Measured cause: finance_tracker/stdout.log.1 held 1572 CRON FIRED banners against 1011 in the
+    // current log. Reading only stdout.log scored those delivered fires as NONE, which this harness
+    // reports as "the injection dropped and the producer is innocent" — rotation silently
+    // MISATTRIBUTED BLAME using evidence I had failed to look at.
+    const cronDir = join(tmp, CRONS_DIRECTORY, 'agent_a');
+    mkdirSync(cronDir, { recursive: true });
+    writeFileSync(
+      join(cronDir, 'cron-execution.log'),
+      JSON.stringify({ ts: '2026-07-29T21:00:14.085Z', cron: 'daily-hygiene', status: 'fired' }) + '\n',
+      'utf-8',
+    );
+    const logDir = join(tmp, 'logs', 'agent_a');
+    mkdirSync(logDir, { recursive: true });
+    // Banner ONLY in the rotated file; current log has unrelated output.
+    writeFileSync(
+      join(logDir, 'stdout.log.1'),
+      '[CRON FIRED 2026-07-29T21:00:14.085Z] daily-hygiene: go\n',
+      'utf-8',
+    );
+    writeFileSync(join(logDir, 'stdout.log'), 'later unrelated output\n', 'utf-8');
+
+    const res = findReceipt({
+      agent: 'agent_a',
+      cron: 'daily-hygiene',
+      date: '2026-07-29',
+      timezone: 'America/New_York',
+      now: NOW,
+      windowMs: 26 * 3_600_000,
+    });
+    expect(res.kind).toBe('stdout-banner');
   });
 });
 

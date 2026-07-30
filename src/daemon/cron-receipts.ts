@@ -169,6 +169,27 @@ export function readTail(path: string, maxBytes: number): string {
   return buf.toString('latin1');
 }
 
+/**
+ * Tail across the CURRENT log and its rotated predecessor, newest content last.
+ *
+ * Reading only `stdout.log` was a real defect in the first version of this module and it failed in the
+ * worst direction. Measured on this fleet: `finance_tracker/stdout.log.1` holds 1572 CRON FIRED banners
+ * while its current `stdout.log` holds 1011, and 11 agents have a rotated file. A fire whose banner
+ * landed before the last rotation therefore scored as `NONE` — no receipt — which this harness reports
+ * as "the injection dropped and the producer is innocent". So rotation silently MISATTRIBUTED BLAME and
+ * inflated the apparent injection-drop rate, using the absence of evidence I had failed to look at.
+ *
+ * Budget is shared, newest first: fill from `stdout.log`, and only spend what remains on `stdout.log.1`.
+ * A day-scale window almost never needs the older file, so the common case costs nothing extra.
+ */
+export function readRotatedTail(logDir: string, basename: string, maxBytes: number): string {
+  const current = readTail(join(logDir, basename), maxBytes);
+  const remaining = maxBytes - current.length;
+  if (remaining <= 0) return current;
+  const previous = readTail(join(logDir, `${basename}.1`), remaining);
+  return previous + current;
+}
+
 const TAIL_BYTES = 16 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
@@ -335,7 +356,7 @@ function declaredPathHit(
 
 function bannerHit(fires: string[], ctxRoot: string, agent: string): string | null {
   if (fires.length === 0) return null;
-  const dense = densify(readTail(join(ctxRoot, 'logs', agent, 'stdout.log'), TAIL_BYTES));
+  const dense = densify(readRotatedTail(join(ctxRoot, 'logs', agent), 'stdout.log', TAIL_BYTES));
   if (!dense) return null;
   const regions = bannerRegions(dense);
   for (const ts of fires) {
