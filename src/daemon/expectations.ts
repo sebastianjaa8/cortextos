@@ -53,6 +53,16 @@ interface ExpectationCommon {
    * report says so rather than leaving it marked provisional forever.
    */
   speculative?: boolean;
+  /**
+   * `YYYY-MM-DD` the speculative flag was added. Optional, and its ABSENCE is reported.
+   *
+   * Closes the asymmetry in the flag as first shipped: a passing speculative expectation was told to
+   * promote itself, but a FAILING one had no shelf life at all. One failing for thirty days rendered
+   * identically to one declared five minutes ago, so an unconfirmable guess became permanent failing
+   * furniture — the provisional-marker-nobody-removes problem, reappearing on the branch I had not
+   * covered. A guess is cheap because it is TEMPORARY; without a date nothing makes it temporary.
+   */
+  speculative_since?: string;
 }
 
 /**
@@ -157,6 +167,8 @@ function validate(
         agent,
         timezone,
         speculative: raw.speculative === true,
+        speculative_since:
+          typeof raw.speculative_since === 'string' ? raw.speculative_since : undefined,
         type: 'artifact-fresh',
         path: raw.path,
         max_age: raw.max_age,
@@ -182,6 +194,8 @@ function validate(
         agent,
         timezone,
         speculative: raw.speculative === true,
+        speculative_since:
+          typeof raw.speculative_since === 'string' ? raw.speculative_since : undefined,
         type: 'prompt-matches-doc',
         cron: raw.cron,
         doc: typeof raw.doc === 'string' ? raw.doc : '(unspecified)',

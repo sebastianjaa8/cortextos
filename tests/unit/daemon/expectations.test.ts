@@ -811,6 +811,81 @@ describe('speculative expectations', () => {
   });
 });
 
+describe('speculative shelf life', () => {
+  function guessed(over: Record<string, unknown>) {
+    const dir = agentDir('agent_a');
+    writeManifest(dir, [
+      {
+        id: 'guessed',
+        type: 'artifact-fresh',
+        path: '/vault/guessed.md',
+        max_age: '26h',
+        speculative: true,
+        ...over,
+      },
+    ]);
+    return sweepExpectations(tmp, NOW, probeFrom({}));
+  }
+
+  it('reports the age of a failing speculative flag on the finding line', () => {
+    const res = guessed({ speculative_since: '2026-07-20' });
+    expect(res.findings[0].speculativeDays).toBe(10);
+    expect(formatSweep(res)).toMatch(/\[speculative 10d\]/);
+  });
+
+  it('shelf-life boundary: 14 days is tolerated, 15 is confirm-or-delete', () => {
+    // NOW is 2026-07-30T02:00Z. 07-16 is 14d, 07-15 is 15d.
+    expect(guessed({ speculative_since: '2026-07-16' }).coverage.speculativeStale).toEqual([]);
+    expect(guessed({ speculative_since: '2026-07-15' }).coverage.speculativeStale).toEqual([
+      { agent: 'agent_a', id: 'guessed', days: 15 },
+    ]);
+  });
+
+  it('treats an UNDATED speculative failure as stale immediately — omitting one field must not buy permanence', () => {
+    const res = guessed({});
+    expect(res.findings[0].speculativeDays).toBeNull();
+    expect(res.coverage.speculativeStale).toEqual([
+      { agent: 'agent_a', id: 'guessed', days: null },
+    ]);
+    expect(formatSweep(res)).toMatch(/NO DATE — add speculative_since/);
+    expect(formatSweep(res)).toMatch(/no speculative_since declared/);
+  });
+
+  it('an unparseable date is treated as undated, not as day zero', () => {
+    expect(guessed({ speculative_since: 'last tuesday' }).coverage.speculativeStale).toEqual([
+      { agent: 'agent_a', id: 'guessed', days: null },
+    ]);
+  });
+
+  it('a PASSING speculative expectation is never stale — it is promotable instead', () => {
+    const dir = agentDir('agent_a');
+    writeManifest(dir, [
+      {
+        id: 'old-but-passing',
+        type: 'artifact-fresh',
+        path: '/vault/real.md',
+        max_age: '26h',
+        speculative: true,
+        speculative_since: '2026-01-01',
+      },
+    ]);
+    const res = sweepExpectations(tmp, NOW, probeFrom({ '/vault/real.md': { bytes: 9999, ageMs: 1_000 } }));
+    expect(res.coverage.speculativeStale).toEqual([]);
+    expect(res.coverage.promotable).toHaveLength(1);
+  });
+
+  it('a CONFIRMED failure is never bucketed as stale, however old the expectation is', () => {
+    const dir = agentDir('agent_a');
+    writeManifest(dir, [
+      { id: 'confirmed', type: 'artifact-fresh', path: '/vault/gone.md', max_age: '26h' },
+    ]);
+    const res = sweepExpectations(tmp, NOW, probeFrom({}));
+    expect(res.findings).toHaveLength(1);
+    expect(res.coverage.speculativeStale).toEqual([]);
+    expect(formatSweep(res)).not.toMatch(/\[speculative/);
+  });
+});
+
 describe('writeRunReceipt', () => {
   it('appends under state/<agent>/ with the ts first, creating the directory', () => {
     const p = writeRunReceipt(tmp, 'builder_1', 'cron-drift-receipt.jsonl', { cron: 'x', findings: 0 }, NOW);

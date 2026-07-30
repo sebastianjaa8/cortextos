@@ -168,6 +168,20 @@ export function checkArtifactFresh(
   };
 }
 
+/**
+ * Days since a `YYYY-MM-DD` stamp, or null when the author declared none.
+ *
+ * null is reported rather than defaulted to 0. Treating an undated flag as brand new is how a
+ * provisional marker lives forever: the one entry with no shelf life would be the one that never
+ * ages out.
+ */
+export function speculativeAgeDays(since: string | undefined, now: Date): number | null {
+  if (!since) return null;
+  const t = Date.parse(since + 'T00:00:00Z');
+  if (isNaN(t)) return null;
+  return Math.max(0, Math.floor((now.getTime() - t) / 86_400_000));
+}
+
 function fmtAge(ms: number): string {
   const h = ms / 3_600_000;
   return h < 1 ? `${Math.round(ms / 60_000)}m` : `${h.toFixed(1)}h`;
@@ -257,7 +271,18 @@ export interface ExpectationFinding {
    * They are ranked and rendered separately so the first can never push the second off the top.
    */
   speculative?: boolean;
+  /** Days the speculative flag has been on this expectation, or null when no date was declared. */
+  speculativeDays?: number | null;
 }
+
+/**
+ * Days a speculative expectation may keep failing before the report says confirm-or-delete.
+ *
+ * A guess is cheap because it is TEMPORARY. Nothing enforced that, so this is the enforcement: past
+ * this age an unconfirmed failing guess is noise with a plausible explanation attached, which is
+ * worse than noise, because it reads as a known issue.
+ */
+const SPECULATIVE_SHELF_DAYS = 14;
 
 /**
  * Coverage, reported alongside findings and never folded into them.
@@ -280,6 +305,8 @@ export interface ExpectationCoverage {
   receiptFound: number;
   /** Expectations declared against an unconfirmed artifact. Cheap to have, must stay labelled. */
   speculative: number;
+  /** Speculative FAILURES past their shelf life, or with no declared date at all. */
+  speculativeStale: Array<{ agent: string; id: string; days: number | null }>;
   /**
    * Speculative expectations that PASSED, i.e. the guess was right and the flag has done its job.
    *
@@ -338,6 +365,7 @@ export function sweepExpectations(
     receiptEligible: 0,
     receiptFound: 0,
     speculative: 0,
+    speculativeStale: [],
     promotable: [],
   };
 
@@ -371,7 +399,11 @@ export function sweepExpectations(
             detail: `${res.path}: ${res.detail}`,
             receipt,
             speculative: exp.speculative,
+            speculativeDays: exp.speculative
+              ? speculativeAgeDays(exp.speculative_since, now)
+              : undefined,
           });
+          if (exp.speculative) noteStale(exp, now, coverage);
         } else if (exp.speculative) {
           // The guess was right. Say so, so the flag gets removed instead of aging into noise.
           coverage.promotable.push({ agent: exp.agent, id: exp.id });
@@ -393,7 +425,11 @@ export function sweepExpectations(
           kind: 'DRIFT',
           detail: res.detail,
           speculative: exp.speculative,
+          speculativeDays: exp.speculative
+            ? speculativeAgeDays(exp.speculative_since, now)
+            : undefined,
         });
+        if (exp.speculative) noteStale(exp, now, coverage);
       } else if (res.state === 'CLEAN' && exp.speculative) {
         coverage.promotable.push({ agent: exp.agent, id: exp.id });
       } else if (res.state === 'PENDING-CONVERSION') {
@@ -403,6 +439,24 @@ export function sweepExpectations(
   }
 
   return { findings, pending, coverage };
+}
+
+/**
+ * Bucket a FAILING speculative expectation that is past its shelf life, or has no date at all.
+ *
+ * Undated counts as stale immediately and deliberately. Otherwise the cheapest way to get a
+ * permanent unexplained failure is to omit one optional field, which is the same shape as the
+ * quiet-state-by-forgetting-a-field trap max_prompt_chars already avoids.
+ */
+function noteStale(
+  exp: Expectation,
+  now: Date,
+  coverage: ExpectationCoverage,
+): void {
+  const days = speculativeAgeDays(exp.speculative_since, now);
+  if (days === null || days > SPECULATIVE_SHELF_DAYS) {
+    coverage.speculativeStale.push({ agent: exp.agent, id: exp.id, days });
+  }
 }
 
 function evaluateReceipt(
@@ -472,7 +526,13 @@ export function formatSweep(result: SweepResult): string {
   const rank = (a: ExpectationFinding, b: ExpectationFinding) =>
     order[a.kind] - order[b.kind] || a.agent.localeCompare(b.agent);
   const render = (f: ExpectationFinding) => {
-    lines.push(`  ${f.agent}/${f.id}  ${f.kind}: ${f.detail}`);
+    const age =
+      f.speculative === true
+        ? f.speculativeDays === null || f.speculativeDays === undefined
+          ? '  [speculative, NO DATE — add speculative_since]'
+          : `  [speculative ${f.speculativeDays}d]`
+        : '';
+    lines.push(`  ${f.agent}/${f.id}  ${f.kind}: ${f.detail}${age}`);
     if (f.receipt) lines.push(`      receipt: ${f.receipt.kind} — ${f.receipt.evidence}`);
   };
 
@@ -513,6 +573,19 @@ export function formatSweep(result: SweepResult): string {
       `A DROP in any of these between runs is itself a finding — a deleted manifest reads exactly ` +
       `like a clean report.`,
   );
+
+  if (coverage.speculativeStale.length > 0) {
+    lines.push('');
+    lines.push(
+      `${coverage.speculativeStale.length} speculative expectation(s) have been FAILING past their ` +
+        `${SPECULATIVE_SHELF_DAYS}-day shelf life (or carry no date). A guess is cheap because it is ` +
+        `temporary — CONFIRM the path or DELETE the entry. An unconfirmed permanent failure is worse ` +
+        `than noise, because it reads as a known issue:`,
+    );
+    for (const s of coverage.speculativeStale) {
+      lines.push(`  ${s.agent}/${s.id}  ${s.days === null ? 'no speculative_since declared' : s.days + 'd'}`);
+    }
+  }
 
   if (coverage.promotable.length > 0) {
     lines.push('');
