@@ -30,9 +30,51 @@
 import { existsSync, readFileSync, readdirSync } from 'fs';
 import { join } from 'path';
 import { readCrons } from '../bus/crons.js';
+import { listAgents } from '../bus/agents.js';
 import { CRONS_DIRECTORY } from '../bus/crons-schema.js';
 import { parseDurationMs } from '../bus/cron-state.js';
 import type { CronDefinition, CronEntry } from '../types/index.js';
+
+/**
+ * Agents that are disabled in the roster, and therefore out of scope.
+ *
+ * A disabled agent does not boot, so its crons never fire, its migration never runs, and every
+ * comparison this module makes has no consequence for it. If a retired agent is genuinely out of
+ * scope then its findings were never findings — and a known-permanent row in a list people are
+ * actively working from teaches them the list has residents.
+ *
+ * DETERMINABLE SIGNAL, NOT A HARDCODED NAME, so this fixes every future retirement rather than the
+ * one line that prompted it (builder_2, retired 2026-07-07).
+ *
+ * EXTRACTED, NOT WRITTEN. `listAgents` already computes enabled state from
+ * `config/enabled-agents.json` with the explicit-entry-wins precedence and the BUG-028 fix. A
+ * second implementation here would be a copy that agrees today and diverges the first time that
+ * precedence changes, with nothing comparing them.
+ */
+function disabledAgents(): Set<string> {
+  const ctxRoot = process.env.CTX_ROOT;
+  if (!ctxRoot) return new Set();
+  try {
+    return new Set(listAgents(ctxRoot).filter((a) => !a.enabled).map((a) => a.name));
+  } catch {
+    // Fail OPEN: an unreadable roster must not silently empty the report. Reporting a retired
+    // agent's line is noise; suppressing a live agent's is a missed finding, and those costs are
+    // not symmetric.
+    return new Set();
+  }
+}
+
+/**
+ * The excluded set, surfaced so the exclusion is visible rather than silent.
+ *
+ * Scope narrowing is indistinguishable from a clean bill of health when it is not stated — the
+ * same failure as a shrinking stated-time denominator. It also matters that re-enabling an agent
+ * silently returns it to scope: a disabled agent holding crons.json with no `.crons-migrated`
+ * marker is a wipe condition that ARMS on re-enable, and nothing would announce that.
+ */
+export function listExcludedRetiredAgents(): string[] {
+  return [...disabledAgents()].sort();
+}
 
 export type CronDriftKind =
   /**
@@ -193,6 +235,7 @@ export function detectConfigCronDrift(
  */
 export function sweepConfigCronDrift(frameworkRoot: string): CronDriftFinding[] {
   const findings: CronDriftFinding[] = [];
+  const retired = disabledAgents();
   const orgsBase = join(frameworkRoot, 'orgs');
   if (!existsSync(orgsBase)) return findings;
 
@@ -203,6 +246,7 @@ export function sweepConfigCronDrift(frameworkRoot: string): CronDriftFinding[] 
 
     for (const agent of readdirSync(agentsBase, { withFileTypes: true })) {
       if (!agent.isDirectory()) continue;
+      if (retired.has(agent.name)) continue;
       const configPath = join(agentsBase, agent.name, 'config.json');
       if (!existsSync(configPath)) continue;
       try {
@@ -220,6 +264,7 @@ export function sweepConfigCronDrift(frameworkRoot: string): CronDriftFinding[] 
   // for a marker that lives in the state dir would have reported "no marker problems
   // fleet-wide" while being structurally unable to see the only two agents missing one.
   for (const agentName of listStateAgents()) {
+    if (retired.has(agentName)) continue;
     try {
       findings.push(...detectMissingMigrationMarker(agentName));
       findings.push(...detectScheduleContradictsPrompt(agentName));

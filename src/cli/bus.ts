@@ -2920,7 +2920,7 @@ busCommand
   .option('--json', 'Emit raw JSON instead of the formatted report')
   .option('--notify', 'Send ONE consolidated message to the org orchestrator when drift is found')
   .action(async (opts: { json?: boolean; notify?: boolean }) => {
-    const { sweepConfigCronDrift, formatDriftFindings, countLatentMarkerAbsent, statedTimeCoverage } = await import('../daemon/cron-drift.js');
+    const { sweepConfigCronDrift, formatDriftFindings, countLatentMarkerAbsent, statedTimeCoverage, listExcludedRetiredAgents } = await import('../daemon/cron-drift.js');
     const env = resolveEnv();
     const projectRoot = env.projectRoot || env.frameworkRoot || process.cwd();
 
@@ -2935,9 +2935,13 @@ busCommand
     // Coverage, not just findings. A prompt tidied into a pointer removes the check subject and
     // shrinks the denominator silently, which reads exactly like a clean report.
     const coverage = statedTimeCoverage();
+    // Stated because an unstated scope narrowing is indistinguishable from a clean bill of health,
+    // and because re-enabling one of these silently returns it to scope — a disabled agent holding
+    // crons.json with no marker is a wipe condition that arms on re-enable.
+    const retired = listExcludedRetiredAgents();
 
     if (opts.json) {
-      console.log(JSON.stringify({ findings, latent_marker_absent: latent, stated_time_coverage: coverage }, null, 2));
+      console.log(JSON.stringify({ findings, latent_marker_absent: latent, stated_time_coverage: coverage, excluded_retired: retired }, null, 2));
     } else {
       console.log(formatDriftFindings(findings));
       console.log(
@@ -2957,6 +2961,15 @@ Stated-time coverage: ${coverage.stating} of ${coverage.timeAnchored} time-ancho
           `
 Also ${latent.length} agent(s) with no .crons-migrated marker and no live crons ` +
             `(harmless now, one add-cron away from the wipe condition): ${latent.join(', ')}`,
+        );
+      }
+      if (retired.length > 0) {
+        console.log(
+          `
+Out of scope: ${retired.length} disabled agent(s) — ${retired.join(', ')}. They do not boot, so ` +
+            `nothing they declare can fire and none of the comparisons above have a consequence for ` +
+            `them. RE-ENABLING ONE RETURNS IT TO SCOPE SILENTLY, so if any of them holds crons.json ` +
+            `with no .crons-migrated marker, that wipe condition arms the moment it is switched on.`,
         );
       }
     }

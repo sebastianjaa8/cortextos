@@ -32,7 +32,7 @@ vi.mock('../../../src/daemon/cron-snapshot.js', async (importOriginal) => {
   };
 });
 
-import { detectConfigCronDrift, detectMissingMigrationMarker, detectScheduleContradictsPrompt, formatDriftFindings } from '../../../src/daemon/cron-drift.js';
+import { detectConfigCronDrift, detectMissingMigrationMarker, detectScheduleContradictsPrompt, formatDriftFindings, sweepConfigCronDrift, listExcludedRetiredAgents } from '../../../src/daemon/cron-drift.js';
 import type { CronDriftFinding } from '../../../src/daemon/cron-drift.js';
 import { migrateCronsForAgent } from '../../../src/daemon/cron-migration.js';
 import { CRONS_DIRECTORY } from '../../../src/bus/crons-schema.js';
@@ -454,5 +454,85 @@ describe('formatDriftFindings', () => {
     expect(formatDriftFindings([])).toBe(
       'config.json and the live scheduler agree everywhere they can be compared.',
     );
+  });
+});
+
+/**
+ * Retired agents are out of scope on a DETERMINABLE signal (roster `enabled: false`), not a
+ * hardcoded name — so every future retirement is covered, not just builder_2 (retired 2026-07-07).
+ *
+ * A disabled agent never boots, so its crons cannot fire and its migration cannot run: none of the
+ * comparisons in this module have a consequence for it. Leaving a known-permanent row in a report
+ * the fleet is actively working from teaches people the list has residents.
+ */
+describe('retired agents are out of scope', () => {
+  let prevFrameworkRoot: string | undefined;
+
+  // BOTH agents always exist with IDENTICAL drift; only the ROSTER varies between tests. The first
+  // version built the second agent's directory only in the disabled case, so the control asserting
+  // "both reported when nobody is disabled" was asserting on an agent that did not exist — it would
+  // have failed for a reason unrelated to the filter, and had the polarity been reversed it would
+  // have PASSED vacuously. The fixture must differ in exactly the variable under test.
+  const AGENTS = ['live_agent', 'dead_agent'];
+
+  function seedFleet(disabled: string[]): void {
+    prevFrameworkRoot = process.env.CTX_FRAMEWORK_ROOT;
+    process.env.CTX_FRAMEWORK_ROOT = tmp;
+    mkdirSync(join(tmp, 'config'), { recursive: true });
+    const roster: Record<string, unknown> = {};
+    for (const name of AGENTS) {
+      roster[name] = { org: 'testorg', enabled: !disabled.includes(name) };
+    }
+    writeFileSync(join(tmp, 'config', 'enabled-agents.json'), JSON.stringify(roster), 'utf-8');
+
+    for (const name of AGENTS) {
+      const dir = join(tmp, 'orgs', 'testorg', 'agents', name);
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(
+        join(dir, 'config.json'),
+        JSON.stringify({ agent_name: name, crons: [{ name: 'ghost', interval: '4h', prompt: 'x' }] }),
+        'utf-8',
+      );
+    }
+  }
+
+  afterEach(() => {
+    if (prevFrameworkRoot === undefined) delete process.env.CTX_FRAMEWORK_ROOT;
+    else process.env.CTX_FRAMEWORK_ROOT = prevFrameworkRoot;
+  });
+
+  it('excludes a disabled agent while still reporting an enabled one with IDENTICAL drift', () => {
+    // Both directions in one assertion pair. An exclusion that suppresses everything is as broken
+    // as no exclusion at all — it just fails quietly instead of loudly.
+    seedFleet(['dead_agent']);
+    const agents = sweepConfigCronDrift(tmp).map((f) => f.agent);
+    expect(agents).toContain('live_agent');
+    expect(agents).not.toContain('dead_agent');
+  });
+
+  it('reports BOTH when nobody is disabled — proves the filter is the cause, not the fixture', () => {
+    seedFleet([]);
+    const agents = sweepConfigCronDrift(tmp).map((f) => f.agent);
+    expect(agents).toContain('live_agent');
+    expect(agents).toContain('dead_agent');
+  });
+
+  it('surfaces the excluded set so the scope narrowing is not silent', () => {
+    // An unstated scope narrowing is indistinguishable from a clean bill of health, and re-enabling
+    // one of these returns it to scope with nothing announcing that.
+    seedFleet(['dead_agent']);
+    expect(listExcludedRetiredAgents()).toEqual(['dead_agent']);
+  });
+
+  it('fails OPEN when the roster is unreadable — never silently empties the report', () => {
+    seedFleet(['dead_agent']);
+    writeFileSync(join(tmp, 'config', 'enabled-agents.json'), 'not json at all', 'utf-8');
+    // listAgents swallows the parse error and falls back to the directory scan, where absence of an
+    // explicit entry means enabled. Suppressing a live agent's finding costs more than printing a
+    // retired one's, so this asymmetry is deliberate.
+    const agents = sweepConfigCronDrift(tmp).map((f) => f.agent);
+    expect(agents).toContain('live_agent');
+    expect(agents).toContain('dead_agent');
+    expect(listExcludedRetiredAgents()).toEqual([]);
   });
 });
