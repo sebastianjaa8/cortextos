@@ -346,7 +346,14 @@ export function updateTask(
   paths: BusPaths,
   taskId: string,
   status: TaskStatus,
-  opts?: { priority?: Priority },
+  opts?: {
+    priority?: Priority;
+    description?: string;
+    project?: string;
+    assignee?: string;
+    dueDate?: string;
+    evidence?: string;
+  },
 ): void {
   const filePath = findTaskFile(paths, taskId);
   if (!filePath) {
@@ -354,16 +361,46 @@ export function updateTask(
       `Task ${taskId} not found in any org under ${paths.ctxRoot}/orgs/`,
     );
   }
+
+  // REASSIGNMENT REFUSES AGAINST A FOREIGN CLAIM-LOCK, and this is the one place where adding a
+  // verb can BREAK something rather than merely unblock it. `claimTask` takes an O_EXCL lock
+  // precisely to stop two agents double-picking one task; silently overwriting `assigned_to`
+  // around that lock is the same race wearing a different hat, and the caller virtually never
+  // intends it. Breaking a lock must be a deliberate separate act, so this refuses and NAMES the
+  // holder rather than releasing it as a side effect.
+  if (opts?.assignee !== undefined) {
+    const claimPath = join(paths.taskDir, '.claims', `${taskId}.claim`);
+    if (existsSync(claimPath)) {
+      let holder = 'unknown';
+      try { holder = readFileSync(claimPath, 'utf-8').split('\t')[0]; } catch { /* keep unknown */ }
+      if (holder !== opts.assignee) {
+        throw new Error(
+          `Task ${taskId} is claimed by ${holder}; refusing to reassign to ${opts.assignee}. ` +
+          `Releasing a claim-lock as a side effect of reassignment reintroduces the double-pick ` +
+          `race the lock exists to prevent. Break the lock deliberately first: ` +
+          `remove ${claimPath}`,
+        );
+      }
+    }
+  }
+
   let prevStatus: TaskStatus | undefined;
   let prevPriority: Priority | undefined;
+  let prevAssignee: string | undefined;
   let assignee: string | undefined;
   try {
     const task: Task = parseTaskFile(filePath);
     prevStatus = task.status;
     prevPriority = task.priority;
-    assignee = task.assigned_to;
+    prevAssignee = task.assigned_to;
     task.status = status;
     if (opts?.priority !== undefined) task.priority = opts.priority;
+    if (opts?.description !== undefined) task.description = opts.description;
+    if (opts?.project !== undefined) task.project = opts.project;
+    if (opts?.assignee !== undefined) task.assigned_to = opts.assignee;
+    if (opts?.dueDate !== undefined) task.due_date = opts.dueDate;
+    if (opts?.evidence !== undefined) task.evidence = opts.evidence;
+    assignee = task.assigned_to;
     task.updated_at = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
     atomicWriteSync(filePath, JSON.stringify(task));
   } catch (err) {
@@ -374,11 +411,88 @@ export function updateTask(
     agent: assignee || 'unknown',
     from: prevStatus,
     to: status,
-    // Only recorded when it actually changed, so the log does not fill with no-op priority lines.
+    // Each recorded ONLY when it actually changed, so the log does not fill with no-op lines.
     ...(opts?.priority !== undefined && opts.priority !== prevPriority
       ? { from_priority: prevPriority, to_priority: opts.priority }
       : {}),
+    ...(opts?.assignee !== undefined && opts.assignee !== prevAssignee
+      ? { from_assignee: prevAssignee, to_assignee: opts.assignee }
+      : {}),
+    ...(opts?.evidence !== undefined ? { evidence: opts.evidence } : {}),
   });
+}
+
+/**
+ * Add or remove one dependency edge on an EXISTING task, maintaining the symmetric reverse edge.
+ *
+ * EXTRACTED, NOT WRITTEN. `create-task --blocked-by/--blocks` could only set edges at creation, so
+ * an agent needing an edge later hand-mirrored `addSymmetricEdge` across three JSON files —
+ * correctly, with atomic writes and a BOM check. That is the dangerous kind: a hand copy that
+ * mirrors internal logic correctly TODAY diverges silently the first time this function changes,
+ * with nothing comparing the copy to the original.
+ *
+ * Cycle detection runs on ADD for the same reason it runs at creation: `blocked_by` edges are what
+ * a cycle walks, and a cycle introduced after creation is identical in effect to one introduced
+ * during it.
+ */
+export function addTaskDependency(
+  paths: BusPaths,
+  taskId: string,
+  blockerId: string,
+): void {
+  validateTaskId(taskId);
+  validateTaskId(blockerId);
+  if (taskId === blockerId) throw new Error(`Task ${taskId} cannot block itself`);
+  const filePath = findTaskFile(paths, taskId);
+  if (!filePath) throw new Error(`Task ${taskId} not found`);
+
+  const task = parseTaskFile(filePath);
+  const existing = task.blocked_by ?? [];
+  if (existing.includes(blockerId)) return; // idempotent
+  detectCycleOrThrow(paths, taskId, [...existing, blockerId], {
+    id: taskId,
+    blocked_by: [...existing, blockerId],
+  });
+
+  task.blocked_by = [...existing, blockerId];
+  task.updated_at = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
+  atomicWriteSync(filePath, JSON.stringify(task));
+
+  const err = addSymmetricEdge(paths, blockerId, 'blocks', taskId);
+  if (err) {
+    // Non-fatal, matching creation-time behaviour: the forward edge is recorded and
+    // `checkTaskDependencies` reports the peer as `missing`. Reported, never swallowed.
+    console.error(`WARNING: forward edge written, reverse edge failed — ${err}`);
+  }
+}
+
+export function removeTaskDependency(
+  paths: BusPaths,
+  taskId: string,
+  blockerId: string,
+): void {
+  validateTaskId(taskId);
+  validateTaskId(blockerId);
+  const filePath = findTaskFile(paths, taskId);
+  if (!filePath) throw new Error(`Task ${taskId} not found`);
+
+  const task = parseTaskFile(filePath);
+  task.blocked_by = (task.blocked_by ?? []).filter((id) => id !== blockerId);
+  task.updated_at = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
+  atomicWriteSync(filePath, JSON.stringify(task));
+
+  // Reverse edge removed too — a one-sided removal leaves the blocker still claiming to block a
+  // task that no longer lists it, which is worse than the edge existing.
+  const peerPath = findTaskFile(paths, blockerId);
+  if (peerPath) {
+    try {
+      const peer = parseTaskFile(peerPath);
+      peer.blocks = (peer.blocks ?? []).filter((id) => id !== taskId);
+      atomicWriteSync(peerPath, JSON.stringify(peer));
+    } catch (err) {
+      console.error(`WARNING: forward edge removed, reverse edge not — ${String(err)}`);
+    }
+  }
 }
 
 /**
@@ -396,6 +510,13 @@ export interface TaskAuditEntry {
    *  changing it silently would hide why an agent started picking a different task. */
   from_priority?: Priority;
   to_priority?: Priority;
+  /** Present only on a reassignment (added 2026-07-30) — moving work between agents was
+   *  impossible via the CLI, so it happened by message and left no record on the task at all.
+   *  That is how a task sequenced for one agent stayed assigned to another. */
+  from_assignee?: string;
+  to_assignee?: string;
+  /** Where the result lives, recorded at the transition that claimed or completed the task. */
+  evidence?: string;
   note?: string;
 }
 
@@ -474,6 +595,7 @@ export function claimTask(
   paths: BusPaths,
   taskId: string,
   agent: string,
+  evidence?: string,
 ): Task {
   const filePath = findTaskFile(paths, taskId);
   if (!filePath) {
@@ -532,6 +654,10 @@ export function claimTask(
   const prevStatus = task.status;
   task.status = 'in_progress';
   task.assigned_to = agent;
+  // The INTENDED first artifact, named at claim time. Entry and exit are the same unguarded
+  // transition: without this, "nothing yet" is undefined rather than answerable, which is how
+  // tasks sat in_progress for 14 days having produced literally nothing.
+  if (evidence !== undefined) task.evidence = evidence;
   task.updated_at = now;
   try {
     atomicWriteSync(filePath, JSON.stringify(task));
@@ -541,7 +667,13 @@ export function claimTask(
     try { unlinkSync(claimPath); } catch { /* best-effort */ }
     throw new Error(`Task ${taskId} claim commit failed: ${err}`);
   }
-  appendTaskAudit(paths, taskId, { event: 'claim', agent, from: prevStatus, to: 'in_progress' });
+  appendTaskAudit(paths, taskId, {
+    event: 'claim',
+    agent,
+    from: prevStatus,
+    to: 'in_progress',
+    ...(evidence !== undefined ? { evidence } : {}),
+  });
   return task;
 }
 
@@ -561,6 +693,7 @@ export function completeTask(
   paths: BusPaths,
   taskId: string,
   result?: string,
+  evidence?: string,
 ): void {
   const filePath = findTaskFile(paths, taskId);
   if (!filePath) {
@@ -582,11 +715,19 @@ export function completeTask(
     if (result) {
       task.result = result;
     }
+    if (evidence !== undefined) task.evidence = evidence;
     atomicWriteSync(filePath, JSON.stringify(task));
   } catch (err) {
     throw new Error(`Task ${taskId} complete failed: ${err}`);
   }
-  appendTaskAudit(paths, taskId, { event: 'complete', agent: assignee || 'unknown', from: prevStatus, to: 'completed', note: result });
+  appendTaskAudit(paths, taskId, {
+    event: 'complete',
+    agent: assignee || 'unknown',
+    from: prevStatus,
+    to: 'completed',
+    note: result,
+    ...(evidence !== undefined ? { evidence } : {}),
+  });
 
   // Activity-feed event. Best-effort — the task is already persisted.
   if (assignee) {

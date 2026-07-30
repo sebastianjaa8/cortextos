@@ -5,7 +5,7 @@ import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { sendMessage, checkInbox, ackInbox } from '../bus/message.js';
 import { validateAgentName, validateTaskId, validatePriority } from '../utils/validate.js';
-import { createTask, updateTask, completeTask, claimTask, readTaskAudit, checkTaskDependencies, compactTasks, listTasks, checkStaleTasks, archiveTasks, checkHumanTasks, findRecentDuplicate } from '../bus/task.js';
+import { createTask, updateTask, completeTask, claimTask, addTaskDependency, removeTaskDependency, readTaskAudit, checkTaskDependencies, compactTasks, listTasks, checkStaleTasks, archiveTasks, checkHumanTasks, findRecentDuplicate } from '../bus/task.js';
 import { saveOutput } from '../bus/save-output.js';
 import { logEvent } from '../bus/event.js';
 import { updateHeartbeat, readAllHeartbeats } from '../bus/heartbeat.js';
@@ -149,6 +149,68 @@ busCommand
     console.log(`ACK'd ${id}`);
   });
 
+/**
+ * WARN, DO NOT FAIL — and the hardening trigger is measured, not promised.
+ *
+ * Failing an empty --evidence today would make the policy real and get routed around under time
+ * pressure, and a routed-around gate is worse than none because it still LOOKS enforced. Warning
+ * makes it advisory, and an advisory that never hardens is the verified-once bucket: true when
+ * written, decaying with nobody comparing.
+ *
+ * What makes warn-now safe is only the trigger, so the trigger is a number another agent is
+ * already producing rather than an intention of ours. The condition is printed in the warning
+ * itself so the person being warned can see what closes it — a hardening condition nobody can read
+ * is the same as no condition.
+ */
+function warnMissingEvidence(transition: string): void {
+  console.error(
+    `NOTE: no --evidence given while ${transition}. Name where the result lives or will live: a ` +
+      `commit, a path, a vault heading, or a WRITTEN NEGATIVE RESULT. Eliminations count and are ` +
+      `the most losable results we have, because nobody commits a negative.
+` +
+      `  This is a warning today. --evidence becomes REQUIRED once pm_bot reports evidence-naming ` +
+      `coverage at or above 90% for 3 consecutive daily syncs.`,
+  );
+}
+
+busCommand
+  .command('add-dependency')
+  .description('Add a blocked_by edge to an EXISTING task, maintaining the symmetric reverse edge')
+  .argument('<id>', 'Task that will be blocked')
+  .argument('<blocker>', 'Task that must complete first')
+  .action((id: string, blocker: string) => {
+    // Exposes addSymmetricEdge, which was private and create-time-only. An agent needing an edge
+    // after creation hand-mirrored it across three JSON files — correctly, with atomic writes and
+    // a BOM check. A hand copy that mirrors internal logic correctly TODAY diverges silently the
+    // first time that logic changes, with nothing comparing the copy to the original.
+    const env = resolveEnv();
+    const paths = resolvePaths(env.agentName, env.instanceId, env.org);
+    try {
+      addTaskDependency(paths, id, blocker);
+      console.log(`${id} now blocked_by ${blocker}`);
+    } catch (err) {
+      console.error(String(err instanceof Error ? err.message : err));
+      process.exit(1);
+    }
+  });
+
+busCommand
+  .command('remove-dependency')
+  .description('Remove a blocked_by edge from a task, clearing the reverse edge too')
+  .argument('<id>', 'Task to unblock')
+  .argument('<blocker>', 'Blocker to remove')
+  .action((id: string, blocker: string) => {
+    const env = resolveEnv();
+    const paths = resolvePaths(env.agentName, env.instanceId, env.org);
+    try {
+      removeTaskDependency(paths, id, blocker);
+      console.log(`${id} no longer blocked_by ${blocker}`);
+    } catch (err) {
+      console.error(String(err instanceof Error ? err.message : err));
+      process.exit(1);
+    }
+  });
+
 busCommand
   .command('create-task')
   .argument('<title>', 'Task title')
@@ -219,7 +281,15 @@ busCommand
   // could announce "moved off low" while the store kept `low` forever. Agents pick the highest
   // priority task, so a frozen field means they sort by what mattered when the task was FILED.
   .option('--priority <p>', 'Also change priority (urgent, high, normal, low) — audited')
-  .action((id: string, status: string, opts: { priority?: string }) => {
+  // Frozen-after-creation until 2026-07-30. Five agents routed around this in one day: notes went
+  // into log-event meta, a constraint went into a chat message, dependency edges were hand-mirrored
+  // across three JSON files, and the orchestrator could not reassign a task at all.
+  .option('--desc <text>', 'Change the description')
+  .option('--project <name>', 'Change the project')
+  .option('--assignee <agent>', 'Reassign — REFUSES if another agent holds the claim-lock')
+  .option('--due <iso>', 'Set the due date (ISO 8601) — until now unreachable from any CLI path')
+  .option('--evidence <text>', 'Where the result lives: commit, path, vault heading, or a written negative result')
+  .action((id: string, status: string, opts: { priority?: string; desc?: string; project?: string; assignee?: string; due?: string; evidence?: string }) => {
     const validStatuses: TaskStatus[] = ['pending', 'in_progress', 'completed', 'blocked', 'cancelled'];
     if (!validStatuses.includes(status as TaskStatus)) {
       console.error(`Invalid status '${status}'. Must be one of: ${validStatuses.join(', ')}`);
@@ -246,8 +316,16 @@ busCommand
           process.exit(1);
         }
       }
-      updateTask(paths, id, status as TaskStatus, { priority: opts.priority as Priority | undefined });
+      updateTask(paths, id, status as TaskStatus, {
+        priority: opts.priority as Priority | undefined,
+        description: opts.desc,
+        project: opts.project,
+        assignee: opts.assignee,
+        dueDate: opts.due,
+        evidence: opts.evidence,
+      });
       console.log(`Updated ${id} -> ${status}`);
+      if (status === 'in_progress' && opts.evidence === undefined) warnMissingEvidence('claiming');
     } catch (err) {
       console.error(err instanceof Error ? err.message : String(err));
       process.exit(1);
@@ -332,7 +410,8 @@ busCommand
   .description('Atomically claim a pending task — marks in_progress + sets assignee in one shot, rejecting if another agent already owns it')
   .argument('<id>', 'Task ID')
   .option('--agent <name>', 'Agent claiming the task (defaults to CTX_AGENT_NAME)')
-  .action((id: string, opts: { agent?: string }) => {
+  .option('--evidence <text>', 'Intended first artifact — what this task will produce and where it will land')
+  .action((id: string, opts: { agent?: string; evidence?: string }) => {
     const env = resolveEnv();
     const paths = resolvePaths(env.agentName, env.instanceId, env.org);
     const agent = opts.agent || env.agentName;
@@ -341,7 +420,8 @@ busCommand
       process.exit(1);
     }
     try {
-      const task = claimTask(paths, id, agent);
+      const task = claimTask(paths, id, agent, opts.evidence);
+      if (opts.evidence === undefined) warnMissingEvidence('claiming');
       console.log(`Claimed ${id} -> in_progress (assigned to ${agent})`);
       console.log(`  Title: ${task.title}`);
     } catch (err) {
@@ -355,7 +435,8 @@ busCommand
   .argument('<id>', 'Task ID')
   .argument('[result]', 'Completion result (optional positional form)')
   .option('--result <text>', 'Completion result')
-  .action((id: string, resultArg: string | undefined, opts: { result?: string }) => {
+  .option('--evidence <text>', 'Where the result lives: commit, path, vault heading, or a written negative result')
+  .action((id: string, resultArg: string | undefined, opts: { result?: string; evidence?: string }) => {
     // Accept result as either positional arg or --result flag (P1 fix #8)
     const effectiveResult = opts.result ?? resultArg;
     const env = resolveEnv();
@@ -370,7 +451,8 @@ busCommand
           process.exit(1);
         }
       }
-      completeTask(paths, id, effectiveResult);
+      completeTask(paths, id, effectiveResult, opts.evidence);
+      if (opts.evidence === undefined) warnMissingEvidence('completing');
       console.log(`Completed ${id}`);
     } catch (err) {
       console.error(err instanceof Error ? err.message : String(err));

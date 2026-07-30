@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, rmSync, readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { createTask, updateTask, completeTask, claimTask, readTaskAudit, checkTaskDependencies, compactTasks, checkStaleTasks, listTasks, findTaskFile, archiveTasks } from '../../../src/bus/task';
+import { createTask, updateTask, completeTask, claimTask, addTaskDependency, removeTaskDependency, readTaskAudit, checkTaskDependencies, compactTasks, checkStaleTasks, listTasks, findTaskFile, archiveTasks } from '../../../src/bus/task';
 import type { BusPaths } from '../../../src/types';
 
 describe('Task Management', () => {
@@ -1017,3 +1017,144 @@ describe('stale_blocked bucket (2026-07-30)', () => {
   });
 });
 
+/**
+ * The task mutation verb gap (2026-07-30). `updateTask` exposed status and priority only, so five
+ * agents routed around it in one day — notes into log-event meta, a constraint into a chat message,
+ * dependency edges hand-mirrored across three JSON files, and the orchestrator unable to reassign
+ * a task at all.
+ */
+describe('task mutation verbs', () => {
+  let testDir: string;
+  let paths: BusPaths;
+
+  beforeEach(() => {
+    testDir = mkdtempSync(join(tmpdir(), 'cortextos-verbgap-'));
+    paths = {
+      ctxRoot: testDir,
+      inbox: join(testDir, 'inbox', 'a'),
+      inflight: join(testDir, 'inflight', 'a'),
+      processed: join(testDir, 'processed', 'a'),
+      logDir: join(testDir, 'logs', 'a'),
+      stateDir: join(testDir, 'state', 'a'),
+      taskDir: join(testDir, 'tasks'),
+      approvalDir: join(testDir, 'approvals'),
+      analyticsDir: join(testDir, 'analytics'),
+      heartbeatDir: join(testDir, 'heartbeats'),
+    };
+  });
+  afterEach(() => rmSync(testDir, { recursive: true, force: true }));
+
+  const read = (id: string) => JSON.parse(readFileSync(findTaskFile(paths, id)!, 'utf-8'));
+
+  it('description, project and due_date are mutable after creation', () => {
+    const id = createTask(paths, 'a', 'org', 'T', { description: 'old', project: 'p1' });
+    updateTask(paths, id, 'in_progress', { description: 'new', project: 'p2', dueDate: '2026-08-01T00:00:00Z' });
+    const t = read(id);
+    expect(t.description).toBe('new');
+    expect(t.project).toBe('p2');
+    expect(t.due_date).toBe('2026-08-01T00:00:00Z');
+  });
+
+  /**
+   * THE CHECK NAMED IN THE SCOPE DOC, AND UNTIL NOW IT WAS UNWRITEABLE.
+   *
+   * `createTask` always accepted `dueDate`, but no CLI path passed it, so no task could carry a due
+   * date — which made `checkStaleTasks`'s `overdue` count structurally 0 forever. It was reported
+   * as `overdue: 0` and read as good news the entire time. A gap that renders its own health metric
+   * unfalsifiable is the sharpest possible argument for closing it.
+   */
+  it('overdue can now be non-zero — the metric is falsifiable for the first time', () => {
+    const id = createTask(paths, 'a', 'org', 'overdue one');
+    expect(checkStaleTasks(paths).overdue.length).toBe(0); // control: not yet due
+    updateTask(paths, id, 'pending', { dueDate: '2020-01-01T00:00:00Z' });
+    expect(checkStaleTasks(paths).overdue.map((t) => t.id)).toContain(id);
+  });
+
+  it('reassignment works, and is audited with both sides', () => {
+    const id = createTask(paths, 'a', 'org', 'T', { assignee: 'agent_one' });
+    updateTask(paths, id, 'pending', { assignee: 'agent_two' });
+    expect(read(id).assigned_to).toBe('agent_two');
+    const audit = readTaskAudit(paths, id).find((e) => e.from_assignee !== undefined);
+    expect(audit).toMatchObject({ from_assignee: 'agent_one', to_assignee: 'agent_two' });
+  });
+
+  it('REFUSES to reassign a task another agent holds the claim-lock on', () => {
+    // The one place this work can BREAK something rather than unblock it. Silently overwriting
+    // assigned_to around an O_EXCL claim-lock is the double-pick race the lock exists to prevent.
+    const id = createTask(paths, 'a', 'org', 'T');
+    claimTask(paths, id, 'holder_agent');
+    expect(() => updateTask(paths, id, 'in_progress', { assignee: 'thief_agent' })).toThrow(/claimed by holder_agent/);
+    expect(read(id).assigned_to).toBe('holder_agent'); // and did not partially apply
+  });
+
+  it('allows a reassignment that agrees with the existing lock holder', () => {
+    // Control for the refusal: a guard that refuses everything is as broken as one that refuses
+    // nothing, it just fails loudly instead of silently.
+    const id = createTask(paths, 'a', 'org', 'T');
+    claimTask(paths, id, 'holder_agent');
+    expect(() => updateTask(paths, id, 'in_progress', { assignee: 'holder_agent' })).not.toThrow();
+  });
+
+  it('evidence is stored on the TASK, not only in the audit log', () => {
+    // An answer only the audit log can see is the workaround this field replaces.
+    const id = createTask(paths, 'a', 'org', 'T');
+    claimTask(paths, id, 'a', 'will land in work/foo-SCOPE.md');
+    expect(read(id).evidence).toBe('will land in work/foo-SCOPE.md');
+    completeTask(paths, id, 'done', 'commit abc123');
+    expect(read(id).evidence).toBe('commit abc123');
+  });
+
+  it('evidence set via updateTask is persisted too — not just via claim/complete', () => {
+    // Found by sabotage, not by review: dropping the evidence write in updateTask left the suite
+    // GREEN because both existing evidence tests went through claimTask and completeTask. Three
+    // transitions can set this field and only two were covered.
+    const id = createTask(paths, 'a', 'org', 'T');
+    updateTask(paths, id, 'blocked', { evidence: 'waiting on task_123; nothing produced yet' });
+    expect(read(id).evidence).toBe('waiting on task_123; nothing produced yet');
+  });
+
+  it('accepts a written NEGATIVE RESULT as evidence — the case that killed the typed version', () => {
+    // A field accepting only commit-or-filepath re-creates the blindness it exists to fix.
+    // Eliminations are the most losable results we have because nobody commits a negative.
+    const id = createTask(paths, 'a', 'org', 'investigate');
+    const elimination = 'no commit: ruled out all three theories; the bug does not fire on the cited case';
+    completeTask(paths, id, undefined, elimination);
+    expect(read(id).evidence).toBe(elimination);
+  });
+
+  it('add-dependency writes BOTH edges on an existing task', () => {
+    const blocked = createTask(paths, 'a', 'org', 'blocked');
+    const blocker = createTask(paths, 'a', 'org', 'blocker');
+    addTaskDependency(paths, blocked, blocker);
+    expect(read(blocked).blocked_by).toContain(blocker);
+    expect(read(blocker).blocks).toContain(blocked); // the hand-mirrored half
+  });
+
+  it('add-dependency rejects a cycle introduced AFTER creation', () => {
+    // A cycle added later is identical in effect to one added at creation, so it gets the same check.
+    const x = createTask(paths, 'a', 'org', 'x');
+    const y = createTask(paths, 'a', 'org', 'y');
+    addTaskDependency(paths, x, y);
+    expect(() => addTaskDependency(paths, y, x)).toThrow(/cycle/i);
+  });
+
+  it('remove-dependency clears BOTH edges', () => {
+    // A one-sided removal leaves the blocker claiming to block a task that no longer lists it,
+    // which is worse than the edge existing — the record disagrees with itself.
+    const blocked = createTask(paths, 'a', 'org', 'blocked');
+    const blocker = createTask(paths, 'a', 'org', 'blocker');
+    addTaskDependency(paths, blocked, blocker);
+    removeTaskDependency(paths, blocked, blocker);
+    expect(read(blocked).blocked_by ?? []).not.toContain(blocker);
+    expect(read(blocker).blocks ?? []).not.toContain(blocked);
+  });
+
+  it('add-dependency is idempotent and refuses self-blocking', () => {
+    const a = createTask(paths, 'a', 'org', 'a');
+    const b = createTask(paths, 'a', 'org', 'b');
+    addTaskDependency(paths, a, b);
+    addTaskDependency(paths, a, b);
+    expect(read(a).blocked_by).toEqual([b]);
+    expect(() => addTaskDependency(paths, a, a)).toThrow(/cannot block itself/);
+  });
+});

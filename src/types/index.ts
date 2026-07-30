@@ -58,6 +58,22 @@ export interface Task {
   due_date: string | null;
   archived: boolean;
   result?: string;
+  /**
+   * WHERE THE RESULT OF THIS TASK LIVES — a commit, a path, a vault heading, or a written
+   * negative result. Free text ON PURPOSE, and that is the load-bearing decision.
+   *
+   * A field accepting only commit-or-filepath re-creates the blindness it exists to fix. The case
+   * that killed the typed version: a task with zero files that had ruled out three theories with
+   * real evidence. ELIMINATIONS ARE THE MOST LOSABLE RESULTS IN THE SYSTEM BECAUSE NOBODY COMMITS
+   * A NEGATIVE — "the bug I reported does not fire on the case I reported it for" has no artifact
+   * and is exactly what the next agent would otherwise re-derive.
+   *
+   * Set at BOTH transitions: claiming names the intended first artifact, completing names where
+   * the result landed. Stored on the task rather than only in the audit log so that whatever asks
+   * "did this produce anything" can read it — an answer only the audit log can see is the
+   * workaround this field replaces.
+   */
+  evidence?: string;
   /** Linked deliverables (files saved via `cortextos bus save-output`). */
   outputs?: TaskOutput[];
   /**
