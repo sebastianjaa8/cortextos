@@ -4,6 +4,7 @@ import { join } from 'path';
 import { homedir } from 'os';
 import { IPCClient } from '../daemon/ipc-server.js';
 import { TelegramAPI, formatValidateError } from '../telegram/api.js';
+import { warnIfWipeArmed } from './enable-arms-check.js';
 
 /**
  * BUG-035 fix: discover the cortextOS framework root without depending on
@@ -219,6 +220,10 @@ export const enableAgentCommand = new Command('enable')
       console.error(`Warning: Telegram credential validation crashed: ${err instanceof Error ? err.message : String(err)}`);
       console.error('  Continuing enable. Investigate the validator if this recurs.');
     }
+
+    // Same condition, second call site. Warning at only one of the two transitions into running
+    // would be a fix plus a survivor.
+    warnIfWipeArmed(agent, join(homedir(), '.cortextos', options.instance));
 
     const agents = readEnabledAgents(options.instance);
     agents[agent] = {

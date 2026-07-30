@@ -6,6 +6,7 @@ import { spawn, spawnSync } from 'child_process';
 import { IPCClient } from '../daemon/ipc-server.js';
 import { daemonAppName, dashboardAppName, dashboardPortForInstance, resolveFrameworkRoot } from './ecosystem.js';
 import { validateInstanceId } from '../utils/validate.js';
+import { warnIfWipeArmed } from './enable-arms-check.js';
 
 const IS_WINDOWS = platform() === 'win32';
 const PM2_COMMAND = IS_WINDOWS ? 'pm2.cmd' : 'pm2';
@@ -481,6 +482,11 @@ export const startCommand = new Command('start')
         writeFileSync(enabledPath, JSON.stringify(enabledAgents, null, 2) + '\n', 'utf-8');
         console.log(`  Registered ${agent} in enabled-agents.json`);
       }
+
+      // Before the boot, not after: migration runs on boot, so a warning printed afterwards
+      // arrives once the crons are already gone. Covers every start, not only a newly-registered
+      // agent — starting an agent already in the roster sends start-agent all the same.
+      warnIfWipeArmed(agent, ctxRoot);
 
       console.log(`Starting agent: ${agent}`);
       const response = await ipc.send({ type: 'start-agent', agent, source: 'cortextos start' });

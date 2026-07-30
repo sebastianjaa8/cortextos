@@ -32,7 +32,7 @@ vi.mock('../../../src/daemon/cron-snapshot.js', async (importOriginal) => {
   };
 });
 
-import { detectConfigCronDrift, detectMissingMigrationMarker, detectScheduleContradictsPrompt, formatDriftFindings, sweepConfigCronDrift, listExcludedRetiredAgents } from '../../../src/daemon/cron-drift.js';
+import { detectConfigCronDrift, detectMissingMigrationMarker, detectScheduleContradictsPrompt, formatDriftFindings, sweepConfigCronDrift, listExcludedRetiredAgents, wipeConditionArmed } from '../../../src/daemon/cron-drift.js';
 import type { CronDriftFinding } from '../../../src/daemon/cron-drift.js';
 import { migrateCronsForAgent } from '../../../src/daemon/cron-migration.js';
 import { CRONS_DIRECTORY } from '../../../src/bus/crons-schema.js';
@@ -534,5 +534,58 @@ describe('retired agents are out of scope', () => {
     expect(agents).toContain('live_agent');
     expect(agents).toContain('dead_agent');
     expect(listExcludedRetiredAgents()).toEqual([]);
+  });
+});
+
+/**
+ * The wipe condition, asked at the moment of enabling rather than in a 6-hourly report the person
+ * flipping the switch is not reading. Takes ctxRoot explicitly because the CLI caller has no
+ * CTX_ROOT in the environment — a human in a terminal is exactly who this needs to reach.
+ */
+describe('wipeConditionArmed', () => {
+  const A = 'probe_agent';
+  const stateDir = () => join(tmp, CRONS_DIRECTORY, A);
+
+  function seed(opts: { marker: boolean; crons: unknown }): void {
+    mkdirSync(stateDir(), { recursive: true });
+    if (opts.crons !== undefined) {
+      writeFileSync(join(stateDir(), 'crons.json'), JSON.stringify(opts.crons), 'utf-8');
+    }
+    if (opts.marker) writeFileSync(join(stateDir(), '.crons-migrated'), '', 'utf-8');
+  }
+
+  it('ARMED: marker absent and crons.json holds crons — names what would be lost', () => {
+    seed({ marker: false, crons: { crons: [{ name: 'unified-watchdog' }, { name: 'liveness-poke' }] } });
+    expect(wipeConditionArmed(A, tmp)).toEqual(['unified-watchdog', 'liveness-poke']);
+  });
+
+  it('NOT armed when the marker is present — the normal case for every live agent', () => {
+    seed({ marker: true, crons: { crons: [{ name: 'x' }] } });
+    expect(wipeConditionArmed(A, tmp)).toBeNull();
+  });
+
+  it('NOT armed when there are no crons to lose — half a condition is not a finding', () => {
+    // Reporting this would put permanent entries in front of the operator on every start, which is
+    // how a real warning gets trained out of existence.
+    seed({ marker: false, crons: { crons: [] } });
+    expect(wipeConditionArmed(A, tmp)).toBeNull();
+  });
+
+  it('NOT armed when crons.json does not exist at all', () => {
+    seed({ marker: false, crons: undefined });
+    expect(wipeConditionArmed(A, tmp)).toBeNull();
+  });
+
+  it('ARMED when crons.json is present but unparseable — migration overwrites it regardless', () => {
+    // Treating a corrupt file as "no crons" would report the condition unarmed while the overwrite
+    // is exactly as destructive. Present is the question, not valid.
+    mkdirSync(stateDir(), { recursive: true });
+    writeFileSync(join(stateDir(), 'crons.json'), '{ not json', 'utf-8');
+    expect(wipeConditionArmed(A, tmp)).toEqual(['(crons.json present but unparseable)']);
+  });
+
+  it('accepts the bare-array crons.json shape as well as the wrapped one', () => {
+    seed({ marker: false, crons: [{ name: 'bare-form' }] });
+    expect(wipeConditionArmed(A, tmp)).toEqual(['bare-form']);
   });
 });

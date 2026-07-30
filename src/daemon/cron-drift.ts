@@ -414,6 +414,38 @@ function listStateAgents(): string[] {
  * naturally rather than needing an exotic trigger, so one runtime `add-cron` on either of them
  * assembles the full condition by accident.
  */
+/**
+ * Is the crons.json-wipe condition ASSEMBLED for this agent right now?
+ *
+ * Marker absent AND crons.json non-empty means the next boot silently overwrites every
+ * runtime-added cron from config.json. Returns the cron names that would be lost, or null.
+ *
+ * TAKES ctxRoot EXPLICITLY so the CLI can call it. `readCrons` resolves CTX_ROOT from the
+ * environment, which is set for agent sessions but not for a human running `cortextos start` in a
+ * terminal — and the human at the enable prompt is precisely the caller this needs to reach.
+ *
+ * The crons read here is deliberately SHALLOW (does the file hold at least one cron), because the
+ * question is existence, not validity. A corrupt crons.json is a different problem with its own
+ * loud path in `readCronsWithStatus`, and treating it as "no crons" here would wrongly report the
+ * condition as unarmed.
+ */
+export function wipeConditionArmed(agentName: string, ctxRoot: string): string[] | null {
+  const agentStateDir = join(ctxRoot, CRONS_DIRECTORY, agentName);
+  if (existsSync(join(agentStateDir, '.crons-migrated'))) return null;
+
+  const cronsPath = join(agentStateDir, 'crons.json');
+  if (!existsSync(cronsPath)) return null;
+  try {
+    const raw: unknown = JSON.parse(readFileSync(cronsPath, 'utf-8'));
+    const list = Array.isArray(raw) ? raw : (raw as { crons?: unknown })?.crons;
+    if (!Array.isArray(list) || list.length === 0) return null;
+    return list.map((c) => (c as { name?: string })?.name ?? '(unnamed)');
+  } catch {
+    // Unparseable but PRESENT. Migration would still overwrite it, so this is armed, not absent.
+    return ['(crons.json present but unparseable)'];
+  }
+}
+
 export function detectMissingMigrationMarker(agentName: string): CronDriftFinding[] {
   const ctxRoot = process.env.CTX_ROOT;
   if (!ctxRoot) return [];
