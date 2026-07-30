@@ -2899,16 +2899,29 @@ busCommand
   .option('--json', 'Emit raw JSON instead of the formatted report')
   .option('--notify', 'Send ONE consolidated message to the org orchestrator when drift is found')
   .action(async (opts: { json?: boolean; notify?: boolean }) => {
-    const { sweepConfigCronDrift, formatDriftFindings } = await import('../daemon/cron-drift.js');
+    const { sweepConfigCronDrift, formatDriftFindings, countLatentMarkerAbsent } = await import('../daemon/cron-drift.js');
     const env = resolveEnv();
     const projectRoot = env.projectRoot || env.frameworkRoot || process.cwd();
 
     const findings = sweepConfigCronDrift(projectRoot);
 
+    // Agents with no marker AND no crons.json are harmless today but prove the marker-absent
+    // state occurs here naturally — one runtime add-cron on any of them assembles the full wipe
+    // condition by accident. Counted, not listed as findings: two permanent top-of-report entries
+    // is how a real finding gets trained out of existence.
+    const latent = countLatentMarkerAbsent();
+
     if (opts.json) {
-      console.log(JSON.stringify(findings, null, 2));
+      console.log(JSON.stringify({ findings, latent_marker_absent: latent }, null, 2));
     } else {
       console.log(formatDriftFindings(findings));
+      if (latent.length > 0) {
+        console.log(
+          `
+Also ${latent.length} agent(s) with no .crons-migrated marker and no live crons ` +
+            `(harmless now, one add-cron away from the wipe condition): ${latent.join(', ')}`,
+        );
+      }
     }
 
     if (findings.length === 0) return;

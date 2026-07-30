@@ -30,10 +30,19 @@
 import { existsSync, readFileSync, readdirSync } from 'fs';
 import { join } from 'path';
 import { readCrons } from '../bus/crons.js';
+import { CRONS_DIRECTORY } from '../bus/crons-schema.js';
 import { parseDurationMs } from '../bus/cron-state.js';
 import type { CronDefinition, CronEntry } from '../types/index.js';
 
 export type CronDriftKind =
+  /**
+   * The `.crons-migrated` marker is absent while crons.json holds live crons — the assembled
+   * trigger for the boot-time overwrite that wipes every runtime-added cron. Agent-level, not
+   * per-cron. This exists because the real guard lives in the daemon, which holds its own
+   * bundle: the guard is inert until the next daemon restart, and this check covers exactly
+   * that window from the CLI, which is live on build.
+   */
+  | 'marker-missing'
   /** config.json names a cron that has no counterpart in crons.json — it will never fire. */
   | 'missing-live'
   /** Both sides use an interval (not a cron expression) and they disagree. */
@@ -184,7 +193,79 @@ export function sweepConfigCronDrift(frameworkRoot: string): CronDriftFinding[] 
     }
   }
 
+  // Marker findings are swept from the STATE dir, not from orgs/. The two enumerations are
+  // NOT the same set: this fleet has two agents (scratch/test) that exist only under
+  // {CTX_ROOT}/.cortextOS/state/agents and have no orgs/ directory at all. Sweeping orgs/
+  // for a marker that lives in the state dir would have reported "no marker problems
+  // fleet-wide" while being structurally unable to see the only two agents missing one.
+  for (const agentName of listStateAgents()) {
+    try {
+      findings.push(...detectMissingMigrationMarker(agentName));
+    } catch { /* one agent must not abort the sweep */ }
+  }
+
   return findings;
+}
+
+/** Agents that have a state directory, which is where the marker and crons.json actually live. */
+function listStateAgents(): string[] {
+  const ctxRoot = process.env.CTX_ROOT;
+  if (!ctxRoot) return [];
+  const base = join(ctxRoot, CRONS_DIRECTORY);
+  if (!existsSync(base)) return [];
+  try {
+    return readdirSync(base, { withFileTypes: true })
+      .filter((d) => d.isDirectory() && !d.name.startsWith('.'))
+      .map((d) => d.name);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Flag an agent whose `.crons-migrated` marker is gone while crons.json still holds crons.
+ *
+ * BOTH conditions are required, and reporting only the assembled pair is deliberate. A missing
+ * marker on an agent with no crons.json is harmless — migration would write from config.json,
+ * which is what it is for. Two such agents exist on this fleet right now (scratch/test agents),
+ * and reporting them would put two permanent entries at the top of a daily report, which is how
+ * a real finding gets trained out of existence. They are surfaced as a count in the footer
+ * instead, because the latent state is worth knowing: it proves marker-absence occurs here
+ * naturally rather than needing an exotic trigger, so one runtime `add-cron` on either of them
+ * assembles the full condition by accident.
+ */
+export function detectMissingMigrationMarker(agentName: string): CronDriftFinding[] {
+  const ctxRoot = process.env.CTX_ROOT;
+  if (!ctxRoot) return [];
+  const agentStateDir = join(ctxRoot, CRONS_DIRECTORY, agentName);
+  if (existsSync(join(agentStateDir, '.crons-migrated'))) return [];
+
+  const live = readCrons(agentName);
+  if (live.length === 0) return [];
+
+  return [
+    {
+      agent: agentName,
+      cron: '(agent-level)',
+      kind: 'marker-missing',
+      configValue: 'marker absent',
+      liveValue: `${live.length} live cron(s) would be overwritten: ${live.map((c) => c.name).join(', ')}`,
+    },
+  ];
+}
+
+/** Agents in the marker-absent-but-harmless state: worth counting, not worth listing daily. */
+export function countLatentMarkerAbsent(): string[] {
+  const ctxRoot = process.env.CTX_ROOT;
+  if (!ctxRoot) return [];
+  const latent: string[] = [];
+  for (const agentName of listStateAgents()) {
+    if (existsSync(join(ctxRoot, CRONS_DIRECTORY, agentName, '.crons-migrated'))) continue;
+    try {
+      if (readCrons(agentName).length === 0) latent.push(agentName);
+    } catch { /* skip */ }
+  }
+  return latent;
 }
 
 /**
@@ -197,9 +278,10 @@ export function sweepConfigCronDrift(frameworkRoot: string): CronDriftFinding[] 
  * never fire scroll off the top.
  */
 const KIND_ORDER: Record<CronDriftKind, number> = {
-  'missing-live': 0,
-  'interval-mismatch': 1,
-  'prompt-differs': 2,
+  'marker-missing': 0,
+  'missing-live': 1,
+  'interval-mismatch': 2,
+  'prompt-differs': 3,
 };
 
 /** One-line-per-finding summary, used by the CLI and by the consolidated bus message. */
@@ -222,8 +304,9 @@ export function formatDriftFindings(findings: CronDriftFinding[]): string {
       `(${Object.entries(counts).map(([k, n]) => `${n} ${k}`).join(', ')}):`,
     ...lines,
     '',
+    'marker-missing is the assembled trigger for a full crons.json wipe on next boot — fix first.',
     'config.json crons are dead text after the .crons-migrated marker is written.',
-    'missing-live means that cron never fires at all — triage those first.',
+    'missing-live means that cron never fires at all.',
     'Fix with: cortextos bus update-cron <agent> <cron> --interval <i> --prompt "<p>"',
   ].join('\n');
 }

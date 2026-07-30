@@ -32,7 +32,7 @@ vi.mock('../../../src/daemon/cron-snapshot.js', async (importOriginal) => {
   };
 });
 
-import { detectConfigCronDrift } from '../../../src/daemon/cron-drift.js';
+import { detectConfigCronDrift, detectMissingMigrationMarker } from '../../../src/daemon/cron-drift.js';
 import { migrateCronsForAgent } from '../../../src/daemon/cron-migration.js';
 import { CRONS_DIRECTORY } from '../../../src/bus/crons-schema.js';
 import type { CronDefinition } from '../../../src/types/index.js';
@@ -227,5 +227,38 @@ describe('cron-migration pre-overwrite snapshot', () => {
     expect(result.status).toBe('migrated');
     expect(criticals).toEqual([]);
     expect(readdirSync(stateDir()).filter((f) => f.includes('.pre-migration-'))).toEqual([]);
+  });
+});
+
+describe('detectMissingMigrationMarker', () => {
+  const stateDir = () => join(tmp, CRONS_DIRECTORY, AGENT);
+
+  function writeLiveCrons(): void {
+    mkdirSync(stateDir(), { recursive: true });
+    writeFileSync(
+      join(stateDir(), 'crons.json'),
+      JSON.stringify({ updated_at: '2026-07-30T00:00:00Z', crons: [live({ name: 'unified-watchdog' })] }),
+      'utf-8',
+    );
+  }
+
+  it('flags the assembled trigger: marker absent WITH live crons', () => {
+    writeLiveCrons();
+    const findings = detectMissingMigrationMarker(AGENT);
+    expect(findings).toHaveLength(1);
+    expect(findings[0].kind).toBe('marker-missing');
+    // The names must be in the message: the whole point is knowing what is at risk.
+    expect(findings[0].liveValue).toContain('unified-watchdog');
+  });
+
+  it('does NOT flag marker absent with NO live crons — harmless, and two permanent entries at the top of a daily report is how a real finding gets ignored', () => {
+    mkdirSync(stateDir(), { recursive: true });
+    expect(detectMissingMigrationMarker(AGENT)).toEqual([]);
+  });
+
+  it('does NOT flag when the marker is present', () => {
+    writeLiveCrons();
+    writeFileSync(join(stateDir(), '.crons-migrated'), '', 'utf-8');
+    expect(detectMissingMigrationMarker(AGENT)).toEqual([]);
   });
 });
