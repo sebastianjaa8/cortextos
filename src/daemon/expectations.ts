@@ -33,6 +33,26 @@ interface ExpectationCommon {
    * hours late since June.
    */
   timezone: string;
+  /**
+   * Set when the author DECLARED an expectation without confirming the artifact exists yet.
+   *
+   * Exists because a wrong guess outperformed a careful question. seb_boss added an expectation
+   * against a `cron-drift-receipt.jsonl` path he invented, left it failing rather than deleting it,
+   * and that failure exposed a real bug — check-cron-drift emitted nothing on a clean run, so "ran,
+   * fleet clean" was byte-identical on disk to "never fired". Asking first would have got the
+   * truthful answer "there is no receipt", the expectation would have been removed, and the silent
+   * detector would still be silent. So: declare it anyway and let it fail loudly.
+   *
+   * The flag is what keeps that habit from destroying the report. A speculative MISSING is a
+   * possible NAMING error; a confirmed MISSING is a possible OUTAGE. Ranked and rendered together
+   * they are indistinguishable, and eleven agents adopting the habit would bury every real finding
+   * under invented paths — the identical cry-wolf failure the cron-drift exclusions exist to prevent.
+   * Marked, they cost nothing and stay loud.
+   *
+   * A speculative expectation that PASSES has served its purpose and should lose the flag; the
+   * report says so rather than leaving it marked provisional forever.
+   */
+  speculative?: boolean;
 }
 
 /**
@@ -136,6 +156,7 @@ function validate(
         id,
         agent,
         timezone,
+        speculative: raw.speculative === true,
         type: 'artifact-fresh',
         path: raw.path,
         max_age: raw.max_age,
@@ -160,6 +181,7 @@ function validate(
         id,
         agent,
         timezone,
+        speculative: raw.speculative === true,
         type: 'prompt-matches-doc',
         cron: raw.cron,
         doc: typeof raw.doc === 'string' ? raw.doc : '(unspecified)',

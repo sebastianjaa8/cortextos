@@ -740,6 +740,77 @@ describe('sweepExpectations coverage', () => {
   });
 });
 
+describe('speculative expectations', () => {
+  it('defaults to false when the manifest does not say otherwise', () => {
+    const dir = agentDir('agent_a');
+    writeManifest(dir, [{ id: 'a1', type: 'artifact-fresh', path: '/x', max_age: '26h' }]);
+    expect(readExpectations('agent_a', dir).expectations[0].speculative).toBe(false);
+  });
+
+  it('counts them in coverage without hiding them from findings', () => {
+    const dir = agentDir('agent_a');
+    writeManifest(dir, [
+      { id: 'guessed', type: 'artifact-fresh', path: '/vault/guessed.md', max_age: '26h', speculative: true },
+    ]);
+    const res = sweepExpectations(tmp, NOW, probeFrom({}));
+    expect(res.coverage.speculative).toBe(1);
+    expect(res.findings).toHaveLength(1);
+    expect(res.findings[0].speculative).toBe(true);
+  });
+
+  it('ranks a speculative failure BELOW a confirmed one, so a naming error cannot bury an outage', () => {
+    const dir = agentDir('agent_a');
+    writeManifest(dir, [
+      // The speculative entry is declared FIRST and would sort first alphabetically by id.
+      { id: 'aaa-guessed', type: 'artifact-fresh', path: '/vault/guessed.md', max_age: '26h', speculative: true },
+      { id: 'zzz-real', type: 'artifact-fresh', path: '/vault/real.md', max_age: '26h' },
+    ]);
+    const out = formatSweep(sweepExpectations(tmp, NOW, probeFrom({})));
+    const confirmedAt = out.indexOf('zzz-real');
+    const speculativeAt = out.indexOf('aaa-guessed');
+    expect(confirmedAt).toBeGreaterThan(-1);
+    expect(speculativeAt).toBeGreaterThan(-1);
+    expect(confirmedAt).toBeLessThan(speculativeAt);
+    expect(out).toMatch(/on CONFIRMED expectations/);
+    expect(out).toMatch(/on SPECULATIVE expectations/);
+  });
+
+  it('marks a PASSING speculative expectation as promotable — a provisional flag nobody removes decays into noise', () => {
+    const dir = agentDir('agent_a');
+    writeManifest(dir, [
+      { id: 'guess-was-right', type: 'artifact-fresh', path: '/vault/real.md', max_age: '26h', speculative: true },
+    ]);
+    const probe = probeFrom({ '/vault/real.md': { bytes: 9999, ageMs: 3_600_000 } });
+    const res = sweepExpectations(tmp, NOW, probe);
+    expect(res.findings).toHaveLength(0);
+    expect(res.coverage.promotable).toEqual([{ agent: 'agent_a', id: 'guess-was-right' }]);
+    expect(formatSweep(res)).toMatch(/remove `"speculative": true`/);
+  });
+
+  it('does NOT mark a passing CONFIRMED expectation as promotable — there is nothing to promote', () => {
+    const dir = agentDir('agent_a');
+    writeManifest(dir, [
+      { id: 'already-confirmed', type: 'artifact-fresh', path: '/vault/real.md', max_age: '26h' },
+    ]);
+    const probe = probeFrom({ '/vault/real.md': { bytes: 9999, ageMs: 3_600_000 } });
+    expect(sweepExpectations(tmp, NOW, probe).coverage.promotable).toEqual([]);
+  });
+
+  it('applies to prompt-matches-doc too: a speculative DRIFT ranks below a confirmed one', () => {
+    const dir = agentDir('agent_a');
+    writeManifest(dir, [
+      { id: 'aaa-guessed-prompt', type: 'prompt-matches-doc', cron: 'heartbeat', doc: 'H.md', inline_forbidden: ['NIGHT MODE:'], max_prompt_chars: 400, speculative: true },
+      { id: 'zzz-real-prompt', type: 'prompt-matches-doc', cron: 'other', doc: 'O.md', inline_forbidden: ['NIGHT MODE:'], max_prompt_chars: 400 },
+    ]);
+    writeLiveCrons('agent_a', [
+      { name: 'heartbeat', prompt: 'NIGHT MODE: quiet' },
+      { name: 'other', prompt: 'NIGHT MODE: quiet' },
+    ]);
+    const out = formatSweep(sweepExpectations(tmp, NOW, probeFrom({})));
+    expect(out.indexOf('zzz-real-prompt')).toBeLessThan(out.indexOf('aaa-guessed-prompt'));
+  });
+});
+
 describe('writeRunReceipt', () => {
   it('appends under state/<agent>/ with the ts first, creating the directory', () => {
     const p = writeRunReceipt(tmp, 'builder_1', 'cron-drift-receipt.jsonl', { cron: 'x', findings: 0 }, NOW);

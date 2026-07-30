@@ -250,6 +250,13 @@ export interface ExpectationFinding {
   detail: string;
   /** Present for artifact-fresh: what receiving-side evidence backed (or failed to back) it. */
   receipt?: ReceiptResult;
+  /**
+   * The author declared this expectation without confirming the artifact exists.
+   *
+   * A speculative MISSING is a possible NAMING error. A confirmed MISSING is a possible OUTAGE.
+   * They are ranked and rendered separately so the first can never push the second off the top.
+   */
+  speculative?: boolean;
 }
 
 /**
@@ -271,6 +278,16 @@ export interface ExpectationCoverage {
   receiptEligible: number;
   /** Of those declaring one, how many had discoverable evidence. */
   receiptFound: number;
+  /** Expectations declared against an unconfirmed artifact. Cheap to have, must stay labelled. */
+  speculative: number;
+  /**
+   * Speculative expectations that PASSED, i.e. the guess was right and the flag has done its job.
+   *
+   * Surfaced because a provisional marker nobody ever removes decays into noise, which is the
+   * verified-once-then-never-rechecked failure in a new costume. A passing speculative expectation is
+   * an ACTION — drop the flag — not a status.
+   */
+  promotable: Array<{ agent: string; id: string }>;
 }
 
 export interface SweepResult {
@@ -320,6 +337,8 @@ export function sweepExpectations(
     receiptDeclared: 0,
     receiptEligible: 0,
     receiptFound: 0,
+    speculative: 0,
+    promotable: [],
   };
 
   for (const { agent, org, dir } of agentDirs(frameworkRoot)) {
@@ -341,6 +360,7 @@ export function sweepExpectations(
       if (exp.type === 'artifact-fresh') {
         coverage.evaluable++;
         coverage.receiptEligible++;
+        if (exp.speculative) coverage.speculative++;
         const res = checkArtifactFresh(exp, now, probe);
         const receipt = evaluateReceipt(exp, now, org, coverage);
         if (res.state !== 'FRESH') {
@@ -350,11 +370,16 @@ export function sweepExpectations(
             kind: res.state,
             detail: `${res.path}: ${res.detail}`,
             receipt,
+            speculative: exp.speculative,
           });
+        } else if (exp.speculative) {
+          // The guess was right. Say so, so the flag gets removed instead of aging into noise.
+          coverage.promotable.push({ agent: exp.agent, id: exp.id });
         }
         continue;
       }
 
+      if (exp.speculative) coverage.speculative++;
       const res = checkPromptMatchesDoc(exp, liveCrons);
       if (res.state === 'NOT-EVALUABLE') {
         coverage.notEvaluable.push({ agent: exp.agent, id: exp.id, reason: res.detail });
@@ -362,7 +387,15 @@ export function sweepExpectations(
       }
       coverage.evaluable++;
       if (res.state === 'DRIFT') {
-        findings.push({ agent: exp.agent, id: exp.id, kind: 'DRIFT', detail: res.detail });
+        findings.push({
+          agent: exp.agent,
+          id: exp.id,
+          kind: 'DRIFT',
+          detail: res.detail,
+          speculative: exp.speculative,
+        });
+      } else if (res.state === 'CLEAN' && exp.speculative) {
+        coverage.promotable.push({ agent: exp.agent, id: exp.id });
       } else if (res.state === 'PENDING-CONVERSION') {
         pending.push({ agent: exp.agent, id: exp.id, detail: res.detail });
       }
@@ -435,18 +468,39 @@ export function formatSweep(result: SweepResult): string {
   const { findings, pending, coverage } = result;
   const lines: string[] = [];
 
-  if (findings.length === 0) {
+  const order: Record<ExpectationFinding['kind'], number> = { MISSING: 0, THIN: 1, DRIFT: 2 };
+  const rank = (a: ExpectationFinding, b: ExpectationFinding) =>
+    order[a.kind] - order[b.kind] || a.agent.localeCompare(b.agent);
+  const render = (f: ExpectationFinding) => {
+    lines.push(`  ${f.agent}/${f.id}  ${f.kind}: ${f.detail}`);
+    if (f.receipt) lines.push(`      receipt: ${f.receipt.kind} — ${f.receipt.evidence}`);
+  };
+
+  // Confirmed findings ABOVE speculative ones, in two separate blocks.
+  //
+  // A speculative MISSING is a possible NAMING error; a confirmed MISSING is a possible OUTAGE.
+  // Interleaved they are indistinguishable, and once declaring-anyway is fleet practice the invented
+  // paths outnumber the real failures — so the crons that genuinely stopped scroll off the top. That
+  // is exactly how the cron-drift detector would have died on day one had it reported its 90 correct
+  // entries. The habit is worth keeping; it just has to be labelled to stay affordable.
+  const confirmed = findings.filter((f) => !f.speculative).sort(rank);
+  const speculative = findings.filter((f) => f.speculative).sort(rank);
+
+  if (confirmed.length === 0 && speculative.length === 0) {
     lines.push('No expectation failures.');
-  } else {
-    const order: Record<ExpectationFinding['kind'], number> = { MISSING: 0, THIN: 1, DRIFT: 2 };
-    const sorted = [...findings].sort(
-      (a, b) => order[a.kind] - order[b.kind] || a.agent.localeCompare(b.agent),
+  }
+  if (confirmed.length > 0) {
+    lines.push(`${confirmed.length} expectation failure(s) on CONFIRMED expectations:`);
+    confirmed.forEach(render);
+  }
+  if (speculative.length > 0) {
+    if (confirmed.length > 0) lines.push('');
+    lines.push(
+      `${speculative.length} failure(s) on SPECULATIVE expectations — declared against an ` +
+        `unconfirmed artifact, so a wrong path is as likely as a real miss. Confirm the path, then ` +
+        `drop the speculative flag:`,
     );
-    lines.push(`${findings.length} expectation failure(s):`);
-    for (const f of sorted) {
-      lines.push(`  ${f.agent}/${f.id}  ${f.kind}: ${f.detail}`);
-      if (f.receipt) lines.push(`      receipt: ${f.receipt.kind} — ${f.receipt.evidence}`);
-    }
+    speculative.forEach(render);
   }
 
   lines.push('');
@@ -455,9 +509,19 @@ export function formatSweep(result: SweepResult): string {
       `across ${coverage.agentsWithManifest} agent(s) with a manifest. ` +
       `Receipts: ${coverage.receiptFound} found of ${coverage.receiptDeclared} declared, ` +
       `${coverage.receiptEligible - coverage.receiptDeclared} artifact expectation(s) declare none. ` +
+      `${coverage.speculative} declared speculatively (unconfirmed artifact). ` +
       `A DROP in any of these between runs is itself a finding — a deleted manifest reads exactly ` +
       `like a clean report.`,
   );
+
+  if (coverage.promotable.length > 0) {
+    lines.push('');
+    lines.push(
+      'Speculative expectations that PASSED — the guess was right, remove `"speculative": true` so ' +
+        'a future failure reads as the outage it is:',
+    );
+    for (const p of coverage.promotable) lines.push(`  ${p.agent}/${p.id}`);
+  }
 
   if (coverage.notEvaluable.length > 0) {
     lines.push('');
