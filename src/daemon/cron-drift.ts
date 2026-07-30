@@ -231,8 +231,36 @@ export function sweepConfigCronDrift(frameworkRoot: string): CronDriftFinding[] 
 
 
 /**
+ * A time token is DISCLAIMED when a negator governs it in the same clause: "not 8am ET",
+ * "fires 7am ET rather than 9am ET", "never 5am ET". The window is deliberately short and
+ * stops at any sentence terminator, so a `not` in a previous sentence cannot reach forward
+ * and silently delete a real claim — which would shrink the denominator invisibly, the exact
+ * failure `statedTimeCoverage` exists to make visible.
+ */
+const DISCLAIMED_BY =
+  /\b(?:not|never|rather than|instead of|no longer|isn't|is not|wasn't|won't)\b[^.!?\n]*$/i;
+
+/**
  * Times a prompt states about itself, e.g. "Sunday 8:30am ET", "fires at 7am ET".
  * Only local-timezone claims are matched; a prompt saying "09:00 UTC" is already unambiguous.
+ *
+ * NEGATION IS EXCLUDED, and the reason generalises past this function. A matcher over prose
+ * fires on prose ABOUT the thing as readily as on the thing, so the better an author documents
+ * WHY a value is right, the likelier they are to trip the check that it is wrong. chef's
+ * sunday-grocery prompt records "12pm ET Sunday — confirmed deliberate ..., not 8am": the
+ * correct claim and its rejected alternative, one clause apart. Third instance of this shape on
+ * 2026-07-30 (two hold-verify matchers fired on text documenting a convention and a decision).
+ *
+ * MEASURED BOUNDARY, because the motivating instance does NOT actually trip this. chef's
+ * negated "8am" carries no timezone suffix, so the pattern above never sees it — live extraction
+ * on that prompt yields exactly ["12pm ET"], verified against the real crons.json. Adding two
+ * characters ("not 8am ET") makes it fire. So this guard is LATENT HARDENING: 0 of 94
+ * time-anchored fleet crons are affected today. It is worth having anyway precisely because the
+ * trigger is good documentation, which is the thing we keep asking agents for.
+ *
+ * The alternative fix considered and REJECTED — "treat the FIRST stated time as the claim" —
+ * handles chef's ordering and fails on the equally natural "not 8am ET, but 12pm ET". A negator
+ * lookback is order-independent, so it subsumes the positional rule rather than complementing it.
  */
 function statedLocalHours(prompt: string): Array<{ hour: number; raw: string }> {
   const out: Array<{ hour: number; raw: string }> = [];
@@ -240,6 +268,7 @@ function statedLocalHours(prompt: string): Array<{ hour: number; raw: string }> 
   for (const m of prompt.matchAll(re)) {
     let h = parseInt(m[1], 10);
     if (h < 1 || h > 12) continue;
+    if (DISCLAIMED_BY.test(prompt.slice(Math.max(0, m.index - 40), m.index))) continue;
     if (/pm/i.test(m[3]) && h !== 12) h += 12;
     if (/am/i.test(m[3]) && h === 12) h = 0;
     out.push({ hour: h, raw: m[0].trim() });

@@ -316,4 +316,64 @@ describe('detectScheduleContradictsPrompt', () => {
       ),
     ).toEqual([]);
   });
+
+  // A matcher over prose fires on prose ABOUT the thing. Documenting WHY a schedule is right
+  // introduces the rejected alternative into the same text, so the better the note the likelier
+  // it trips the check. Each case below states a CORRECT schedule and must stay silent.
+  describe('a time inside a negation is not a claim', () => {
+    it.each([
+      ['post-hoc rejection (chef shape)', '0 16 * * 0', 'Sunday grocery (12pm ET — deliberate, not 8am ET).'],
+      ['rather than',                      '0 16 * * 0', 'Sunday grocery at 12pm ET rather than 9am ET.'],
+      ['instead of',                       '0 16 * * 0', 'Sunday grocery at 12pm ET instead of 10am ET.'],
+      ['never',                            '0 16 * * 0', 'Sunday grocery at 12pm ET. Never 5am ET.'],
+      // Order-independence is the whole reason this is a negator lookback and not a
+      // first-match-wins rule: here the DISCLAIMED time comes first.
+      ['negation first, claim second',     '0 16 * * 0', 'Not 8am ET — this runs 12pm ET.'],
+    ])('stays silent: %s', (_label, schedule, prompt) => {
+      expect(
+        detectScheduleContradictsPrompt(AGENT, [live({ name: 'sunday-grocery', schedule, prompt })], TZ),
+      ).toEqual([]);
+    });
+
+    // Both directions. A guard that can never fire is as broken as one that never goes quiet —
+    // it just fails silently instead of loudly. These prove the negator lookback did not simply
+    // disable the check.
+    it('STILL FLAGS a real contradiction that merely mentions a negator elsewhere', () => {
+      const findings = detectScheduleContradictsPrompt(
+        AGENT,
+        [live({
+          name: 'sunday-grocery',
+          schedule: '0 16 * * 0',
+          // The negator governs a different clause and is closed off by a full stop, so it must
+          // not reach forward and disclaim the real 8am ET claim.
+          prompt: 'Do not skip this run. Sunday grocery at 8am ET.',
+        })],
+        TZ,
+      );
+      expect(findings).toHaveLength(1);
+      expect(findings[0].kind).toBe('schedule-contradicts-prompt');
+    });
+
+    it('STILL FLAGS when every stated time is disclaimed except a wrong one', () => {
+      const findings = detectScheduleContradictsPrompt(
+        AGENT,
+        [live({ name: 'sunday-grocery', schedule: '0 16 * * 0', prompt: 'Runs 8am ET, not 11am ET.' })],
+        TZ,
+      );
+      expect(findings).toHaveLength(1);
+    });
+
+    it('goes silent rather than flagging when the ONLY stated time is disclaimed', () => {
+      // No surviving claim means no contradiction — the same rule as a prompt stating no time.
+      // Asserted explicitly because the alternative (treating a disclaimed time as the claim)
+      // is exactly the false positive this change exists to remove.
+      expect(
+        detectScheduleContradictsPrompt(
+          AGENT,
+          [live({ name: 'sunday-grocery', schedule: '0 16 * * 0', prompt: 'This does not run at 8am ET.' })],
+          TZ,
+        ),
+      ).toEqual([]);
+    });
+  });
 });
