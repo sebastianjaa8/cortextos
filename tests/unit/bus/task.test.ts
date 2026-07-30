@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, rmSync, readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { createTask, updateTask, completeTask, claimTask, readTaskAudit, checkTaskDependencies, compactTasks, listTasks, findTaskFile, archiveTasks } from '../../../src/bus/task';
+import { createTask, updateTask, completeTask, claimTask, readTaskAudit, checkTaskDependencies, compactTasks, checkStaleTasks, listTasks, findTaskFile, archiveTasks } from '../../../src/bus/task';
 import type { BusPaths } from '../../../src/types';
 
 describe('Task Management', () => {
@@ -203,7 +203,6 @@ describe('Task Management', () => {
       const pending = listTasks(paths, { status: 'pending' });
       expect(pending.length).toBe(1);
     });
-  });
 });
 
 /**
@@ -858,5 +857,75 @@ describe('compactTasks — semantic compaction of old completed tasks', () => {
     expect(report.archived.map(a => a.id)).toEqual([id]);
     // Active JSON still present
     expect(existsSync(join(paths.taskDir, `${id}.json`))).toBe(true);
+  });
+
+  });
+
+});
+
+describe('UTF-8 BOM tolerance (2026-07-30 incident)', () => {
+  // A UTF-8 BOM on ONE task file of 708 made that task invisible to every reader in this module,
+  // because each wrapped JSON.parse in a silent catch. It hid a HIGH-priority, blocked, 49-day-old task
+  // from listTasks AND from checkStaleTasks — the detector whose whole job is finding forgotten work.
+  // The same BOM broke the symmetric-edge WRITE while createTask reported success.
+  //
+  // Self-contained on purpose: an earlier version relied on an enclosing describe's `paths` and silently
+  // landed in the wrong one, producing ENOENT instead of testing anything.
+  let dir: string;
+  let p: BusPaths;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'cortextos-bom-test-'));
+    p = {
+      ctxRoot: dir, inbox: join(dir, 'inbox'), inflight: join(dir, 'inflight'),
+      processed: join(dir, 'processed'), logDir: join(dir, 'logs'), stateDir: join(dir, 'state'),
+      taskDir: join(dir, 'tasks'), approvalDir: join(dir, 'approvals'),
+      analyticsDir: join(dir, 'analytics'), heartbeatDir: join(dir, 'heartbeats'),
+    } as BusPaths;
+    mkdirSync(p.taskDir, { recursive: true });
+  });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  const withBom = (id: string, over: Record<string, unknown> = {}) => {
+    const t = {
+      id, title: 'bom task', description: '', type: 'agent', needs_approval: false,
+      status: 'pending', assigned_to: 'boris', created_by: 'paul', org: 'acme',
+      priority: 'high', project: '', kpi_key: null,
+      created_at: '2026-06-11T02:34:52Z', updated_at: '2026-06-11T02:34:52Z',
+      completed_at: null, due_date: null, archived: false, ...over,
+    };
+    writeFileSync(join(p.taskDir, `${id}.json`), '﻿' + JSON.stringify(t), 'utf-8');
+  };
+
+  it('listTasks SEES a BOM-prefixed task — it was invisible before', () => {
+    withBom('task_bom_001');
+    expect(listTasks(p).map((t) => t.id)).toContain('task_bom_001');
+  });
+
+  it('checkStaleTasks SEES a BOM-prefixed task — the forgotten-work detector was blind to it', () => {
+    withBom('task_bom_002', { created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-01T00:00:00Z' });
+    expect(checkStaleTasks(p).stale_pending.map((t) => t.id)).toContain('task_bom_002');
+  });
+
+  it('a symmetric edge WRITES onto a BOM-prefixed peer — the half-recorded-relationship bug', () => {
+    withBom('task_bom_003');
+    const blocker = createTask(p, 'paul', 'acme', 'blocker', { blocks: ['task_bom_003'] });
+    const peer = JSON.parse(
+      readFileSync(join(p.taskDir, 'task_bom_003.json'), 'utf-8').replace(/^﻿/, ''),
+    );
+    expect(peer.blocked_by).toContain(blocker);
+  });
+
+  it('NEGATIVE CONTROL: a genuinely corrupt peer is REPORTED, not silently skipped', () => {
+    // The BOM was one cause of failure; the SILENT CATCH was the defect. Without this, the edge test
+    // above could pass while every other cause stayed swallowed.
+    writeFileSync(join(p.taskDir, 'task_corrupt_1.json'), '{ not valid json', 'utf-8');
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const id = createTask(p, 'paul', 'acme', 'blocker2', { blocks: ['task_corrupt_1'] });
+    expect(spy).toHaveBeenCalled();
+    expect(String(spy.mock.calls[0][0])).toMatch(/HALF-RECORDED/);
+    spy.mockRestore();
+    const notes = readTaskAudit(p, id).map((e) => e.note ?? '').join(' ');
+    expect(notes).toMatch(/PARTIAL: 1 dependency edge\(s\) NOT written/);
   });
 });

@@ -87,10 +87,32 @@ export function createTask(
 
   // Cycle-safe now: validation already passed, so symmetric-edge
   // maintenance is just mutating peer JSONs.
-  for (const depId of blockedBy) addSymmetricEdge(paths, depId, 'blocks', taskId);
-  for (const downId of blocks) addSymmetricEdge(paths, downId, 'blocked_by', taskId);
+  const edgeFailures: string[] = [];
+  for (const depId of blockedBy) {
+    const err = addSymmetricEdge(paths, depId, 'blocks', taskId);
+    if (err) edgeFailures.push(err);
+  }
+  for (const downId of blocks) {
+    const err = addSymmetricEdge(paths, downId, 'blocked_by', taskId);
+    if (err) edgeFailures.push(err);
+  }
 
   appendTaskAudit(paths, taskId, { event: 'create', agent: agentName, to: 'pending', note: title });
+
+  // Surface a partial write on BOTH channels. The task itself is fine and deliberately kept — throwing
+  // here would discard a valid task over a peer's problem — but the caller asked for an edge and did not
+  // get one, so this must be impossible to miss rather than inferred from a later `check-deps`.
+  if (edgeFailures.length) {
+    appendTaskAudit(paths, taskId, {
+      event: 'update',
+      agent: agentName,
+      note: `PARTIAL: ${edgeFailures.length} dependency edge(s) NOT written — ${edgeFailures.join('; ')}`,
+    });
+    console.error(
+      `WARNING: task ${taskId} was created but ${edgeFailures.length} dependency edge(s) were NOT ` +
+        `written. The relationship is HALF-RECORDED:\n  ${edgeFailures.join('\n  ')}`,
+    );
+  }
 
   return taskId;
 }
@@ -100,22 +122,65 @@ export function createTask(
  * No-op if the peer id is already present. Used to maintain symmetric
  * edges when a new task declares its dependencies.
  */
+/**
+ * Read and JSON.parse a task file, tolerating a UTF-8 BOM.
+ *
+ * Added 2026-07-30 after a real incident. Exactly ONE task file of 708 carries a BOM, and
+ * `JSON.parse` on a plain utf-8 read of it THROWS. Every reader in this module wrapped that parse in a
+ * silent catch, so that one task became invisible to `listTasks`, `checkStaleTasks`, `claimTask`,
+ * `updateTask`, `checkTaskDependencies`, `compactTasks`, `archiveTasks` and `addSymmetricEdge` — while
+ * the CLI reported success everywhere.
+ *
+ * The task it hid: a HIGH-priority, `blocked`, 49-day-old NanoNeuro Playwright e2e gate assigned to
+ * seb_boss. Not merely unsurfaced — absent from every query, including the stale-task detector whose
+ * whole job is finding forgotten work.
+ *
+ * One helper rather than a fix at the call site that happened to be noticed: the BOM breaks READS and
+ * WRITES identically, so patching only the write path would have left eight survivors.
+ */
+function parseTaskFile(filePath: string): Task {
+  const raw = readFileSync(filePath, 'utf-8');
+  // Strip a leading BOM. charCodeAt is cheaper than a regex on every task read in a fleet-wide sweep.
+  return JSON.parse(raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw) as Task;
+}
+
+/**
+ * Add one side of a dependency edge to a peer task. Returns why it failed, or null on success.
+ *
+ * NO LONGER SILENT (2026-07-30), and this half matters more than the BOM fix. The body was wrapped in
+ * `catch { /* best-effort *​/ }`, so a failed peer write produced: `createTask` returning success, a
+ * clean `create` audit entry, the new task showing its `blocks` list — and the peer never receiving
+ * `blocked_by`. **A half-written relationship, reported as complete.**
+ *
+ * That is worse than not writing it. The caller was TOLD the edge exists, and the record now disagrees
+ * with itself in a way no query can see: `check-deps` on the peer reports no blockers, while the other
+ * side insists it is blocking something.
+ *
+ * "best-effort" is the wrong policy for edge maintenance specifically. It is defensible when a failure
+ * degrades a nice-to-have; an edge IS the deliverable when someone passes `--blocks`. The BOM was one
+ * cause of one failure — the silent catch would have swallowed every future cause too.
+ */
 function addSymmetricEdge(
   paths: BusPaths,
   taskId: string,
   field: 'blocks' | 'blocked_by',
   peerId: string,
-): void {
+): string | null {
   const filePath = findTaskFile(paths, taskId);
-  if (!filePath) return; // Peer task missing — surfaced at resolution time.
+  // A missing peer stays non-fatal: the dangling id is visible in the new task's own list and
+  // `checkTaskDependencies` reports it as `status: 'missing'`. Reported, not swallowed.
+  if (!filePath) return `peer task ${taskId} not found`;
   try {
-    const task = JSON.parse(readFileSync(filePath, 'utf-8')) as Task;
+    const task = parseTaskFile(filePath);
     const list = task[field] ?? [];
     if (!list.includes(peerId)) {
       task[field] = [...list, peerId];
       atomicWriteSync(filePath, JSON.stringify(task));
     }
-  } catch { /* best-effort */ }
+    return null;
+  } catch (err) {
+    return `peer task ${taskId} could not be updated: ${String(err)}`;
+  }
 }
 
 /**
@@ -151,7 +216,7 @@ function detectCycleOrThrow(
     const filePath = findTaskFile(paths, cur);
     if (!filePath) continue; // Missing peer is not a cycle, just a dangling ref.
     try {
-      const task = JSON.parse(readFileSync(filePath, 'utf-8')) as Task;
+      const task = parseTaskFile(filePath);
       if (task.blocked_by?.length) stack.push(...task.blocked_by);
     } catch { /* skip */ }
   }
@@ -171,7 +236,7 @@ export function checkTaskDependencies(
   const filePath = findTaskFile(paths, taskId);
   if (!filePath) return [];
   let task: Task;
-  try { task = JSON.parse(readFileSync(filePath, 'utf-8')) as Task; }
+  try { task = parseTaskFile(filePath); }
   catch { return []; }
   const deps = task.blocked_by ?? [];
   const open: Array<{ id: string; status: TaskStatus | 'missing' }> = [];
@@ -179,7 +244,7 @@ export function checkTaskDependencies(
     const depPath = findTaskFile(paths, depId);
     if (!depPath) { open.push({ id: depId, status: 'missing' }); continue; }
     try {
-      const dep = JSON.parse(readFileSync(depPath, 'utf-8')) as Task;
+      const dep = parseTaskFile(depPath);
       if (dep.status !== 'completed') open.push({ id: depId, status: dep.status });
     } catch {
       open.push({ id: depId, status: 'missing' });
@@ -293,8 +358,7 @@ export function updateTask(
   let prevPriority: Priority | undefined;
   let assignee: string | undefined;
   try {
-    const content = readFileSync(filePath, 'utf-8');
-    const task: Task = JSON.parse(content);
+    const task: Task = parseTaskFile(filePath);
     prevStatus = task.status;
     prevPriority = task.priority;
     assignee = task.assigned_to;
@@ -420,7 +484,7 @@ export function claimTask(
 
   let task: Task;
   try {
-    task = JSON.parse(readFileSync(filePath, 'utf-8')) as Task;
+    task = parseTaskFile(filePath);
   } catch (err) {
     throw new Error(`Task ${taskId} claim failed (unreadable): ${err}`);
   }
@@ -508,8 +572,7 @@ export function completeTask(
   let assignee: string | undefined;
   let taskOrg: string = '';
   try {
-    const content = readFileSync(filePath, 'utf-8');
-    const task: Task = JSON.parse(content);
+    const task: Task = parseTaskFile(filePath);
     prevStatus = task.status;
     assignee = task.assigned_to;
     taskOrg = task.org || '';
@@ -635,8 +698,7 @@ export function listTasks(
   const tasks: Task[] = [];
   for (const file of files) {
     try {
-      const content = readFileSync(join(taskDir, file), 'utf-8');
-      const task: Task = JSON.parse(content);
+      const task: Task = parseTaskFile(join(taskDir, file));
 
       // Apply filters
       if (filters?.agent && task.assigned_to !== filters.agent) continue;
@@ -693,8 +755,7 @@ function readAllTasks(taskDir: string): Task[] {
   const tasks: Task[] = [];
   for (const file of files) {
     try {
-      const content = readFileSync(join(taskDir, file), 'utf-8');
-      tasks.push(JSON.parse(content));
+      tasks.push(parseTaskFile(join(taskDir, file)));
     } catch {
       // Skip corrupt files
     }
@@ -871,7 +932,7 @@ export function compactTasks(
   // references without re-reading files per candidate.
   const tasks: Task[] = [];
   for (const f of files) {
-    try { tasks.push(JSON.parse(readFileSync(join(taskDir, f), 'utf-8')) as Task); }
+    try { tasks.push(parseTaskFile(join(taskDir, f))); }
     catch { /* skip corrupt */ }
   }
 
