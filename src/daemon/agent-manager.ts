@@ -15,6 +15,7 @@ import { resolvePaths } from '../utils/paths.js';
 import { resolveEnv } from '../utils/env.js';
 import { recordInboundTelegram, cacheLastSent, logOutboundMessage, buildRecentHistory } from '../telegram/logging.js';
 import { logEvent } from '../bus/event.js';
+import { sendMessage } from '../bus/message.js';
 import { collectTelegramCommands, registerTelegramCommands } from '../bus/metrics.js';
 import { stripControlChars } from '../utils/validate.js';
 import { processMediaMessage } from '../telegram/media.js';
@@ -488,6 +489,11 @@ export class AgentManager {
     const configJsonPath = join(agentDir, 'config.json');
     migrateCronsForAgent(name, configJsonPath, this.ctxRoot, {
       log: (msg) => log(`[migration] ${msg}`),
+      // Bus-visible escalation for the pre-overwrite snapshot path. Migration only reaches it
+      // when crons.json holds live crons and the .crons-migrated marker is gone, i.e. the one
+      // boot-time write that can wipe every runtime-added cron on the fleet. A daemon log line
+      // is not enough for that: it has to reach the Activity feed and the orchestrator's inbox.
+      onCritical: (msg, meta) => this.notifyCronMigrationCritical(name, msg, meta),
     });
 
     // Wire daemon-level CronScheduler for this agent.
@@ -1305,6 +1311,52 @@ export class AgentManager {
    * If crons.json is absent or empty the scheduler starts but has nothing to do;
    * it will pick up new entries on the next `reloadCrons()` call.
    */
+  /**
+   * Surface a cron-migration critical on the bus, not just in the daemon log.
+   *
+   * Reached only from the pre-overwrite snapshot path in cron-migration.ts, which triggers
+   * when crons.json holds live crons and the .crons-migrated marker is absent. That is the
+   * single boot-time write capable of wiping every runtime-added cron on the fleet, including
+   * the orchestrator's own watchdog and liveness poke — so the fleet would lose the component
+   * that notices it lost things. Two surfaces on purpose: an error-severity event for the
+   * Activity feed, and a direct message so a human-facing agent is told rather than expected
+   * to notice. Both are best-effort; `notifyCritical` in cron-migration.ts swallows throws so
+   * this can never stop an agent booting.
+   */
+  private notifyCronMigrationCritical(
+    agentName: string,
+    msg: string,
+    meta: Record<string, unknown>,
+  ): void {
+    const paths = resolvePaths(agentName, this.instanceId, this.org);
+    logEvent(
+      paths,
+      agentName,
+      this.org,
+      'error',
+      'cron_migration_would_overwrite',
+      'error',
+      meta,
+      // The daemon is reporting ON this agent, not the agent reporting on itself: refreshing
+      // its heartbeat here would fake liveness for a process that may not even be up yet.
+      true,
+    );
+
+    // Route to the org's orchestrator if context.json names one. Same resolution the PTY uses
+    // for CTX_ORCHESTRATOR_AGENT, so a wipe alarm lands wherever agent traffic already goes.
+    try {
+      const env = resolveEnv();
+      if (!env.projectRoot) return;
+      const contextPath = join(env.projectRoot, 'orgs', this.org, 'context.json');
+      if (!existsSync(contextPath)) return;
+      const ctx = JSON.parse(readFileSync(contextPath, 'utf-8'));
+      if (!ctx.orchestrator || ctx.orchestrator === agentName) return;
+      sendMessage(paths, agentName, ctx.orchestrator, 'urgent', `CRON MIGRATION CRITICAL: ${msg}`);
+    } catch {
+      /* the event above already carries the finding */
+    }
+  }
+
   private startAgentCronScheduler(agentName: string): void {
     // Skip if already running (idempotent — e.g. called twice on fast restart)
     if (this.cronSchedulers.has(agentName)) {

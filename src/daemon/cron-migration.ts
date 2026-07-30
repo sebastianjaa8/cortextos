@@ -30,6 +30,7 @@ import type { CronDefinition, CronEntry } from '../types/index.js';
 import { readCrons, writeCrons } from '../bus/crons.js';
 import { CRONS_DIRECTORY } from '../bus/crons-schema.js';
 import { scanAgentDir } from '../utils/cron-teaching-scanner.js';
+import { snapshotLiveCrons } from './cron-snapshot.js';
 
 // ---------------------------------------------------------------------------
 // Marker file path helpers
@@ -247,6 +248,16 @@ export interface MigrationOptions {
   force?: boolean;
   /** Custom logger (defaults to console.log). */
   log?: (msg: string) => void;
+  /**
+   * Escalation hook for the pre-overwrite snapshot path below.
+   *
+   * A log line is not enough for an event that can wipe every runtime-added cron on the
+   * fleet: the whole lesson of the 2026-07-30 audit is that a warning in a file nobody reads
+   * is the same bug wearing a different hat. The caller owns bus context (paths, org,
+   * orchestrator name), so it injects the notifier rather than this module reaching for it —
+   * and a throw from the notifier must never take down an agent boot.
+   */
+  onCritical?: (msg: string, meta: Record<string, unknown>) => void;
 }
 
 export interface MigrationResult {
@@ -298,6 +309,26 @@ export function migrateCronsForAgent(
   return result;
 }
 
+/**
+ * Fire the caller's escalation hook, swallowing any failure.
+ *
+ * This runs inside agent startup. A notifier that throws — no bus, no disk, a bad org name —
+ * must not be the reason an agent fails to boot, and the log line has already been written by
+ * the time we get here, so the information is not lost if this is a no-op.
+ */
+function notifyCritical(
+  options: MigrationOptions,
+  msg: string,
+  meta: Record<string, unknown>,
+): void {
+  if (!options.onCritical) return;
+  try {
+    options.onCritical(msg, meta);
+  } catch {
+    /* never block a boot on a notification */
+  }
+}
+
 /** Core migration logic. Public callers go through `migrateCronsForAgent`. */
 function runMigrationCore(
   agentName: string,
@@ -316,6 +347,73 @@ function runMigrationCore(
   if (isMigrated(ctxRoot, agentName)) {
     log(`Skipping migration for "${agentName}" — already migrated`);
     return { agentName, status: 'skipped-already-migrated' };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Pre-overwrite snapshot: the one boot-time write that can destroy live state.
+  //
+  // Past this point every branch writes crons.json — either config.json's crons or an empty
+  // array. That is correct for a genuinely new agent. It is catastrophic for an established
+  // one: if the marker is ever absent while crons.json holds live crons (marker deleted, a
+  // state dir restored from a partial backup, a new CTX_ROOT / instance id), the next agent
+  // boot silently replaces the file the scheduler reads with whatever config.json happens to
+  // say, and rewrites the marker so it never retries. Every runtime-added cron is gone with
+  // no warning: ~75 fleet-wide as of 2026-07-30, including the orchestrator's own watchdog
+  // and liveness poke — so the fleet would lose the thing that notices it lost things.
+  //
+  // Nothing has hit this yet, which is the only reason it is a guard and not an incident.
+  //
+  // The snapshot is verified to exist and be non-empty BEFORE the write proceeds, and the
+  // migration ABORTS if it cannot be. A backup nobody checked is not a backup — on
+  // 2026-07-28 a backup written inside the tree being edited silently became a copy of the
+  // post-change state, and this is the one write with no second chance and no history.
+  // ---------------------------------------------------------------------------
+  const existingLive = readCrons(agentName);
+  if (existingLive.length > 0) {
+    const livePath = join(ctxRoot, CRONS_DIRECTORY, agentName, 'crons.json');
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const snapshotPath = `${livePath}.pre-migration-${stamp}`;
+    const names = existingLive.map((c) => c.name).join(', ');
+
+    let snapshotOk = false;
+    try {
+      // Verifies the artifact, not the call — see cron-snapshot.ts.
+      snapshotOk = snapshotLiveCrons(livePath, snapshotPath);
+    } catch (err) {
+      log(
+        `SNAPSHOT FAILED for "${agentName}": ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+
+    const detail =
+      `crons.json for "${agentName}" holds ${existingLive.length} live cron(s) but the ` +
+      `.crons-migrated marker is missing. Migration would overwrite them from config.json. ` +
+      `Crons at risk: ${names}`;
+
+    if (!snapshotOk) {
+      const msg = `ABORTED migration for "${agentName}" — could not verify a snapshot. ${detail}`;
+      log(`CRITICAL: ${msg}`);
+      notifyCritical(options, msg, {
+        agent: agentName,
+        reason: 'snapshot-unverified',
+        live_cron_count: existingLive.length,
+        crons: existingLive.map((c) => c.name),
+        snapshot_path: snapshotPath,
+      });
+      // Leaving the marker absent means the next boot retries. Retrying a blocked overwrite
+      // is safe; proceeding without a snapshot is not.
+      return { agentName, status: 'skipped-already-migrated' };
+    }
+
+    const msg = `Snapshotted live crons.json before re-migrating "${agentName}" → ${snapshotPath}. ${detail}`;
+    log(`CRITICAL: ${msg}`);
+    notifyCritical(options, msg, {
+      agent: agentName,
+      reason: 'pre-migration-overwrite',
+      live_cron_count: existingLive.length,
+      crons: existingLive.map((c) => c.name),
+      snapshot_path: snapshotPath,
+    });
   }
 
   // Read config.json — no-op on missing file

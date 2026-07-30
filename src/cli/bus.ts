@@ -2893,6 +2893,56 @@ busCommand
     }
   });
 
+busCommand
+  .command('check-cron-drift')
+  .description('Report config.json cron edits that are NOT in effect (fleet-wide)')
+  .option('--json', 'Emit raw JSON instead of the formatted report')
+  .option('--notify', 'Send ONE consolidated message to the org orchestrator when drift is found')
+  .action(async (opts: { json?: boolean; notify?: boolean }) => {
+    const { sweepConfigCronDrift, formatDriftFindings } = await import('../daemon/cron-drift.js');
+    const env = resolveEnv();
+    const projectRoot = env.projectRoot || env.frameworkRoot || process.cwd();
+
+    const findings = sweepConfigCronDrift(projectRoot);
+
+    if (opts.json) {
+      console.log(JSON.stringify(findings, null, 2));
+    } else {
+      console.log(formatDriftFindings(findings));
+    }
+
+    if (findings.length === 0) return;
+
+    const paths = resolvePaths(env.agentName, env.instanceId, env.org);
+    try {
+      logEvent(paths, env.agentName, env.org, 'action', 'cron_config_drift_detected', 'warning', {
+        finding_count: findings.length,
+        agents: [...new Set(findings.map((f) => f.agent))],
+        kinds: findings.reduce<Record<string, number>>((acc, f) => {
+          acc[f.kind] = (acc[f.kind] ?? 0) + 1;
+          return acc;
+        }, {}),
+      });
+    } catch { /* non-fatal */ }
+
+    // ONE message for the whole fleet, never one per agent. Fourteen separate notifications
+    // for a fleet-wide condition is how a real finding gets filtered out as noise.
+    if (!opts.notify) return;
+    try {
+      const contextPath = join(projectRoot, 'orgs', env.org, 'context.json');
+      if (!existsSync(contextPath)) return;
+      const ctx = JSON.parse(readFileSync(contextPath, 'utf-8'));
+      if (!ctx.orchestrator || ctx.orchestrator === env.agentName) return;
+      sendMessage(
+        paths,
+        env.agentName,
+        ctx.orchestrator,
+        'normal',
+        `config.json cron drift: ${findings.length} edit(s) not in effect.\n\n${formatDriftFindings(findings)}`,
+      );
+    } catch { /* the event above already carries the finding */ }
+  });
+
 function sleepMs(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
