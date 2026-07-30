@@ -74,6 +74,71 @@ export const busCommand = new Command('bus')
   .description('Bus commands for agent messaging, tasks, and events');
 
 busCommand
+  .command('send-message-file')
+  .description('Same as send-message, but the body is READ FROM A FILE so it never crosses a shell')
+  .argument('<to>', 'Target agent')
+  .argument('<priority>', 'Message priority (urgent, high, normal, low)')
+  .argument('<path>', 'File containing the message body (UTF-8)')
+  .argument('[reply-to]', 'Reply to message ID (optional positional form)')
+  .option('--reply-to <id>', 'Reply to message ID')
+  .action((to: string, priority: string, bodyPath: string, replyToArg: string | undefined, opts: { replyTo?: string }) => {
+    // WHY THIS EXISTS. `send-message` takes the body as a POSITIONAL ARGUMENT, so every message
+    // crosses a shell and inherits its quoting rules. On 2026-07-30 that cost SEVEN failures across
+    // two agents in one day: backslashes eaten inside heredocs, an apostrophe terminating a
+    // single-quoted string, and backticks running as command substitution mid-message.
+    //
+    // Every one was in the SHELL LAYER, not in the message. The habit fix we adopted — write
+    // harnesses to files instead of piping them through `node -e` — is right and does NOT cover
+    // this path, because a bus message still has to become an argv entry somehow.
+    //
+    // Passing a PATH removes the body from argv entirely: an agent writes the file with a
+    // non-shell tool and the shell only ever sees a filename with no metacharacters in it.
+    //
+    // Additive on purpose. `send-message` is unchanged and every existing caller keeps working —
+    // reworking its positional signature while fifteen agents depend on it would trade a quoting
+    // hazard for a compatibility one.
+    const effectiveReplyTo = opts.replyTo ?? replyToArg;
+    const validPriorities: Priority[] = ['urgent', 'high', 'normal', 'low'];
+    if (!validPriorities.includes(priority as Priority)) {
+      console.error(`Invalid priority '${priority}'. Must be one of: ${validPriorities.join(', ')}`);
+      process.exit(1);
+    }
+    try {
+      validateAgentName(to);
+    } catch (err) {
+      console.error(String(err));
+      process.exit(1);
+    }
+
+    const { readFileSync: readBody, existsSync: bodyExists } = require('fs');
+    if (!bodyExists(bodyPath)) {
+      // Loud, and distinct from an empty body. A missing file silently sending an empty message is
+      // the reassuring-direction failure for a tool whose whole purpose is not losing content.
+      console.error(`Message body file not found: ${bodyPath}`);
+      process.exit(1);
+    }
+    let text: string;
+    try {
+      text = readBody(bodyPath, 'utf-8');
+    } catch (err) {
+      console.error(`Could not read message body: ${String(err)}`);
+      process.exit(1);
+    }
+    if (!text.trim()) {
+      console.error(`Message body file is empty: ${bodyPath}`);
+      process.exit(1);
+    }
+
+    const env = resolveEnv();
+    const paths = resolvePaths(env.agentName, env.instanceId, env.org);
+    const msgId = sendMessage(paths, env.agentName, to, priority as Priority, text, effectiveReplyTo);
+    try {
+      logEvent(paths, env.agentName, env.org, 'message', 'agent_message_sent', 'info', JSON.stringify({ to, priority, msg_id: msgId, reply_to: effectiveReplyTo ?? null, from_file: true }));
+    } catch { /* non-fatal */ }
+    console.log(msgId);
+  });
+
+busCommand
   .command('send-message')
   .argument('<to>', 'Target agent')
   .argument('<priority>', 'Message priority (urgent, high, normal, low)')
