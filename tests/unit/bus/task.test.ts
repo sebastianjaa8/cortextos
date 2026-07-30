@@ -986,6 +986,28 @@ describe('stale_blocked bucket (2026-07-30)', () => {
     expect(r.stale_human).toEqual([]);
   });
 
+  it('recording a blocker does NOT reset the blocked-age clock — the fix must not defeat itself', () => {
+    // ENFORCES an accidental correctness. `addSymmetricEdge` does not bump `updated_at`, which is why a
+    // 49-day blocked task still read 43d after its blocker was recorded rather than resetting to 0.
+    // If it DID bump — the obvious "tidy this to match the other writers" change — then writing a
+    // blocker would reset the age and hide the task from stale_blocked for another 24h. The fix would
+    // be defeated by an unrelated write, and nothing would say so.
+    //
+    // This is the same shape as a sabotage harness that only passes because nobody has touched the
+    // source yet: correctness that survives by luck rather than by constraint.
+    write('task_blk_edge', { status: 'blocked', updated_at: hoursAgo(49 * 24) });
+    const blocker = createTask(p, 'paul', 'acme', 'the blocker', { blocks: ['task_blk_edge'] });
+
+    // FIRST assert the edge actually landed. Without this the test could pass vacuously: a broken
+    // addSymmetricEdge writes nothing, updated_at is trivially unchanged, and the real assertion below
+    // would hold for the wrong reason.
+    const peer = JSON.parse(readFileSync(join(p.taskDir, 'task_blk_edge.json'), 'utf-8'));
+    expect(peer.blocked_by).toContain(blocker);
+
+    // THEN the thing that matters: it is still reported as long-blocked.
+    expect(checkStaleTasks(p).stale_blocked.map((t) => t.id)).toContain('task_blk_edge');
+  });
+
   it('NEGATIVE CONTROL: the pre-existing buckets still fire — the new branch changed nothing else', () => {
     write('task_ip', { status: 'in_progress', updated_at: hoursAgo(9) });
     write('task_pd', { status: 'pending', created_at: hoursAgo(30), updated_at: hoursAgo(30) });
