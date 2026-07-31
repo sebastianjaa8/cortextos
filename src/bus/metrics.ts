@@ -101,11 +101,33 @@ export function collectMetrics(ctxRoot: string, org?: string): MetricsReport {
   const timestamp = new Date().toISOString();
   const today = timestamp.split('T')[0];
 
+  // Only ENABLED agents count toward health. The file is named enabled-agents.json but it holds the
+  // full roster: each entry carries its own `enabled` flag, and Object.keys() took the disabled ones
+  // too. That pinned builder_2 and builder_opus (both retired) in the denominator permanently, so
+  // the report read 13/15 and could never reach full health however well the live agents behaved.
+  //
+  // A permanent ceiling below 100% is worse than a wrong number. It teaches readers the shortfall is
+  // normal, and then a REAL agent going unhealthy moves 13/15 to 12/15 — a change nobody looks at
+  // twice against a figure that has never been full.
+  //
+  // Read as ENTRIES, not keys, because the flag that answers the question is the value.
+  //
+  // NOT routed through listAgents()/disabledAgents() despite those being the canonical roster.
+  // Tried it; it is the wrong tool and the test caught it — listAgents MERGES a directory scan of
+  // CTX_FRAMEWORK_ROOT/orgs (BUG-028) with this file, so it returned 14 agents against a 2-agent
+  // fixture by discovering the real fleet through cwd. That is roster DISCOVERY, not an
+  // enabled-predicate. collectMetrics is handed ctxRoot deliberately; swapping in a function with a
+  // process.env-and-cwd input path would be a bigger behaviour change than the bug being fixed.
+  //
+  // `!== false` rather than `=== true`: an entry with no flag at all is a live agent someone added
+  // without setting it, and defaulting those OUT would silently shrink the fleet — the same
+  // disappearing-denominator failure in the opposite direction.
   const enabledFile = join(ctxRoot, 'config', 'enabled-agents.json');
   let agentNames: string[] = [];
   if (existsSync(enabledFile)) {
     try {
-      agentNames = Object.keys(JSON.parse(readFileSync(enabledFile, 'utf-8')));
+      const roster: Record<string, { enabled?: boolean }> = JSON.parse(readFileSync(enabledFile, 'utf-8'));
+      agentNames = Object.entries(roster).filter(([, v]) => v?.enabled !== false).map(([k]) => k);
     } catch { /* empty */ }
   }
 

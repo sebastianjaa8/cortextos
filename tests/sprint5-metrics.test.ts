@@ -37,6 +37,29 @@ describe('Sprint 5: Observability & Metrics', () => {
       expect(report.system.approvals_pending).toBe(0);
     });
 
+    it('excludes disabled agents from the health denominator', () => {
+      // Two agents differing in ONE variable: the enabled flag. Anything else different and a
+      // failure would not isolate the cause.
+      writeFileSync(
+        join(ctxRoot, 'config', 'enabled-agents.json'),
+        JSON.stringify({ live_bot: { enabled: true }, retired_bot: { enabled: false } }),
+        'utf-8',
+      );
+      mkdirSync(join(ctxRoot, 'state', 'live_bot'), { recursive: true });
+      mkdirSync(join(ctxRoot, 'state', 'retired_bot'), { recursive: true });
+
+      const report = collectMetrics(ctxRoot);
+
+      // The regression: Object.keys() counted both, pinning the report at N-1 of N forever.
+      expect(report.system.agents_total).toBe(1);
+      expect(report.agents).not.toHaveProperty('retired_bot');
+
+      // CONTROL. Without this, an empty roster (listAgents throwing, a bad ctxRoot, a filter that
+      // excludes everything) satisfies both assertions above and the test passes having proven
+      // nothing. The exclusion is only meaningful if the inclusion still works.
+      expect(report.agents).toHaveProperty('live_bot');
+    });
+
     it('counts tasks per agent by status', () => {
       writeFileSync(join(ctxRoot, 'config', 'enabled-agents.json'), JSON.stringify({ bot1: { enabled: true } }), 'utf-8');
       mkdirSync(join(ctxRoot, 'state', 'bot1'), { recursive: true });
