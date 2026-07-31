@@ -3111,7 +3111,13 @@ Stated-time coverage: ${coverage.stating} of ${coverage.timeAnchored} time-ancho
   ${coverage.disclaimed} time token(s) disclaimed by a negation (e.g. "not 8am ET") and correctly ` +
           `not counted as claims. This guards the OTHER direction: the extractor is shared by the ` +
           `finding path and by the number above, so an over-matching extractor would RAISE coverage ` +
-          `and read as improving health. A RISE here is the tell.`,
+          `and read as improving health. A RISE here is the tell.` +
+          `
+  ${coverage.threshold} time token(s) read as a THRESHOLD, not a claim — a time introduced by a ` +
+          `comparison ("older than 6pm ET", "before the 7am ET brief", "received after 6:30am ET") ` +
+          `is what the cron reasons ABOUT, and it may fire at any hour to evaluate it. Counted ` +
+          `separately from disclaimed so neither guard's false positives can hide inside the ` +
+          `other's expected number. A RISE here is the tell, same as above.`,
       );
       if (latent.length > 0) {
         console.log(

@@ -286,6 +286,38 @@ const DISCLAIMED_BY =
   /\b(?:not|never|rather than|instead of|no longer|isn't|is not|wasn't|won't)\b[^.!?\n]*$/i;
 
 /**
+ * A time token is a THRESHOLD, not a fire-time claim, when a comparison preposition introduces it:
+ * "older than 6pm ET", "before the 7am ET brief", "received after 6:30am ET". The time is the
+ * OBJECT of a comparison — a boundary the cron reasons ABOUT — and the cron may legitimately fire
+ * at any hour to evaluate it. Reading it as a schedule claim inverts the check: the better a prompt
+ * explains which window it inspects, the likelier it is flagged for not firing inside that window.
+ *
+ * Same machinery as `DISCLAIMED_BY`, different words, and the shared clause-bounded lookback is the
+ * point rather than an implementation detail — a preposition in a previous sentence must not reach
+ * forward and delete a real claim. Lookback is also directional, which does the disambiguating for
+ * free: "at 9am ET, after checking the inbox" has `after` AFTER the token and stays a claim.
+ *
+ * LIVE FALSE POSITIVE, not latent hardening — unlike the negation guard above, this one has work to
+ * do the moment it ships. Measured against the real fleet on 2026-07-31: 40 time-anchored matches
+ * post-negation, 3 suppressed, 37 remain. The three span THREE GRAMMARS across THREE AGENTS, which
+ * is why a word list beats special-casing the cron that exposed it:
+ *
+ *   atlas/weekly-review-check      threshold      "older than Sunday 22:00 UTC (6pm ET"
+ *   builder_1/check-expectations   cross-cron ref "= 6am ET daily, before the 7am ET"
+ *   email_triage/midday-triage     filter bound   "Pull unread Gmail received after 6:30am ET"
+ *
+ * COVERAGE FALLS AND THAT IS THE FIX WORKING: `stating` 34 -> 33 (only atlas/weekly-review-check
+ * loses its ONLY time; the other two state a real time elsewhere in the same prompt and stay
+ * checkable). A drop in `stating` is otherwise a finding by design, so the suppression is COUNTED
+ * and reported — an unexplained fall reads identically to the silent-tidy regression this metric
+ * exists to catch. Counted SEPARATELY from `disclaimed` deliberately: that counter guards the
+ * over-match direction for negation, and folding a second reason into it would let one guard's
+ * false positives hide inside the other's expected number.
+ */
+const THRESHOLD_BY =
+  /\b(?:older than|newer than|earlier than|later than|prior to|before|after|since|until)\b[^.!?\n]*$/i;
+
+/**
  * Times a prompt states about itself, e.g. "Sunday 8:30am ET", "fires at 7am ET".
  * Only local-timezone claims are matched; a prompt saying "09:00 UTC" is already unambiguous.
  *
@@ -310,22 +342,31 @@ const DISCLAIMED_BY =
 function extractLocalHours(prompt: string): {
   stated: Array<{ hour: number; raw: string }>;
   disclaimed: number;
+  threshold: number;
 } {
   const stated: Array<{ hour: number; raw: string }> = [];
   let disclaimed = 0;
+  let threshold = 0;
   const re = /\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b[^.\n]{0,20}?\b(ET|EST|EDT|local)\b/gi;
   for (const m of prompt.matchAll(re)) {
     let h = parseInt(m[1], 10);
     if (h < 1 || h > 12) continue;
-    if (DISCLAIMED_BY.test(prompt.slice(Math.max(0, m.index - 40), m.index))) {
+    const lookback = prompt.slice(Math.max(0, m.index - 40), m.index);
+    // Negation first, so a token carrying both ("not before 8am ET") keeps its existing
+    // classification and this change cannot move a number it was not meant to move.
+    if (DISCLAIMED_BY.test(lookback)) {
       disclaimed++;
+      continue;
+    }
+    if (THRESHOLD_BY.test(lookback)) {
+      threshold++;
       continue;
     }
     if (/pm/i.test(m[3]) && h !== 12) h += 12;
     if (/am/i.test(m[3]) && h === 12) h = 0;
     stated.push({ hour: h, raw: m[0].trim() });
   }
-  return { stated, disclaimed };
+  return { stated, disclaimed, threshold };
 }
 
 function statedLocalHours(prompt: string): Array<{ hour: number; raw: string }> {
@@ -522,24 +563,34 @@ const KIND_ORDER: Record<CronDriftKind, number> = {
  * have inflated this very number. A metric that only guards one direction is not half a guard, it
  * is a guard plus a blind spot aimed at the reassuring outcome. Counting disclaimed tokens makes an
  * over-matching extractor surface as a rising `disclaimed` rather than as a healthier `stating`.
+ *
+ * `threshold` is the same instrument for the comparison-preposition guard (`THRESHOLD_BY`), kept as
+ * its OWN counter rather than added to `disclaimed`. Two suppression reasons sharing one number
+ * means either guard can over-match without the total looking wrong, since a fall in one hides a
+ * rise in the other. It also accounts for the one-time `stating` drop that guard causes on the run
+ * it ships: this metric treats an unexplained fall as a finding, so a suppression that does not
+ * report itself would be indistinguishable from the regression the whole function exists to catch.
  */
 export function statedTimeCoverage(): {
   timeAnchored: number;
   stating: number;
   disclaimed: number;
+  threshold: number;
   agents: string[];
 } {
   let timeAnchored = 0;
   let stating = 0;
   let disclaimed = 0;
+  let threshold = 0;
   const agents: string[] = [];
   for (const agentName of listStateAgents()) {
     try {
       for (const cron of readCrons(agentName)) {
         if (cron.schedule.trim().split(/\s+/).length !== 5) continue;
         timeAnchored++;
-        const { stated, disclaimed: d } = extractLocalHours(cron.prompt ?? '');
+        const { stated, disclaimed: d, threshold: t } = extractLocalHours(cron.prompt ?? '');
         disclaimed += d;
+        threshold += t;
         if (stated.length > 0) {
           stating++;
           if (!agents.includes(agentName)) agents.push(agentName);
@@ -547,7 +598,7 @@ export function statedTimeCoverage(): {
       }
     } catch { /* skip */ }
   }
-  return { timeAnchored, stating, disclaimed, agents };
+  return { timeAnchored, stating, disclaimed, threshold, agents };
 }
 
 /**

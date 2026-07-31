@@ -32,7 +32,7 @@ vi.mock('../../../src/daemon/cron-snapshot.js', async (importOriginal) => {
   };
 });
 
-import { detectConfigCronDrift, detectMissingMigrationMarker, detectScheduleContradictsPrompt, formatDriftFindings, sweepConfigCronDrift, listExcludedRetiredAgents, wipeConditionArmed } from '../../../src/daemon/cron-drift.js';
+import { detectConfigCronDrift, detectMissingMigrationMarker, detectScheduleContradictsPrompt, formatDriftFindings, statedTimeCoverage, sweepConfigCronDrift, listExcludedRetiredAgents, wipeConditionArmed } from '../../../src/daemon/cron-drift.js';
 import type { CronDriftFinding } from '../../../src/daemon/cron-drift.js';
 import { migrateCronsForAgent } from '../../../src/daemon/cron-migration.js';
 import { CRONS_DIRECTORY } from '../../../src/bus/crons-schema.js';
@@ -376,6 +376,141 @@ describe('detectScheduleContradictsPrompt', () => {
         ),
       ).toEqual([]);
     });
+  });
+
+  // The negation guard above was LATENT — 0 live crons affected. This one shipped against three
+  // live false positives, and the three do not share a phrasing, only a grammar: the time is the
+  // OBJECT of a comparison. A cron may fire at any hour to evaluate a boundary, so reading the
+  // boundary as a fire-time claim inverts the check — the more precisely a prompt names the window
+  // it inspects, the more certainly it is flagged for not firing inside it.
+  describe('a time introduced by a comparison is a threshold, not a claim', () => {
+    it.each([
+      // The three live grammars, verbatim in shape from the fleet on 2026-07-31. Each schedule
+      // below is the REAL one and is correct by design: fire outside the window, inspect inside it.
+      [
+        'threshold (atlas/weekly-review-check)',
+        '0 16 * * 1',
+        'If mtime is older than Sunday 22:00 UTC (6pm ET Sunday = start of review window), flag it.',
+      ],
+      [
+        // The live prompt ALSO states its own fire time ("10:00 UTC = 6am ET"), which on the
+        // finding path masks this entirely — the live cost is in the match count, not a finding.
+        // Dropped here so the case can actually discriminate: with the threshold as the only time,
+        // the guard is the difference between silence and a false positive.
+        'positional reference to another cron (builder_1/check-expectations)',
+        '0 10 * * *',
+        'Fires 10:00 UTC daily, before the 7am ET brief composes.',
+      ],
+      [
+        'filter bound (email_triage/midday-triage)',
+        '0 16 * * *',
+        'Pull unread Gmail received after 6:30am ET and triage it.',
+      ],
+      ['prior to', '0 16 * * 1', 'Sweep anything landed prior to 9am ET.'],
+      ['since', '0 16 * * 1', 'Report everything since 7am ET.'],
+      ['until', '0 16 * * 1', 'Hold the queue until 8am ET.'],
+      ['newer than', '0 16 * * 1', 'Skip anything newer than 7am ET.'],
+      ['earlier than', '0 16 * * 1', 'Escalate anything earlier than 9am ET.'],
+      ['later than', '0 16 * * 1', 'Escalate anything later than 8am ET.'],
+    ])('stays silent: %s', (_label, schedule, prompt) => {
+      expect(
+        detectScheduleContradictsPrompt(AGENT, [live({ name: 'probe', schedule, prompt })], TZ),
+      ).toEqual([]);
+    });
+
+    // Both directions, same discipline as the negation block. A guard that can never fire is as
+    // broken as one that never goes quiet — it just fails silently instead of loudly.
+    it('STILL FLAGS when the comparison word FOLLOWS the time — lookback is directional', () => {
+      // "at 9am ET, after checking the inbox": `after` governs the checking, not the hour. This is
+      // the property that lets a bare word list like `after` be safe at all, so it is asserted
+      // rather than assumed.
+      const findings = detectScheduleContradictsPrompt(
+        AGENT,
+        [live({ name: 'probe', schedule: '0 16 * * *', prompt: 'Runs at 9am ET, after checking the inbox.' })],
+        TZ,
+      );
+      expect(findings).toHaveLength(1);
+    });
+
+    it('STILL FLAGS when the comparison word is closed off by a sentence terminator', () => {
+      // A preposition in a previous sentence must not reach forward and delete a real claim —
+      // the same clause bound the negation guard uses, for the same reason.
+      const findings = detectScheduleContradictsPrompt(
+        AGENT,
+        [live({ name: 'probe', schedule: '0 16 * * *', prompt: 'Skip anything older than a week. Runs 9am ET.' })],
+        TZ,
+      );
+      expect(findings).toHaveLength(1);
+    });
+
+    // GUARD FOR ONE LEG SUPPRESSING ANOTHER. Two of the three live false positives state a real
+    // time in the SAME prompt as the threshold, so a guard that suppressed the whole prompt rather
+    // than the token would have silently un-checked two correct crons while looking like a fix.
+    it('suppresses only the threshold token — a threshold must not MASK a real contradiction', () => {
+      // Two of the three live false positives state a real time in the SAME prompt as the
+      // threshold, so a guard applied to the prompt rather than the token would silently
+      // un-check two correct crons while looking like a fix.
+      //
+      // Chosen so it DISCRIMINATES, which the obvious version of this test does not: here the
+      // schedule matches the THRESHOLD (12pm) and contradicts the CLAIM (9am). Ungrarded, the
+      // threshold token satisfies `stated.some(...)` and the detector goes silent on a real
+      // contradiction — the guard turns a false NEGATIVE into a finding, not just a finding
+      // into silence. A first draft of this test asserted the same outcome on both sides of the
+      // guard and passed with the rule deleted.
+      const prompt = 'Runs at 9am ET, after the 12pm ET sweep.';
+      expect(
+        detectScheduleContradictsPrompt(AGENT, [live({ name: 'probe', schedule: '0 16 * * *', prompt })], TZ),
+      ).toHaveLength(1);
+      // ...and the surviving claim is the 9am one: a schedule that matches IT is silent.
+      expect(
+        detectScheduleContradictsPrompt(AGENT, [live({ name: 'probe', schedule: '0 13 * * *', prompt })], TZ),
+      ).toEqual([]);
+    });
+  });
+});
+
+/**
+ * The counters, not the findings. `stating` falling is a finding BY DESIGN — it is how a prompt
+ * tidied into a doc pointer gets caught. So a suppression rule that lowers `stating` without
+ * reporting itself is indistinguishable from the regression this metric exists to detect, and the
+ * run it ships on would read as a silent tidy. These assert the accounting, which is the only
+ * thing that keeps the drop legible.
+ */
+describe('statedTimeCoverage accounting', () => {
+  const A = 'probe_agent';
+
+  function seedCrons(crons: Array<{ name: string; schedule: string; prompt: string }>): void {
+    const dir = join(tmp, CRONS_DIRECTORY, A);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, 'crons.json'),
+      JSON.stringify({ updated_at: '2026-07-31T00:00:00Z', crons: crons.map((c) => ({ ...c, enabled: true })) }),
+      'utf-8',
+    );
+  }
+
+  it('counts a threshold token separately from a disclaimed one', () => {
+    seedCrons([
+      { name: 'thresh', schedule: '0 16 * * 1', prompt: 'Flag anything older than 6pm ET.' },
+      { name: 'neg', schedule: '0 16 * * 0', prompt: 'Runs 12pm ET, not 8am ET.' },
+    ]);
+    const c = statedTimeCoverage();
+    expect(c.threshold).toBe(1);
+    expect(c.disclaimed).toBe(1);
+    // The threshold cron states nothing that survives, so it drops out of `stating` — and the
+    // count above is what explains the drop to a reader who would otherwise see a regression.
+    expect(c.stating).toBe(1);
+    expect(c.timeAnchored).toBe(2);
+  });
+
+  it('classifies a token carrying BOTH as disclaimed, so this change cannot move the other number', () => {
+    // "not before 8am ET" is negated AND comparative. Negation is checked first deliberately:
+    // the pre-existing counter must keep its pre-existing meaning, or shipping this guard would
+    // silently redistribute a number nobody asked it to touch.
+    seedCrons([{ name: 'both', schedule: '0 16 * * *', prompt: 'This does not run before 8am ET.' }]);
+    const c = statedTimeCoverage();
+    expect(c.disclaimed).toBe(1);
+    expect(c.threshold).toBe(0);
   });
 });
 
