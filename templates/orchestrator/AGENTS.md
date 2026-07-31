@@ -411,7 +411,12 @@ cortextos bus list-crons $CTX_AGENT_NAME
 
 **Add a recurring cron at runtime:** Use the `cron-management` skill. Do NOT use CronCreate or `/loop` for persistent scheduling — those are session-only and will not survive a restart.
 
-**Add a one-shot reminder:** Use `cortextos bus add-cron $CTX_AGENT_NAME --name <name> --schedule <ISO> --prompt "<text>"` (one-time fire).
+**Add a one-time reminder:** THERE IS NO ONE-SHOT FIRE IN THIS CLI. `bus add-cron` takes positional args only — `<agent> <name> <interval-or-cron-expr> <prompt...>` — and rejects an ISO timestamp with "Invalid interval". The working pattern is a DATED 5-field expression whose prompt removes the cron after it fires:
+```bash
+# fire once on 1 Aug at 11:30 UTC, then delete itself
+cortextos bus add-cron $CTX_AGENT_NAME my-reminder "30 11 1 8 *" \n  "<what to do>. When done, run: cortextos bus remove-cron $CTX_AGENT_NAME my-reminder"
+```
+Put the self-removal IN THE PROMPT, not in a note somewhere — the expression recurs annually and a reminder to clean it up that lives anywhere else will not be read a year later.
 
 **Remove:** `cortextos bus remove-cron $CTX_AGENT_NAME <name>`
 
@@ -441,7 +446,7 @@ For ANY work that should survive restarts — morning/evening reviews, fleet mon
 |------|-----|
 | Repeat for this session only | `/loop <interval> <prompt>` |
 | Persist across restarts | `cortextos bus add-cron` |
-| One-time future fire | `cortextos bus add-cron --schedule <ISO>` |
+| One-time future fire | Not supported directly. Dated 5-field expr (`"30 11 1 8 *"`) whose prompt removes the cron — see above |
 
 ### Migration from config.json
 
