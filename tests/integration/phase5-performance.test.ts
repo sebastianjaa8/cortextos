@@ -62,6 +62,43 @@ async function reloadModules(): Promise<void> {
 let tmpRoot: string;
 const originalCtxRoot = process.env.CTX_ROOT;
 
+/**
+ * Every scheduler this file constructs, so teardown does NOT depend on the test body finishing.
+ *
+ * THE LEAK THIS FIXES, measured 2026-07-31 rather than reasoned about. This file was appending
+ * exactly 16 cron-execution-log entries per run into the developer's LIVE state dir at
+ * ~/.cortextos/default/.cortextOS/state/agents/sc2-drift-1000/. A stack captured at the write:
+ *
+ *     logFilePath -> appendExecutionLog -> fireWithRetry -> CronScheduler.tick
+ *
+ * with root=C:\Users\Sebas\.cortextos\default. So a tick was still DISPATCHING after the test had
+ * moved on and CTX_ROOT had been restored.
+ *
+ * THE CAUSE IS THE TIMEOUT, and it is why two earlier fixes failed. SC-2 times out at 120000ms,
+ * so its `scheduler.stop()` — the last line of the test body — NEVER RUNS. The scheduler keeps its
+ * interval and its in-flight tick and goes on firing into whatever CTX_ROOT happens to be. Any
+ * teardown written as the last statement of a test is teardown that a timeout skips.
+ *
+ * TWO REJECTED FIXES, recorded so they are not retried:
+ *  1. Draining outstanding fires before the assertion. SC-2 exists to MEASURE fire drift at 1000
+ *     crons; forcing the fires to complete changes the quantity under test (984 -> 16) and the leak
+ *     survived anyway. A test whose subject is "some fires have not happened yet" cannot be fixed
+ *     by making them happen.
+ *  2. Pointing CTX_ROOT at a quarantine dir in afterEach and restoring in afterAll. Measured: the
+ *     leak was unchanged, because these writes land after afterAll, not between tests.
+ *
+ * The production writer needs no change: per-call CTX_ROOT resolution is correct, and CTX_ROOT
+ * never moves in production, so a late write is harmless there by construction.
+ */
+const liveSchedulers: Array<{ stop(): void }> = [];
+
+/** Same arity as `new CronScheduler(...)` so call sites are a one-token change. */
+function trackScheduler(opts: ConstructorParameters<typeof CronScheduler>[0]) {
+  const s = new CronScheduler(opts);
+  liveSchedulers.push(s);
+  return s;
+}
+
 beforeEach(async () => {
   tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'phase5-perf-'));
   process.env.CTX_ROOT = tmpRoot;
@@ -70,6 +107,12 @@ beforeEach(async () => {
 });
 
 afterEach(() => {
+  // FIRST, and before restoring CTX_ROOT: stop every scheduler this test built, whether or not the
+  // test reached its own stop() call. afterEach still runs when a test times out; the last line of
+  // the test body does not.
+  while (liveSchedulers.length > 0) {
+    try { liveSchedulers.pop()!.stop(); } catch { /* a half-built scheduler is still worth dropping */ }
+  }
   // Restore real timers if any test left fake timers running
   vi.useRealTimers();
   vi.resetModules();
@@ -206,7 +249,7 @@ describe('P-1: Startup time — 1000 crons ready in <5s', () => {
 
     for (const agentName of agents) {
       let fired = 0;
-      const scheduler = new CronScheduler({
+      const scheduler = trackScheduler({
         agentName,
         onFire: async () => { fired++; },
         logger: () => { /* silent */ },
@@ -225,7 +268,7 @@ describe('P-1: Startup time — 1000 crons ready in <5s', () => {
     await reloadModules();
 
     const t0 = performance.now();
-    const bigScheduler = new CronScheduler({
+    const bigScheduler = trackScheduler({
       agentName: bigAgent,
       onFire: async () => { /* no-op */ },
       logger: () => { /* silent */ },
@@ -278,7 +321,7 @@ describe('P-2: Fire latency — due cron fires within 1 min of schedule', () => 
     const fireEvents: { name: string; delayMs: number }[] = [];
     const startFakeTime = Date.now();
 
-    const scheduler = new CronScheduler({
+    const scheduler = trackScheduler({
       agentName: agent,
       onFire: async (c) => {
         fireEvents.push({ name: c.name, delayMs: Date.now() - startFakeTime });
@@ -473,7 +516,7 @@ describe('P-5: Concurrent fires — 100 simultaneous crons succeed in <30s (simu
     let firstFireSimMs = 0;
     let lastFireSimMs = 0;
 
-    const scheduler = new CronScheduler({
+    const scheduler = trackScheduler({
       agentName: agent,
       onFire: async () => {
         const now = Date.now(); // fake-timer Date.now()
@@ -536,7 +579,7 @@ describe('P-5: Concurrent fires — 100 simultaneous crons succeed in <30s (simu
     let firstFireSimMs = 0;
     let lastFireSimMs = 0;
 
-    const scheduler = new CronScheduler({
+    const scheduler = trackScheduler({
       agentName: agent,
       onFire: async () => {
         const now = Date.now();
@@ -684,7 +727,7 @@ describe('SC-1: Scaling cliff — startup time at 500/1000/2000 crons', () => {
       const samples: number[] = [];
       for (let sample = 0; sample < STARTUP_SAMPLES; sample++) {
         const t0 = performance.now();
-        const scheduler = new CronScheduler({
+        const scheduler = trackScheduler({
           agentName,
           onFire: async () => { /* no-op */ },
           logger: () => { /* silent */ },
@@ -752,7 +795,7 @@ describe('SC-2: Scaling cliff — sequential fire drift at 1000 crons × 10ms PT
 
     let fireCount = 0;
 
-    const scheduler = new CronScheduler({
+    const scheduler = trackScheduler({
       agentName: agent,
       onFire: async () => {
         fireCount++;
