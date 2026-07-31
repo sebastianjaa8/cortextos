@@ -2,9 +2,14 @@
 // Is the RUNNING daemon executing the current src? Three facts, two comparisons, nobody was
 // making either one.
 //
-//   A  last commit touching src/      (when the code last changed)
+//   A  newest mtime under src/        (when the code last changed)
 //   B  mtime of dist/daemon.js        (when the bundle was last built)
 //   C  pm2 up_since for the daemon    (when the resident copy was loaded)
+//
+// A was the last COMMIT date until 2026-07-30, when that leg fired a false positive by 278ms —
+// git commit times have 1-second resolution, file mtimes have milliseconds, and the real workflow
+// is edit->build->test->commit, so a healthy build lands a fraction of a second BEFORE its commit.
+// All three facts are now file/process timestamps on one clock. See the STALE-BUNDLE leg.
 //
 // The chain must hold A <= B <= C. Break it anywhere and the daemon is running code that is not
 // what the repo says:
@@ -28,7 +33,7 @@
 //
 // exit 0 CURRENT · 2 a real finding (stale bundle or stale daemon) · 3 could not run
 import { execSync } from 'node:child_process';
-import { statSync, existsSync } from 'node:fs';
+import { statSync, existsSync, readdirSync } from 'node:fs';
 
 const REPO = 'C:/Users/Sebas/cortextos';
 const BUNDLE = `${REPO}/dist/daemon.js`;
@@ -37,14 +42,32 @@ const BUNDLE = `${REPO}/dist/daemon.js`;
  * Pure verdict logic, so --self-test can drive it with fabricated times.
  * @returns {{code:0|2, lines:string[]}}
  */
-export function verdict({ lastSrcCommit, bundleMtime, daemonUpSince, dirtySrcFiles }) {
+export function verdict({ newestSrcMtime, bundleMtime, daemonUpSince, dirtySrcFiles }) {
   const lines = [];
   const findings = [];
 
-  if (bundleMtime < lastSrcCommit) {
+  // COMPARED AGAINST THE NEWEST src/ FILE MTIME, NOT THE LAST COMMIT DATE. This leg fired a false
+  // positive on 2026-07-30 by 278 MILLISECONDS, and the cause was a clock-domain mismatch:
+  //
+  //   * git commit timestamps have ONE-SECOND resolution (the value read back ends in .000)
+  //   * file mtimes have millisecond resolution
+  //
+  // and worse, the comparison assumed build-AFTER-commit while the real workflow is
+  // edit -> build -> test -> commit. So a healthy build-then-commit leaves the bundle a fraction of
+  // a second OLDER than the commit, every time, and this leg reported that as staleness. The
+  // artifact points at "stale", so the check was biased toward firing on correct behaviour.
+  //
+  // Two file mtimes are the same clock at the same resolution, and they answer the question this
+  // leg actually asks — was the bundle built after the last source EDIT. A tolerance would only
+  // have been a guess about how long a commit takes.
+  //
+  // It also closes a gap the commit-based version could not see at all: editing src without
+  // committing never moved the old comparand, so uncommitted-and-unbuilt read as CURRENT.
+  if (bundleMtime < newestSrcMtime) {
     findings.push(
-      `STALE-BUNDLE — dist/daemon.js (${bundleMtime.toISOString()}) is OLDER than the last src/ ` +
-        `commit (${lastSrcCommit.toISOString()}). The bundle was never rebuilt. npm run build.`,
+      `STALE-BUNDLE — dist/daemon.js (${bundleMtime.toISOString()}) is OLDER than the newest src/ ` +
+        `file (${newestSrcMtime.toISOString()}). The bundle was not rebuilt after the last source ` +
+        `edit. npm run build.`,
     );
   }
   if (daemonUpSince < bundleMtime) {
@@ -55,18 +78,20 @@ export function verdict({ lastSrcCommit, bundleMtime, daemonUpSince, dirtySrcFil
     );
   }
 
-  // Advisory only: uncommitted src cannot be compared against a commit date, so it neither
-  // confirms nor refutes. Said out loud rather than silently folded into the pass.
+  // Advisory. Now that the bundle is compared against file mtimes, uncommitted edits ARE covered by
+  // the comparison — but they are still worth naming, because a bundle built from uncommitted source
+  // is current on this box and unreproducible anywhere else.
   if (dirtySrcFiles > 0) {
     lines.push(
-      `NOTE: ${dirtySrcFiles} uncommitted file(s) under src/. Those changes are in NO bundle, and ` +
-        `the comparison below covers committed src only.`,
+      `NOTE: ${dirtySrcFiles} uncommitted file(s) under src/. The comparison below DOES cover them ` +
+        `(it uses file mtimes), but a bundle built from uncommitted source cannot be rebuilt from ` +
+        `git alone.`,
     );
   }
 
   if (findings.length === 0) {
     lines.push(
-      'VERDICT: CURRENT — the running daemon loaded a bundle built from the current committed src.',
+      'VERDICT: CURRENT — the running daemon loaded a bundle built after the newest src/ edit.',
       'This does NOT prove any given code path executes. Loaded is not exercised.',
     );
     return { code: 0, lines };
@@ -79,13 +104,13 @@ function selfTest() {
   const t = (iso) => new Date(iso);
   const cases = [
     // name, input, expected code, expected substring
-    ['clean chain', { lastSrcCommit: t('2026-07-30T01:00:00Z'), bundleMtime: t('2026-07-30T02:00:00Z'), daemonUpSince: t('2026-07-30T03:00:00Z'), dirtySrcFiles: 0 }, 0, 'CURRENT'],
-    ['boundary: all equal', { lastSrcCommit: t('2026-07-30T02:00:00Z'), bundleMtime: t('2026-07-30T02:00:00Z'), daemonUpSince: t('2026-07-30T02:00:00Z'), dirtySrcFiles: 0 }, 0, 'CURRENT'],
-    ['bundle older than src', { lastSrcCommit: t('2026-07-30T04:00:00Z'), bundleMtime: t('2026-07-30T02:00:00Z'), daemonUpSince: t('2026-07-30T05:00:00Z'), dirtySrcFiles: 0 }, 2, 'STALE-BUNDLE'],
-    ['daemon older than bundle', { lastSrcCommit: t('2026-07-30T01:00:00Z'), bundleMtime: t('2026-07-30T04:00:00Z'), daemonUpSince: t('2026-07-30T02:00:00Z'), dirtySrcFiles: 0 }, 2, 'STALE-DAEMON'],
+    ['clean chain', { newestSrcMtime: t('2026-07-30T01:00:00Z'), bundleMtime: t('2026-07-30T02:00:00Z'), daemonUpSince: t('2026-07-30T03:00:00Z'), dirtySrcFiles: 0 }, 0, 'CURRENT'],
+    ['boundary: all equal', { newestSrcMtime: t('2026-07-30T02:00:00Z'), bundleMtime: t('2026-07-30T02:00:00Z'), daemonUpSince: t('2026-07-30T02:00:00Z'), dirtySrcFiles: 0 }, 0, 'CURRENT'],
+    ['bundle older than src', { newestSrcMtime: t('2026-07-30T04:00:00Z'), bundleMtime: t('2026-07-30T02:00:00Z'), daemonUpSince: t('2026-07-30T05:00:00Z'), dirtySrcFiles: 0 }, 2, 'STALE-BUNDLE'],
+    ['daemon older than bundle', { newestSrcMtime: t('2026-07-30T01:00:00Z'), bundleMtime: t('2026-07-30T04:00:00Z'), daemonUpSince: t('2026-07-30T02:00:00Z'), dirtySrcFiles: 0 }, 2, 'STALE-DAEMON'],
     // The real 2026-07-30 case: bundle 12:13:45Z, commit 13:51:40Z, daemon 13:56:03Z.
-    ['the case that motivated this', { lastSrcCommit: t('2026-07-30T13:51:40Z'), bundleMtime: t('2026-07-30T12:13:45Z'), daemonUpSince: t('2026-07-30T13:56:03Z'), dirtySrcFiles: 0 }, 2, 'STALE-BUNDLE'],
-    ['dirty src still passes but says so', { lastSrcCommit: t('2026-07-30T01:00:00Z'), bundleMtime: t('2026-07-30T02:00:00Z'), daemonUpSince: t('2026-07-30T03:00:00Z'), dirtySrcFiles: 3 }, 0, 'uncommitted'],
+    ['the case that motivated this', { newestSrcMtime: t('2026-07-30T13:51:40Z'), bundleMtime: t('2026-07-30T12:13:45Z'), daemonUpSince: t('2026-07-30T13:56:03Z'), dirtySrcFiles: 0 }, 2, 'STALE-BUNDLE'],
+    ['dirty src still passes but says so', { newestSrcMtime: t('2026-07-30T01:00:00Z'), bundleMtime: t('2026-07-30T02:00:00Z'), daemonUpSince: t('2026-07-30T03:00:00Z'), dirtySrcFiles: 3 }, 0, 'uncommitted'],
   ];
 
   let failed = 0;
@@ -123,27 +148,47 @@ const proc = jlist.find((p) => p.name?.includes('cortextos-daemon'));
 if (!proc) fail('cortextos daemon is not running under pm2');
 if (!existsSync(BUNDLE)) fail(`no bundle at ${BUNDLE}`);
 
-let lastSrcCommitIso, dirtySrcFiles;
+let dirtySrcFiles;
 try {
-  lastSrcCommitIso = execSync('git log -1 --format=%cI -- src/', {
-    cwd: REPO, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
-  }).trim();
   dirtySrcFiles = execSync('git status --porcelain -- src/', {
     cwd: REPO, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
   }).split('\n').filter((l) => l.trim()).length;
 } catch (err) {
   fail(`could not read git state: ${err.message}`);
 }
-if (!lastSrcCommitIso) fail('git returned no commit touching src/ — wrong repo path?');
+
+/**
+ * Newest mtime under src/. Deliberately a FILE mtime, so it is the same clock and the same
+ * resolution as the bundle mtime it gets compared against — see the note on the STALE-BUNDLE leg.
+ */
+function newestSrcMtimeMs(dir) {
+  let newest = 0;
+  for (const e of readdirSync(dir, { withFileTypes: true })) {
+    const full = `${dir}/${e.name}`;
+    if (e.isDirectory()) newest = Math.max(newest, newestSrcMtimeMs(full));
+    else if (e.name.endsWith('.ts')) newest = Math.max(newest, statSync(full).mtimeMs);
+  }
+  return newest;
+}
+
+let newestMs;
+try {
+  newestMs = newestSrcMtimeMs(`${REPO}/src`);
+} catch (err) {
+  fail(`could not walk src/: ${err.message}`);
+}
+// A zero here would make EVERY bundle look current — failure in the reassuring direction, which is
+// the one this whole check exists to refuse. Could-not-run rather than a silent pass.
+if (!newestMs) fail('found no .ts files under src/ — wrong repo path?');
 
 const input = {
-  lastSrcCommit: new Date(lastSrcCommitIso),
+  newestSrcMtime: new Date(newestMs),
   bundleMtime: statSync(BUNDLE).mtime,
   daemonUpSince: new Date(proc.pm2_env.pm_uptime),
   dirtySrcFiles,
 };
 
-console.log(`A last src/ commit  ${input.lastSrcCommit.toISOString()}`);
+console.log(`A newest src/ edit  ${input.newestSrcMtime.toISOString()}`);
 console.log(`B dist bundle built ${input.bundleMtime.toISOString()}`);
 console.log(`C daemon up_since   ${input.daemonUpSince.toISOString()} (pid ${proc.pid}, restarts ${proc.pm2_env.restart_time})`);
 

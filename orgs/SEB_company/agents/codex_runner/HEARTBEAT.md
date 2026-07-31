@@ -8,6 +8,8 @@ If local time is 00:00-08:00 America/New_York, use a silent heartbeat: touch fil
 
 Cap discipline: check Codex CLI weekly cap usage; surface to seb_boss via bus at 70% / 85% / 95% thresholds; halt new dispatches at 95%.
 
+The local cap gauge is passive session telemetry and is expected to become stale while this agent is parked. Do not refresh it on a schedule. When a new dispatch is being considered after a stale reading, make one minimal real Codex API probe first, then re-parse. It authorizes a decision only when `codex_rate_limits_captured_at` is newer than the pre-probe value **and** `rate_limits` is present. Any other result is `UNKNOWN`: do not start the dispatch, do not retry, and escalate to seb_boss. This deliberate, metered probe is a cold-start workaround, not a repair; replace it if an authenticated on-demand Codex usage source becomes available.
+
 Runs every 4h. Execute ALL steps in order — skipping = broken system, dashboard tracks compliance.
 
 ## Step 0: Tier 3 context gate (NEW 2026-05-25)
