@@ -67,10 +67,36 @@ function git(root, args) {
   return execFileSync('git', args, { cwd: root, encoding: 'utf-8' }).trim();
 }
 
-/** HEAD hash and whether src/ has uncommitted changes, right now. */
+/**
+ * The src TREE hash at a commit. THIS IS THE COMPARAND, and `head` is not.
+ *
+ * THE THIRD PROXY, fixed 2026-08-01 within twenty minutes of the second. This leg has now used
+ * three stand-ins for one content question:
+ *   commit date   fired by 278ms      (commit resolution vs mtime resolution)
+ *   src mtime     fired on a revert   (checkout restored identical content, bumped mtime)
+ *   HEAD hash     fires on ANY commit that does not touch src/ — including f5f6c1a6, the commit
+ *                 that fixed the other two. Measured: 452c0c19:src and f5f6c1a6:src are both
+ *                 061239e3, and the guard reported STALE-BUNDLE against a correct bundle.
+ *
+ * The stamp was built on the argument that only the artifact recording its own provenance answers
+ * a content question. It then recorded a commit id, which is a REFERENCE to content and not the
+ * content. `rev-parse <commit>:src` is the fact itself: it changes exactly when src/ changes and
+ * is unmoved by every commit that cannot have affected the answer.
+ *
+ * IT IS BLIND TO THE WORKING TREE BY CONSTRUCTION — it reads the commit object. That is why
+ * stamp.dirtySrc and current.dirtySrc stay SEPARATE signals and must not be folded into it: the
+ * tree hash answers "which committed source", the dirty flags answer "is anything uncommitted".
+ * Merging them would trade this over-fire for an under-fire, which is the worse direction.
+ */
+export function srcTreeAt(root, commit) {
+  return git(root, ['rev-parse', `${commit}:src`]);
+}
+
+/** Committed src tree, HEAD hash, and whether src/ has uncommitted changes, right now. */
 export function currentProvenance(root) {
   return {
     head: git(root, ['rev-parse', 'HEAD']),
+    srcTree: srcTreeAt(root, 'HEAD'),
     // ONLY src/. dist/ is expected to differ, and a dirty README has no bearing on whether the
     // bundle matches its source. Scoping this is what keeps the check from crying wolf daily.
     dirtySrc: git(root, ['status', '--porcelain', '--', 'src']).length > 0,
@@ -79,9 +105,32 @@ export function currentProvenance(root) {
 
 export function writeStamp(root, nowIso) {
   const p = currentProvenance(root);
-  const stamp = { head: p.head, dirtySrc: p.dirtySrc, builtAt: nowIso };
+  const stamp = { head: p.head, srcTree: p.srcTree, dirtySrc: p.dirtySrc, builtAt: nowIso };
   writeFileSync(join(root, STAMP), JSON.stringify(stamp, null, 2) + '\n', 'utf-8');
   return stamp;
+}
+
+/**
+ * Read the stamp and normalise it, so both call sites branch on the same shape.
+ *
+ * BACK-COMPAT IS NOT COURTESY HERE, IT IS THE POINT. The stamp already on disk was written before
+ * srcTree existed, and treating a missing field as unverifiable would manufacture exactly the
+ * false finding this change removes. It carries `head`, and the tree of that commit is derivable —
+ * so an old stamp stays FULLY verifiable and the swap costs no rebuild and no restart.
+ *
+ * If the recorded commit is gone (rebase, gc), the tree is genuinely underivable. That is
+ * UNVERIFIABLE, a finding about the bundle, and NOT could-not-run: the tool worked fine.
+ */
+export function readStamp(root) {
+  const path = join(root, STAMP);
+  if (!existsSync(path)) return null;
+  const stamp = JSON.parse(readFileSync(path, 'utf-8'));
+  if (stamp.srcTree) return stamp;
+  try {
+    return { ...stamp, srcTree: srcTreeAt(root, stamp.head), srcTreeDerived: true };
+  } catch {
+    return { ...stamp, srcTree: null, srcTreeDerived: true };
+  }
 }
 
 /** Max gap between a bundle's mtime and its stamp before the stamp is not believable as a postbuild step. */
@@ -114,16 +163,28 @@ export function verdict({ stamp, current, bundleMtime }) {
     return { code: 2, status: 'UNVERIFIABLE',
       detail: `bundle was built from a DIRTY src/ at ${stamp.builtAt}. The exact source is not recoverable from any commit, so currency cannot be established — rebuild from a clean tree to get a checkable answer.` };
   }
-  if (stamp.head !== current.head) {
+  // The commit that recorded this stamp is no longer reachable, so its src tree cannot be
+  // recovered. A finding about the bundle, not a broken tool.
+  if (!stamp.srcTree) {
+    return { code: 2, status: 'UNVERIFIABLE',
+      detail: `stamp names commit ${String(stamp.head).slice(0, 8)}, which is no longer in this repository, so the source it was built from cannot be recovered. Rebuild.` };
+  }
+  // COMPARES THE src TREE, NOT HEAD. A commit touching only docs, scripts or agent files leaves
+  // this identical and correctly reads CURRENT. See srcTreeAt for the three-proxy history.
+  if (stamp.srcTree !== current.srcTree) {
     return { code: 2, status: 'STALE',
-      detail: `bundle built from ${stamp.head.slice(0, 8)}, HEAD is now ${current.head.slice(0, 8)}. Rebuild.` };
+      detail: `bundle built from src tree ${stamp.srcTree.slice(0, 8)} (commit ${String(stamp.head).slice(0, 8)}), HEAD's src tree is now ${current.srcTree.slice(0, 8)}. Rebuild.` };
   }
   if (current.dirtySrc) {
     return { code: 2, status: 'STALE',
-      detail: `bundle matches HEAD (${stamp.head.slice(0, 8)}) but src/ has uncommitted changes that are not in it. Rebuild.` };
+      detail: `bundle matches HEAD's src tree (${stamp.srcTree.slice(0, 8)}) but src/ has uncommitted changes that are not in it. Rebuild.` };
   }
+  // SAYS TREE, NOT COMMIT. It read "at the same commit" for one commit after the comparand swap,
+  // which was false the moment it mattered most: HEAD was f5f6c1a6 and the stamp named 452c0c19,
+  // a DIFFERENT commit with the same src tree — precisely the case this leg now passes. A pass
+  // whose wording describes the old predicate is how the next reader re-derives the old bug.
   return { code: 0, status: 'CURRENT',
-    detail: `bundle built from ${stamp.head.slice(0, 8)}, working tree clean and at the same commit.` };
+    detail: `bundle built from src tree ${stamp.srcTree.slice(0, 8)} (commit ${String(stamp.head).slice(0, 8)}), which is HEAD's src tree, and the working tree is clean.` };
 }
 
 // --- CLI, ONLY WHEN THIS FILE IS THE ENTRY POINT ----------------------------
@@ -140,19 +201,32 @@ const IS_ENTRY = process.argv[1] && resolve(process.argv[1]) === fileURLToPath(i
 // --- self-test -------------------------------------------------------------
 if (IS_ENTRY && process.argv[2] === '--self-test') {
   const H = 'a'.repeat(40), H2 = 'b'.repeat(40);
+  const T = '1'.repeat(40), T2 = '2'.repeat(40);   // src TREE hashes — the comparand
   const cases = [
-    ['clean match',        { stamp: { head: H, dirtySrc: false, builtAt: 't' }, current: { head: H, dirtySrc: false } }, 0, 'CURRENT'],
-    ['HEAD moved on',      { stamp: { head: H, dirtySrc: false, builtAt: 't' }, current: { head: H2, dirtySrc: false } }, 2, 'STALE'],
-    ['uncommitted now',    { stamp: { head: H, dirtySrc: false, builtAt: 't' }, current: { head: H, dirtySrc: true } },  2, 'STALE'],
-    ['built from dirty',   { stamp: { head: H, dirtySrc: true,  builtAt: 't' }, current: { head: H, dirtySrc: false } }, 2, 'UNVERIFIABLE'],
-    ['no stamp',           { stamp: null, current: { head: H, dirtySrc: false } },                                       2, 'UNVERIFIABLE'],
+    ['clean match',        { stamp: { head: H, srcTree: T, dirtySrc: false, builtAt: 't' }, current: { head: H, srcTree: T, dirtySrc: false } }, 0, 'CURRENT'],
+    // THE CASE THE WHOLE CHANGE EXISTS FOR, and it is a CLEAN one. A commit that touches only
+    // docs/scripts/agent files moves HEAD and leaves src/ untouched, so the bundle is still
+    // correct. Measured live on 2026-08-01: 452c0c19:src == f5f6c1a6:src == 061239e3, and the
+    // HEAD-comparing version called that STALE-BUNDLE. Revert the comparand to head and this
+    // goes red — which is the point of asserting it rather than describing it in a comment.
+    ['commit moved, src tree unchanged',
+                           { stamp: { head: H, srcTree: T, dirtySrc: false, builtAt: 't' }, current: { head: H2, srcTree: T, dirtySrc: false } }, 0, 'CURRENT'],
+    ['src tree changed',   { stamp: { head: H, srcTree: T, dirtySrc: false, builtAt: 't' }, current: { head: H2, srcTree: T2, dirtySrc: false } }, 2, 'STALE'],
+    // CONTROL FOR THE ABOVE PAIR: src can change WITHOUT a new commit. The tree hash is blind to
+    // the worktree by construction, so this is caught by current.dirtySrc and nothing else. If
+    // anyone ever folds dirtySrc into the tree comparison, this case is what goes red.
+    ['uncommitted now',    { stamp: { head: H, srcTree: T, dirtySrc: false, builtAt: 't' }, current: { head: H, srcTree: T, dirtySrc: true } },  2, 'STALE'],
+    ['built from dirty',   { stamp: { head: H, srcTree: T, dirtySrc: true,  builtAt: 't' }, current: { head: H, srcTree: T, dirtySrc: false } }, 2, 'UNVERIFIABLE'],
+    ['no stamp',           { stamp: null, current: { head: H, srcTree: T, dirtySrc: false } },                                                    2, 'UNVERIFIABLE'],
+    // readStamp could not derive a tree because the recorded commit is gone (rebase, gc).
+    ['stamp commit gone',  { stamp: { head: H, srcTree: null, dirtySrc: false, builtAt: 't', srcTreeDerived: true }, current: { head: H2, srcTree: T, dirtySrc: false } }, 2, 'UNVERIFIABLE'],
     // The hand-written-stamp footgun: stamp two hours newer than the bundle it claims to describe.
-    ['stamp after build',  { stamp: { head: H, dirtySrc: false, builtAt: '2026-07-31T09:00:00Z' },
-                             current: { head: H, dirtySrc: false }, bundleMtime: new Date('2026-07-31T07:00:00Z') }, 2, 'UNVERIFIABLE'],
+    ['stamp after build',  { stamp: { head: H, srcTree: T, dirtySrc: false, builtAt: '2026-07-31T09:00:00Z' },
+                             current: { head: H, srcTree: T, dirtySrc: false }, bundleMtime: new Date('2026-07-31T07:00:00Z') }, 2, 'UNVERIFIABLE'],
     // CONTROL: a stamp written BY the build sits within seconds of it and must stay CURRENT — a
     // lag check that rejects every stamp is as useless as one that rejects none.
-    ['stamp from build',   { stamp: { head: H, dirtySrc: false, builtAt: '2026-07-31T07:00:03Z' },
-                             current: { head: H, dirtySrc: false }, bundleMtime: new Date('2026-07-31T07:00:00Z') }, 0, 'CURRENT'],
+    ['stamp from build',   { stamp: { head: H, srcTree: T, dirtySrc: false, builtAt: '2026-07-31T07:00:03Z' },
+                             current: { head: H, srcTree: T, dirtySrc: false }, bundleMtime: new Date('2026-07-31T07:00:00Z') }, 0, 'CURRENT'],
   ];
   let pass = 0;
   for (const [name, input, wantCode, wantStatus] of cases) {
@@ -183,8 +257,7 @@ if (mode === '--write') {
   process.exit(0);
 }
 if (mode === '--check') {
-  const path = join(root, STAMP);
-  const stamp = existsSync(path) ? JSON.parse(readFileSync(path, 'utf-8')) : null;
+  const stamp = readStamp(root);
   const bundle = join(root, 'dist/daemon.js');
   const bundleMtime = existsSync(bundle) ? statSync(bundle).mtime : null;
   const v = verdict({ stamp, current: currentProvenance(root), bundleMtime });

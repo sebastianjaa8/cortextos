@@ -47,7 +47,7 @@ import { statSync, existsSync, readFileSync } from 'node:fs';
 // orgs/ files, because .gitignore does not apply to paths already added. The reason is the other
 // direction: build-stamp.mjs genuinely was untracked, and `tsup.config.ts` is a framework file that
 // must not reach into one user's org data for a build step. See scripts/build-stamp.mjs.
-import { verdict as stampVerdict, currentProvenance } from '../../../../../scripts/build-stamp.mjs';
+import { verdict as stampVerdict, currentProvenance, readStamp } from '../../../../../scripts/build-stamp.mjs';
 
 const REPO = 'C:/Users/Sebas/cortextos';
 const BUNDLE = `${REPO}/dist/daemon.js`;
@@ -100,7 +100,10 @@ export function verdict({ stamp, bundleMtime, daemonUpSince, dirtySrcFiles }) {
 
   if (findings.length === 0) {
     lines.push(
-      'VERDICT: CURRENT — the running daemon loaded a bundle whose stamp matches HEAD.',
+      // "matches HEAD's src tree", not "matches HEAD". Same correction as build-stamp's CURRENT
+      // detail: after the comparand swap the stamp routinely names a DIFFERENT commit, and a pass
+      // line describing the superseded predicate is how the old bug gets re-derived.
+      "VERDICT: CURRENT — the running daemon loaded a bundle built from HEAD's src tree.",
       'This does NOT prove any given code path executes. Loaded is not exercised.',
     );
     return { code: 0, lines };
@@ -175,9 +178,12 @@ try {
 // The src/ mtime walk that used to live here is gone with the leg it fed.
 let stamp;
 try {
-  const stampPath = `${REPO}/dist/.build-stamp`;
+  // readStamp, NOT a second hand-rolled read of the same file. This file used to parse the stamp
+  // itself, which meant the srcTree back-compat normalisation existed in one call site and not the
+  // other — the same one-fact-two-implementations shape as the exit-code seam fixed in f5f6c1a6,
+  // and it would have been introduced by the commit that fixed it.
   stamp = stampVerdict({
-    stamp: existsSync(stampPath) ? JSON.parse(readFileSync(stampPath, 'utf-8')) : null,
+    stamp: readStamp(REPO),
     current: currentProvenance(REPO),
     // NOT a ternary. The `if (!existsSync(BUNDLE)) fail(...)` above already exited if it were
     // missing, so the guard here was dead and the file read as if the same expression needed
