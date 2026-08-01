@@ -74,7 +74,44 @@ describe('Sprint 5: Observability & Metrics', () => {
       expect(report.agents.bot1.tasks_completed).toBe(1);
       expect(report.agents.bot1.tasks_pending).toBe(1);
       expect(report.agents.bot1.tasks_in_progress).toBe(1);
-      expect(report.system.total_tasks_completed).toBe(1);
+      // 2, NOT 1. task4 is completed and assigned to 'other', who is not on the roster.
+      // This assertion previously read toBe(1) and was ENCODING THE DEFECT: total_tasks_completed
+      // is a LIFETIME total and must count completed work regardless of who did it or whether
+      // they are still enabled. The per-agent figure above stays roster-scoped, which is the
+      // distinction the old single assertion could not express.
+      expect(report.system.total_tasks_completed).toBe(2);
+    });
+
+    it('lifetime total_tasks_completed does NOT shrink when an agent retires', () => {
+      // da70966d correctly filtered the HEALTH DENOMINATOR to enabled agents. The same filter
+      // reached the cumulative total, so retiring an agent silently deleted its completed work
+      // from a monotonically increasing figure. Measured on the live store 2026-08-01:
+      // 683 on disk, 648 reported, 35 dropped.
+      writeFileSync(
+        join(ctxRoot, 'config', 'enabled-agents.json'),
+        JSON.stringify({ live_bot: { enabled: true }, retired_bot: { enabled: false } }),
+        'utf-8',
+      );
+      mkdirSync(join(ctxRoot, 'state', 'live_bot'), { recursive: true });
+      writeFileSync(join(ctxRoot, 'tasks', 'l1.json'), JSON.stringify({ assigned_to: 'live_bot', status: 'completed' }), 'utf-8');
+      writeFileSync(join(ctxRoot, 'tasks', 'r1.json'), JSON.stringify({ assigned_to: 'retired_bot', status: 'completed' }), 'utf-8');
+      writeFileSync(join(ctxRoot, 'tasks', 'h1.json'), JSON.stringify({ assigned_to: 'human', status: 'completed' }), 'utf-8');
+      writeFileSync(join(ctxRoot, 'tasks', 'p1.json'), JSON.stringify({ assigned_to: 'live_bot', status: 'pending' }), 'utf-8');
+
+      const report = collectMetrics(ctxRoot);
+
+      // The whole point: retired and non-roster completions are still counted.
+      expect(report.system.total_tasks_completed).toBe(3);
+
+      // CONTROL 1 — the roster scoping that da70966d added must SURVIVE. If this regresses, the
+      // fix above was applied by deleting the enabled-filter entirely, which reintroduces the
+      // permanent sub-100% health ceiling that commit existed to remove.
+      expect(report.agents).not.toHaveProperty('retired_bot');
+      expect(report.agents.live_bot.tasks_completed).toBe(1);
+
+      // CONTROL 2 — a lifetime counter that simply counts every task file would also satisfy the
+      // assertion above. Pending work must NOT be counted as completed.
+      expect(report.system.total_tasks_completed).not.toBe(4);
     });
 
     it('detects healthy heartbeats', () => {
