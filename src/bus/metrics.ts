@@ -132,7 +132,19 @@ export function collectMetrics(ctxRoot: string, org?: string): MetricsReport {
   }
 
   const agents: Record<string, AgentMetrics> = {};
-  let totalCompleted = 0;
+  // NOTE: there is deliberately no roster-scoped GRAND total any more. It existed only to feed
+  // total_tasks_completed, and leaving it as a live-but-unread accumulator is how a dead field
+  // later gets picked up by someone who assumes it means something. The roster-scoped figure is
+  // still derivable by summing agents[*].tasks_completed, which is where it belongs.
+  // NOT ROSTER-SCOPED, and that is the point. A LIFETIME total must not shrink when an agent
+  // retires -- those tasks really happened. da70966d added the enabled-roster filter for the
+  // HEALTH DENOMINATOR, which is right (a permanent sub-100% ceiling teaches readers that
+  // shortfall is normal), and the same filter reached this cumulative total, which is wrong.
+  // Measured 2026-08-01: 683 completed on disk, 648 reported, 35 silently dropped (builder_2 11,
+  // builder_opus 23, human 1). A monotonically increasing quantity that goes DOWN -- which is
+  // how it was noticed at all, the most recent count being the lowest.
+  // ONE FILTER APPLIED TO TWO FIELDS, AIMED AT ONLY ONE.
+  let totalCompletedAllTime = 0;
   let agentsHealthy = 0;
   const agentsTotal = agentNames.length;
 
@@ -151,6 +163,27 @@ export function collectMetrics(ctxRoot: string, org?: string): MetricsReport {
         }
       }
     } catch { /* ignore */ }
+  }
+
+  // Lifetime pass: EVERY completed task on disk, regardless of who it was assigned to or whether
+  // that agent is still on the roster. Counts unassigned and [HUMAN] tasks too -- the question this
+  // field's NAME asks is "how much work has been completed", not "by currently-enabled agents".
+  const seenTaskFiles = new Set<string>();
+  for (const taskDir of taskDirs) {
+    try {
+      for (const file of readdirSync(taskDir)) {
+        if (!file.endsWith('.json')) continue;
+        // taskDirs can overlap (org dir plus a scanned path); dedupe by filename so a task
+        // reachable twice is not counted twice. The roster loop below is immune to this by
+        // accident -- it matches assigned_to -- so the bug would only appear here.
+        if (seenTaskFiles.has(file)) continue;
+        seenTaskFiles.add(file);
+        try {
+          const task = JSON.parse(readFileSync(join(taskDir, file), 'utf-8'));
+          if (task.status === 'completed') totalCompletedAllTime++;
+        } catch { /* skip bad files */ }
+      }
+    } catch { /* skip bad dirs */ }
   }
 
   for (const agent of agentNames) {
@@ -173,7 +206,6 @@ export function collectMetrics(ctxRoot: string, org?: string): MetricsReport {
         }
       } catch { /* skip bad dirs */ }
     }
-    totalCompleted += completed;
 
     // Count errors today from event logs.
     // Both category AND severity must match — early agents emitted
@@ -250,7 +282,7 @@ export function collectMetrics(ctxRoot: string, org?: string): MetricsReport {
     timestamp,
     agents,
     system: {
-      total_tasks_completed: totalCompleted,
+      total_tasks_completed: totalCompletedAllTime,
       agents_healthy: agentsHealthy,
       agents_total: agentsTotal,
       approvals_pending: approvalsPending,
