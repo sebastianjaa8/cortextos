@@ -280,6 +280,21 @@ export function isPm2ShutdownMessage(message: unknown): boolean {
   return message === 'shutdown';
 }
 
+export function pm2SupervisorOwnsCurrentProcess(
+  env: NodeJS.ProcessEnv = process.env,
+  pid: number = process.pid,
+): boolean | undefined {
+  const pidPath = env.pm_pid_path;
+  if (!pidPath) return undefined;
+  try {
+    const rawPid = readFileSync(pidPath, 'utf-8').trim();
+    if (!/^[1-9]\d*$/.test(rawPid)) return false;
+    return Number(rawPid) === pid;
+  } catch {
+    return false;
+  }
+}
+
 class Daemon {
   private agentManager: AgentManager | null = null;
   private ipcServer: IPCServer | null = null;
@@ -316,20 +331,34 @@ class Daemon {
       throw new Error(`Another cortextOS daemon is already running for instance "${this.instanceId}"`);
     }
     this.lockHeld = true;
-    let lockLossHandled = false;
+    let fenceFailureHandled = false;
     this.lockHeartbeat = setInterval(() => {
       const result = touchLock(join(this.ctxRoot, '.daemon-instance'));
-      if (result.status === 'ok') return;
       if (result.status === 'busy') {
         console.warn('[daemon] Lock heartbeat deferred because the lock guard is busy');
+      } else if (result.status !== 'ok') {
+        if (fenceFailureHandled) return;
+        fenceFailureHandled = true;
+        this.lockHeld = false;
+        handleFatal(
+          'uncaughtException',
+          new Error(`Daemon instance-lock ownership lost (${result.status}); terminating to prevent split-brain`),
+          this.ctxRoot,
+          frameworkRoot,
+          true,
+        );
         return;
       }
-      if (lockLossHandled) return;
-      lockLossHandled = true;
-      this.lockHeld = false;
+
+      if (pm2SupervisorOwnsCurrentProcess() !== false) return;
+      if (fenceFailureHandled) return;
+      fenceFailureHandled = true;
       handleFatal(
         'uncaughtException',
-        new Error(`Daemon instance-lock ownership lost (${result.status}); terminating to prevent split-brain`),
+        new Error(
+          `PM2 supervisor ownership lost: ${process.env.pm_pid_path} no longer names daemon pid ${process.pid}; ` +
+          'terminating orphaned generation',
+        ),
         this.ctxRoot,
         frameworkRoot,
         true,
@@ -476,6 +505,22 @@ class Daemon {
   }
 }
 
+// Exit code PM2 is configured to treat as terminal (`stop_exit_codes` in
+// ecosystem.config.js). A duplicate-daemon lock conflict is NOT a crash worth
+// retrying: another daemon holds the lock and is heartbeating it, so every
+// respawn dies the same way. min_uptime/max_restarts do not catch this —
+// startup lives well past min_uptime before reaching the lock check, so PM2
+// never marks the restarts unstable and the circuit breaker never trips
+// (measured 2026-08-01: 20 restarts in 15 min, ~45s apart, unstable_restarts=0,
+// cumulative counter at 1168). A genuinely dead holder is already handled
+// upstream: acquireLock takes a lock idle past DAEMON_LOCK_STALE_MS, so
+// reaching this path means the holder is alive.
+export const DAEMON_EXIT_LOCK_CONFLICT = 2;
+
+export function daemonFatalExitCode(errMessage: string): number {
+  return /already running/i.test(errMessage) ? DAEMON_EXIT_LOCK_CONFLICT : 1;
+}
+
 // Only auto-start when run directly (e.g. `node dist/daemon.js` or via PM2).
 // Guarding with require.main prevents accidental daemon spawn when the module
 // is require()'d for testing or class imports — which would start a full daemon
@@ -485,6 +530,7 @@ if (require.main === module) {
   const daemon = new Daemon();
   daemon.start().catch(err => {
     console.error('[daemon] Fatal error:', err);
+    const exitCode = daemonFatalExitCode(err instanceof Error ? err.message : String(err));
 
     // Startup failures must feed the same crash-history + operator-alert
     // machinery as runtime crashes. Before this, a duplicate-daemon lock
@@ -502,7 +548,7 @@ if (require.main === module) {
       const ctxRoot = join(homedir(), '.cortextos', instanceId);
       const frameworkRoot = process.env.CTX_FRAMEWORK_ROOT || '';
       const errStr = err instanceof Error ? err.message : String(err);
-      const isLockConflict = /already running/i.test(errStr);
+      const isLockConflict = exitCode === DAEMON_EXIT_LOCK_CONFLICT;
       const history = recordCrash(ctxRoot, errStr);
       if (shouldSendCrashLoopAlert(history)) {
         const recent = countRecentCrashes(history);
@@ -519,7 +565,7 @@ if (require.main === module) {
       }
     } catch { /* alerting is best-effort — never mask the original failure */ }
 
-    process.exit(1);
+    process.exit(exitCode);
   });
 }
 

@@ -62,6 +62,17 @@ module.exports = {
       // max_restarts remains the crash-storm circuit breaker; backoff reduces
       // churn while still recovering quickly from a one-off crash.
       exp_backoff_restart_delay: 5000,
+      // Exit code 2 = duplicate-daemon lock conflict (DAEMON_EXIT_LOCK_CONFLICT
+      // in src/daemon/index.ts). PM2 stops instead of respawning. The backoff
+      // and max_restarts above do NOT contain this case: startup reaches the
+      // lock check well after min_uptime, so PM2 counts every attempt as a
+      // stable run and unstable_restarts stays 0 forever. Measured 2026-08-01:
+      // 20 restarts in 15 min, ~45s apart, breaker never tripped, cumulative
+      // counter 1168. Retrying is also pointless — a live daemon holds the
+      // lock and keeps heartbeating it (a dead holder's lock goes stale after
+      // DAEMON_LOCK_STALE_MS and is taken normally). The operator Telegram
+      // alert fires from the same path with the recovery steps.
+      stop_exit_codes: [2],
       // PM2's supported Windows graceful-stop path. SIGINT-based restarts can
       // detach a still-live daemon from PM2 and spawn a competing generation.
       shutdown_with_message: true,
