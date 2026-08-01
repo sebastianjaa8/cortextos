@@ -29,9 +29,10 @@
 // "the step found nothing" and "the wrapper is broken" must not share a code.
 
 import { execFileSync } from 'node:child_process';
-import { existsSync, appendFileSync, mkdirSync, statSync } from 'node:fs';
+import { existsSync, appendFileSync, mkdirSync, statSync, readFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createHash } from 'node:crypto';
 
 /**
  * Pull the embedding-token count out of a kb-ingest run.
@@ -52,10 +53,46 @@ export function parseEmbeddingTokens(stdout) {
 }
 
 /**
+ * A fingerprint of the inputs as they are RIGHT NOW: path and content hash for each.
+ *
+ * A CONTENT HASH, NOT mtime+size. I proposed mtime+size (two stats, cheaper); seb_boss overrode it
+ * and was right, for a reason that outlives the performance argument: A HASH IN THE RECEIPT IS
+ * RE-CHECKABLE BY ANYONE LATER. An mtime+size pair recorded in a receipt cannot be verified after
+ * the fact — the file has moved on and nothing can reconstruct what it was. A receipt whose claim
+ * cannot be re-tested is a chronicle, not evidence.
+ *
+ * And mtime is a DISCREDITED SIGNAL ON THIS BOX, twice in writing on 2026-08-01: a `git checkout`
+ * revert bumped src mtime without changing content (the false positive the build-stamp exists to
+ * fix), and OneDrive touches mtimes on files no cron wrote. Reading 350KB is trivial and bounded by
+ * the same files we were already about to embed.
+ */
+export function fingerprint(paths) {
+  return paths.map((p) => {
+    try {
+      return { path: p, sha256: createHash('sha256').update(readFileSync(p)).digest('hex') };
+    } catch {
+      return { path: p, sha256: null };
+    }
+  });
+}
+
+/**
+ * Is this run a no-op? Only when the last receipt SUCCEEDED and its fingerprint is identical.
+ *
+ * GATED ON THE PRIOR STATUS, not just on the fingerprint. If the last run failed, the inputs being
+ * unchanged is exactly the situation in which we must try AGAIN — skipping there would make a
+ * failure permanent and silent, which is the whole family this file exists to prevent.
+ */
+export function isUnchanged(prev, now) {
+  if (!prev || !["INGESTED", "UNCHANGED"].includes(prev.status)) return false;
+  return JSON.stringify(prev.fingerprint) === JSON.stringify(now);
+}
+
+/**
  * Pure verdict logic so --self-test can drive it without touching the CLI.
  * @returns {{code:0|2|3, status:string, detail:string}}
  */
-export function verdict({ missingPaths, tokens, ingestFailed, skippedOptional = [] }) {
+export function verdict({ missingPaths, tokens, ingestFailed, skippedOptional = [], unchanged = false }) {
   // AN ABSENT OPTIONAL PATH IS NOT A FINDING, AND IT IS NOT SILENT EITHER.
   // seb_boss caught this before it did damage: `./memory/<today>.md` does not
   // exist until something writes memory that day, so treating every path as
@@ -79,6 +116,20 @@ export function verdict({ missingPaths, tokens, ingestFailed, skippedOptional = 
     return { code: 2, status: 'PATH-MISSING',
       detail: `${missingPaths.length} input path(s) do not exist: ${missingPaths.join(', ')}. ` +
         `kb-ingest EXITS 0 on a missing path and reports 0 chunks, so this would otherwise read as a clean run.` };
+  }
+  // UNCHANGED IS A SUCCESS AND IT IS NOT SILENCE. Found by analyst 2026-08-01: this wrapper
+  // hardcoded --force, so every fire fully re-embedded files that had not changed — ~96k tokens
+  // and 199s per cycle for builder_1 alone, 12 cycles a day.
+  //
+  // THE OBVIOUS FIX WOULD HAVE BROKEN THE DETECTOR, measured rather than assumed: without --force,
+  // kb-ingest prints "Ingested 0 new chunk(s) / Tokens: 0" for an already-indexed file, which this
+  // wrapper correctly classifies as ZERO-TOKENS, a finding. Dropping the flag would have turned
+  // every quiet cycle red on 15 agents. --force is what makes the nonzero-token assertion mean
+  // anything, so the answer is not to weaken the assertion but to SKIP THE CALL when there is
+  // nothing to do — cheaper than a no-op ingest, and it reports a POSITIVE fact rather than a zero.
+  if (unchanged) {
+    return { code: 0, status: 'UNCHANGED',
+      detail: `inputs are byte-identical to the last receipt, so nothing was re-embedded. This is a SUCCESS, not a silence — the previous receipt still describes the indexed state.${skipNote}` };
   }
   if (ingestFailed) {
     // THE REASON IS CARRIED, NOT SWALLOWED. The first version of this returned a
@@ -123,6 +174,33 @@ function selfTest() {
     ['missing path outranks zero tokens, by STATUS not just code', () =>
       verdict({ missingPaths: ['./gone.md'], tokens: 0, ingestFailed: false }).status === 'PATH-MISSING'],
     ['broken call is 3, not 2', () => verdict({ missingPaths: [], tokens: null, ingestFailed: 'spawn EINVAL' }).code === 3],
+
+    // --- the UNCHANGED skip (analyst 2026-08-01: --force re-embedded everything every fire) ---
+    ['unchanged is a SUCCESS, not a finding', () =>
+      verdict({ missingPaths: [], tokens: null, ingestFailed: null, unchanged: true }).code === 0],
+    // Without this, UNCHANGED and ZERO-TOKENS could collapse — and they are opposites: one is
+    // "nothing needed doing", the other is "something should have happened and did not".
+    ['unchanged and zero-tokens are DIFFERENT statuses', () =>
+      verdict({ missingPaths: [], tokens: null, ingestFailed: null, unchanged: true }).status !==
+      verdict({ missingPaths: [], tokens: 0, ingestFailed: null }).status],
+    // A MISSING PATH STILL OUTRANKS AN UNCHANGED FINGERPRINT. Ordering, again: if a required file
+    // is deleted, its hash goes null and the fingerprint "changes", but should the file be restored
+    // byte-identically we must not skip past the fact that it was gone.
+    ['missing path outranks unchanged', () =>
+      verdict({ missingPaths: ['./gone.md'], tokens: null, ingestFailed: null, unchanged: true }).status === 'PATH-MISSING'],
+    // isUnchanged is GATED ON THE PRIOR STATUS. If the last run FAILED, unchanged inputs are exactly
+    // when we must retry — skipping there makes a failure permanent and silent.
+    ['a prior FAILURE never permits a skip', () =>
+      isUnchanged({ status: 'ZERO-TOKENS', fingerprint: [{ path: 'a', sha256: 'x' }] },
+                  [{ path: 'a', sha256: 'x' }]) === false],
+    ['a prior SUCCESS with an identical hash permits a skip', () =>
+      isUnchanged({ status: 'INGESTED', fingerprint: [{ path: 'a', sha256: 'x' }] },
+                  [{ path: 'a', sha256: 'x' }]) === true],
+    ['a changed hash never permits a skip', () =>
+      isUnchanged({ status: 'INGESTED', fingerprint: [{ path: 'a', sha256: 'x' }] },
+                  [{ path: 'a', sha256: 'y' }]) === false],
+    ['no prior receipt never permits a skip (first run must actually run)', () =>
+      isUnchanged(null, [{ path: 'a', sha256: 'x' }]) === false],
     // Asserting only the CODE would pass while the receipt says nothing useful,
     // which is the failure this file already made once. The reason must survive
     // into the detail, or COULD-NOT-RUN is a dead end for whoever reads it.
@@ -204,9 +282,30 @@ const ingestPaths = [...paths, ...presentOptional];
 // CLI relative to THIS file, so it does not depend on cwd or PATH either.
 const CLI = fileURLToPath(new URL('../dist/cli.js', import.meta.url));
 
+const RECEIPT_ROOT = (process.env.CTX_ROOT || `${process.env.HOME}/.cortextos/default`).replace(/\\/g, '/');
+const RECEIPT = `${RECEIPT_ROOT}/state/${agent}/.kb-ingest-receipts.jsonl`;
+
+let prevReceipt = null;
+try {
+  const lines = readFileSync(RECEIPT, 'utf8').trim().split('\n').filter(Boolean);
+  prevReceipt = lines.length ? JSON.parse(lines[lines.length - 1]) : null;
+} catch {
+  prevReceipt = null; // no receipt yet is not an error, it is the first run
+}
+
+// THE SKIP IS OFF UNTIL THE 15 HEARTBEAT.md BLOCKS SAY UNCHANGED IS A SUCCESS.
+// All of them currently read "INGESTED (0) is the only success", so shipping the skip first would
+// hand 15 live agents a status their own instructions explicitly deny — which is exactly the
+// suspected-injection alarm pm_bot correctly raised on 2026-07-30 against an unannounced change.
+// The code lands first and stays inert; the flag flips after the docs land with a bus announcement.
+const SKIP_ENABLED = process.env.FT_KB_SKIP_UNCHANGED === '1';
+
+const nowPrint = missingPaths.length ? null : fingerprint(ingestPaths);
+const unchanged = SKIP_ENABLED && nowPrint !== null && isUnchanged(prevReceipt, nowPrint);
+
 let stdout = '';
 let ingestFailed = null;
-if (!missingPaths.length) {
+if (!missingPaths.length && !unchanged) {
   if (!existsSync(CLI)) {
     ingestFailed = `no CLI bundle at ${CLI} — run npm run build.`;
   } else {
@@ -224,7 +323,7 @@ if (!missingPaths.length) {
 }
 
 const tokens = parseEmbeddingTokens(stdout);
-const { code, status, detail } = verdict({ missingPaths, tokens, ingestFailed, skippedOptional });
+const { code, status, detail } = verdict({ missingPaths, tokens, ingestFailed, skippedOptional, unchanged });
 
 // THE RECEIPT IS WRITTEN ON EVERY OUTCOME, INCLUDING THE BAD ONES. A receipt
 // that only appears on success cannot distinguish "failed" from "never ran",
@@ -246,6 +345,12 @@ try {
     // whose entire job is describing coverage. Reading `paths` would have
     // understated what was indexed; only the byte count disagreed.
     paths: ingestPaths, skippedOptional,
+    // The fingerprint is what makes the NEXT run's skip decision possible. Without it in the
+    // receipt there is no prior state to compare against and every run re-embeds forever.
+    fingerprint: nowPrint,
+    // Carried forward on a skip so the receipt line still says how much is indexed. A receipt that
+    // reads "tokens: null" on every quiet cycle loses the number the whole file exists to report.
+    tokens_carried: unchanged ? (prevReceipt && (prevReceipt.tokens ?? prevReceipt.tokens_carried)) : undefined,
   }) + '\n');
 } catch (err) {
   console.log(`NOTE: verdict stands but the receipt could not be written (${err.message}).`);
