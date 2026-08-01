@@ -349,12 +349,13 @@ busCommand
   // Frozen-after-creation until 2026-07-30. Five agents routed around this in one day: notes went
   // into log-event meta, a constraint went into a chat message, dependency edges were hand-mirrored
   // across three JSON files, and the orchestrator could not reassign a task at all.
+  .option('--title <text>', 'Correct the title — audited, and the superseded title is preserved into the description')
   .option('--desc <text>', 'Change the description')
   .option('--project <name>', 'Change the project')
   .option('--assignee <agent>', 'Reassign — REFUSES if another agent holds the claim-lock')
   .option('--due <iso>', 'Set the due date (ISO 8601) — until now unreachable from any CLI path')
   .option('--evidence <text>', 'Where the result lives: commit, path, vault heading, or a written negative result')
-  .action((id: string, status: string, opts: { priority?: string; desc?: string; project?: string; assignee?: string; due?: string; evidence?: string }) => {
+  .action((id: string, status: string, opts: { priority?: string; title?: string; desc?: string; project?: string; assignee?: string; due?: string; evidence?: string }) => {
     const validStatuses: TaskStatus[] = ['pending', 'in_progress', 'completed', 'blocked', 'cancelled'];
     if (!validStatuses.includes(status as TaskStatus)) {
       console.error(`Invalid status '${status}'. Must be one of: ${validStatuses.join(', ')}`);
@@ -383,6 +384,7 @@ busCommand
       }
       updateTask(paths, id, status as TaskStatus, {
         priority: opts.priority as Priority | undefined,
+        title: opts.title,
         description: opts.desc,
         project: opts.project,
         assignee: opts.assignee,
@@ -464,9 +466,20 @@ busCommand
         e.from_priority !== undefined || e.to_priority !== undefined
           ? ` [priority ${e.from_priority ?? '?'} -> ${e.to_priority ?? '?'}]`
           : '';
+      // Same reasoning as `prio` above, one field over, and it matters MORE here: the title is
+      // the only field `list-tasks` shows, so a retitle that is recorded on disk but absent from
+      // the tool people read reproduces exactly the defect --title exists to fix. Rendered in
+      // full rather than truncated — a retitle is checked to see what CHANGED, and an ellipsis
+      // hides the word that moved.
+      const titleChange =
+        e.from_title !== undefined || e.to_title !== undefined
+          ? `
+      [title] "${e.from_title ?? '?'}"
+           -> "${e.to_title ?? '?'}"`
+          : '';
       const transition = (e.from && e.to ? `${e.from} -> ${e.to}` : e.to || '') + prio;
       const note = e.note ? ` | ${e.note}` : '';
-      console.log(`  ${e.ts}  ${e.event.padEnd(8)}  ${e.agent.padEnd(16)}  ${transition}${note}`);
+      console.log(`  ${e.ts}  ${e.event.padEnd(8)}  ${e.agent.padEnd(16)}  ${transition}${note}${titleChange}`);
     }
   });
 

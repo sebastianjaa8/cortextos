@@ -348,6 +348,7 @@ export function updateTask(
   status: TaskStatus,
   opts?: {
     priority?: Priority;
+    title?: string;
     description?: string;
     project?: string;
     assignee?: string;
@@ -387,15 +388,36 @@ export function updateTask(
   let prevStatus: TaskStatus | undefined;
   let prevPriority: Priority | undefined;
   let prevAssignee: string | undefined;
+  let prevTitle: string | undefined;
   let assignee: string | undefined;
   try {
     const task: Task = parseTaskFile(filePath);
     prevStatus = task.status;
     prevPriority = task.priority;
     prevAssignee = task.assigned_to;
+    prevTitle = task.title;
     task.status = status;
     if (opts?.priority !== undefined) task.priority = opts.priority;
     if (opts?.description !== undefined) task.description = opts.description;
+    // TITLE IS THE ONLY FIELD `list-tasks` DISPLAYS, so a wrong one is the one error nobody can
+    // see past — a corrected body sits invisibly behind an uncorrected headline, and the headline
+    // is what gets acted on. Worked example that produced this verb: a task whose TITLE asserted an
+    // impossibility its OWN BODY recorded as mistaken was walked past for a full day.
+    //
+    // THE SUPERSEDED TITLE IS PRESERVED INTO THE DESCRIPTION, not just the audit log. The audit log
+    // already records from_title/to_title, but reading it needs a separate `task-history` call, and
+    // the whole finding here is that people do not go past the surface. Amend-in-place: the old
+    // headline stays legible so the error remains auditable, and the correction sits adjacent so it
+    // cannot be read without it. Applied AFTER --desc so an accompanying description rewrite cannot
+    // drop the note.
+    if (opts?.title !== undefined && opts.title !== prevTitle) {
+      task.title = opts.title;
+      const stamp = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
+      // Explicit \n escapes, NOT a multi-line template literal: this file is CRLF on disk, so a
+      // literal line break here would inject \r\n into every corrected description.
+      const note = `\n\n[TITLE CORRECTED ${stamp}] superseded title, kept for the record: "${prevTitle}"`;
+      task.description = (task.description ?? '') + note;
+    }
     if (opts?.project !== undefined) task.project = opts.project;
     if (opts?.assignee !== undefined) task.assigned_to = opts.assignee;
     if (opts?.dueDate !== undefined) task.due_date = opts.dueDate;
@@ -417,6 +439,12 @@ export function updateTask(
       : {}),
     ...(opts?.assignee !== undefined && opts.assignee !== prevAssignee
       ? { from_assignee: prevAssignee, to_assignee: opts.assignee }
+      : {}),
+    // Audited MORE carefully than priority, not less: a title change rewrites what the task
+    // APPEARS to be to every future reader, so a silent retitle is a rewrite of history at the
+    // only surface most readers ever see.
+    ...(opts?.title !== undefined && opts.title !== prevTitle
+      ? { from_title: prevTitle, to_title: opts.title }
       : {}),
     ...(opts?.evidence !== undefined ? { evidence: opts.evidence } : {}),
   });
@@ -515,6 +543,13 @@ export interface TaskAuditEntry {
    *  That is how a task sequenced for one agent stayed assigned to another. */
   from_assignee?: string;
   to_assignee?: string;
+  /** Present only on a title CORRECTION (added 2026-08-01). The title is the only field
+   *  `list-tasks` renders, so a wrong one is the single error no reader can see past: a corrected
+   *  body sits invisibly behind an uncorrected headline and the headline is what gets acted on.
+   *  Audited more carefully than priority, because a retitle rewrites what the task APPEARS to be
+   *  to every future reader. */
+  from_title?: string;
+  to_title?: string;
   /** Where the result lives, recorded at the transition that claimed or completed the task. */
   evidence?: string;
   note?: string;

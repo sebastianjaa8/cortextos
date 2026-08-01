@@ -137,6 +137,73 @@ describe('Task Management', () => {
       expect(entry?.from_priority).toBeUndefined();
       expect(entry?.to_priority).toBeUndefined();
     });
+
+    // TITLE CORRECTION. The title is the ONLY field `list-tasks` renders, so a wrong one is the
+    // single error no reader can see past: a corrected body sits invisibly behind an uncorrected
+    // headline, and the headline is what gets acted on. Origin: a task whose TITLE asserted an
+    // impossibility its own BODY already recorded as mistaken was walked past for a full day.
+    it('corrects the title AND preserves the superseded one into the description', () => {
+      const taskId = createTask(paths, 'paul', 'acme', 'WRONG: no way to change a description', {
+        description: 'original body',
+      });
+      updateTask(paths, taskId, 'pending', { title: 'RIGHT: --desc shipped in 9cdfdc0f' });
+
+      const t = JSON.parse(readFileSync(join(paths.taskDir, `${taskId}.json`), 'utf-8'));
+      expect(t.title).toBe('RIGHT: --desc shipped in 9cdfdc0f');
+      // The superseded headline must remain LEGIBLE, not be silently replaced — a retitle that
+      // erases the old claim destroys the evidence that the task was ever wrong.
+      expect(t.description).toContain('WRONG: no way to change a description');
+      expect(t.description).toContain('[TITLE CORRECTED');
+      // CONTROL: the original body must survive the append, not be overwritten by the note.
+      expect(t.description).toContain('original body');
+      // CONTROL: no carriage return injected. This file is CRLF on disk, so a literal line
+      // break inside the note's template literal would put one into every description.
+      expect(t.description).not.toContain(String.fromCharCode(13));
+    });
+
+    it('audits a title correction with from_title/to_title AND actually applies it', () => {
+      const taskId = createTask(paths, 'paul', 'acme', 'OLD HEADLINE');
+      updateTask(paths, taskId, 'pending', { title: 'NEW HEADLINE' });
+
+      const entry = readTaskAudit(paths, taskId).find((e) => e.event === 'update');
+      expect(entry?.from_title).toBe('OLD HEADLINE');
+      expect(entry?.to_title).toBe('NEW HEADLINE');
+
+      // THE AUDIT AND THE WRITE ARE SEPARATE EXPRESSIONS, so this assertion is not redundant:
+      // sabotaging the title-write leg left this test GREEN while the audit still claimed a
+      // change that never reached the task. An audit entry asserting a mutation that did not
+      // happen is worse than no entry — it is a false record of the exact field the log exists
+      // to make trustworthy. Found by mutation, not by review.
+      const t = JSON.parse(readFileSync(join(paths.taskDir, `${taskId}.json`), 'utf-8'));
+      expect(t.title).toBe('NEW HEADLINE');
+    });
+
+    // CONTROL, and it is the one that stops this from being a vacuous pair: without it, an
+    // implementation that appends a note and an audit entry on EVERY update passes both
+    // assertions above while spamming the description of every unrelated status change.
+    it('does NOT touch the description or audit for a no-op re-assertion of the same title', () => {
+      const taskId = createTask(paths, 'paul', 'acme', 'SAME', { description: 'body' });
+      updateTask(paths, taskId, 'pending', { title: 'SAME' });
+
+      const t = JSON.parse(readFileSync(join(paths.taskDir, `${taskId}.json`), 'utf-8'));
+      expect(t.description).toBe('body');
+      expect(t.description).not.toContain('[TITLE CORRECTED');
+      const entry = readTaskAudit(paths, taskId).find((e) => e.event === 'update');
+      expect(entry?.from_title).toBeUndefined();
+      expect(entry?.to_title).toBeUndefined();
+    });
+
+    // CONTROL: an update that does not pass --title must leave the title alone. Without this, an
+    // implementation defaulting title to undefined-and-writing-it would blank every title on any
+    // ordinary status change, and the assertions above would not notice.
+    it('leaves the title untouched when no title option is passed', () => {
+      const taskId = createTask(paths, 'paul', 'acme', 'UNTOUCHED', { description: 'body' });
+      updateTask(paths, taskId, 'in_progress', { priority: 'high' });
+
+      const t = JSON.parse(readFileSync(join(paths.taskDir, `${taskId}.json`), 'utf-8'));
+      expect(t.title).toBe('UNTOUCHED');
+      expect(t.description).toBe('body');
+    });
   });
 
   describe('completeTask', () => {
