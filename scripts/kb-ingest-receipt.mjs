@@ -65,6 +65,14 @@ export function parseEmbeddingTokens(stdout) {
  * revert bumped src mtime without changing content (the false positive the build-stamp exists to
  * fix), and OneDrive touches mtimes on files no cron wrote. Reading 350KB is trivial and bounded by
  * the same files we were already about to embed.
+ *
+ * THE PER-INPUT SHAPE IS LOAD-BEARING — DO NOT COLLAPSE THIS TO ONE HASH OF THE CONCATENATION.
+ * Nothing in the tests covers this and seb_boss found it by checking his own lane, which is the only
+ * one passing an `--optional` daily file. The daily path CHANGES NAME at UTC midnight: on 08-02 it
+ * becomes memory/2026-08-02.md, which is absent, so a {path, sha256} list differs from yesterday's
+ * and the run correctly INGESTS. A single hash over the concatenated bytes would be IDENTICAL on a
+ * quiet rollover — same content, different filename — and the skip would fire on a day when the
+ * input set genuinely changed. The paths are half the fingerprint, not decoration.
  */
 export function fingerprint(paths) {
   return paths.map((p) => {
