@@ -305,6 +305,7 @@ class Daemon {
   private lockHeld = false;
   private lockHeartbeat: NodeJS.Timeout | null = null;
   private supervisorFence: NodeJS.Timeout | null = null;
+  private skipOwnedProcessCleanup = false;
 
   constructor() {
     this.instanceId = process.env.CTX_INSTANCE_ID || 'default';
@@ -366,6 +367,7 @@ class Daemon {
       if (supervisorFenceFailures < PM2_SUPERVISOR_FENCE_FAILURE_THRESHOLD) return;
       if (fenceFailureHandled) return;
       fenceFailureHandled = true;
+      this.skipOwnedProcessCleanup = true;
       handleFatal(
         'uncaughtException',
         new Error(
@@ -374,8 +376,9 @@ class Daemon {
         ),
         this.ctxRoot,
         frameworkRoot,
-        true,
+        false,
       );
+      process.exit(1);
     }, PM2_SUPERVISOR_FENCE_INTERVAL_MS);
     this.supervisorFence.unref();
     const pidFile = join(this.ctxRoot, 'daemon.pid');
@@ -396,17 +399,20 @@ class Daemon {
       } catch (err) {
         console.error('[daemon] Failed to stop IPC during exit cleanup:', err);
       }
-      try {
-        this.agentManager?.forceStopAll();
-      } catch (err) {
-        console.error('[daemon] Failed to stop owned processes during exit cleanup:', err);
+      if (!this.skipOwnedProcessCleanup) {
+        try {
+          this.agentManager?.forceStopAll();
+        } catch (err) {
+          console.error('[daemon] Failed to stop owned processes during exit cleanup:', err);
+        }
       }
       try {
         const { unlinkSync } = require('fs');
         unlinkSync(pidFile);
       } catch { /* ignore */ }
-      // The instance lock is the lifecycle fence: release it only after every
-      // owned process tree and control-plane endpoint has been torn down.
+      // The instance lock is the lifecycle fence. Supervisor-loss exits skip
+      // synchronous PTY teardown so PM2 receives the exit promptly; the next
+      // daemon reconciles the old generation's PID-safe runtime records.
       if (this.lockHeld) {
         releaseDaemonInstanceLock(this.ctxRoot);
         this.lockHeld = false;
