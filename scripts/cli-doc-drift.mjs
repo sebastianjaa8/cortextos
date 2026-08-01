@@ -125,7 +125,28 @@ const contracts = files.filter((f) => f.endsWith('AGENTS.md'));
 
 // A WARNING about a bad flag and a USE of a bad flag are THE SAME STRING. If they cannot be told
 // apart, report both and MARK the ambiguity rather than picking one and being silently wrong.
-const WARNS = /\b(does not exist|do not exist|no such|dead|WRONG|NOT a real|is not a flag|rejects|fails loudly|nonexistent|never existed|removed)\b/i;
+const WARNS_RE = /\b(does not exist|do not exist|no such|dead|WRONG|NOT a real|is not a flag|rejects|fails loudly|nonexistent|never existed|removed)\b/i;
+
+/**
+ * Is this line WARNING about a bad flag, rather than USING one?
+ *
+ * TEST THE PROSE, NOT THE IDENTIFIERS. v1 ran the regex over the whole line, so a flag whose NAME
+ * happened to contain a warning word classified its own use as a warning and was demoted out of
+ * direction (a) entirely. Caught by a discriminating pair: two identical lines differing only in
+ * the flag name — `--nonexistent-flag-abc123` landed in AMBIGUOUS, `--plainflag-abc123` landed in
+ * (a). A real documented `--dead-letter` or `--removed-only` would have silently disappeared.
+ *
+ * Found because analyst reported the splitter firing on their synthetic bait as PROOF IT WORKS. It
+ * fired for the wrong reason — the bait was named `--nonexistent-flag-abc123`. Green for the wrong
+ * reason, one more time, and this one arrived labelled as validation.
+ */
+function warnsAboutIt(line) {
+  const prose = line
+    .replace(/`[^`]*`/g, ' ')        // code spans hold identifiers, not commentary
+    .replace(/--[a-z0-9-]+/gi, ' ')  // bare flags outside spans
+    .replace(/\b[a-z]+(-[a-z0-9]+){2,}\b/gi, ' '); // long kebab identifiers
+  return WARNS_RE.test(prose);
+}
 
 // Prose denials for direction (b).
 const DENY = /\b(cannot|can't|no way to|there is no|unable to|not possible|only exposes|does not support|has no|impossible to)\b/i;
@@ -154,14 +175,14 @@ for (const file of files) {
       const cmd = m[1];
       const rec = { file: path.relative(REPO, file), line: i + 1, text: line.trim().slice(0, 160) };
       if (!busCommands.has(cmd)) {
-        (WARNS.test(line) ? findings.ambiguous : findings.a).push({ ...rec, kind: 'command', name: cmd });
+        (warnsAboutIt(line) ? findings.ambiguous : findings.a).push({ ...rec, kind: 'command', name: cmd });
         continue;
       }
       const known = flagsFor(cmd);
       const flagsUsed = [...(m[2] || '').matchAll(/(--[a-z][a-z0-9-]+)/g)].map((x) => x[1]);
       for (const f of flagsUsed) {
         if (!known.has(f)) {
-          (WARNS.test(line) ? findings.ambiguous : findings.a).push({ ...rec, kind: 'flag', name: `${cmd} ${f}` });
+          (warnsAboutIt(line) ? findings.ambiguous : findings.a).push({ ...rec, kind: 'flag', name: `${cmd} ${f}` });
         }
       }
     }
