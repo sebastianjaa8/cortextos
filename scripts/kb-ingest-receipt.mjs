@@ -55,7 +55,22 @@ export function parseEmbeddingTokens(stdout) {
  * Pure verdict logic so --self-test can drive it without touching the CLI.
  * @returns {{code:0|2|3, status:string, detail:string}}
  */
-export function verdict({ missingPaths, tokens, ingestFailed }) {
+export function verdict({ missingPaths, tokens, ingestFailed, skippedOptional = [] }) {
+  // AN ABSENT OPTIONAL PATH IS NOT A FINDING, AND IT IS NOT SILENT EITHER.
+  // seb_boss caught this before it did damage: `./memory/<today>.md` does not
+  // exist until something writes memory that day, so treating every path as
+  // required emits PATH-MISSING on every agent at the start of every UTC day —
+  // a red that is correct by its own logic and means nothing. Once that is the
+  // normal daily state, a REAL missing path (a typo, a rename, a rotation) is
+  // indistinguishable from the routine one, which is the exact failure this
+  // file exists to prevent, reintroduced by its own invocation. GUARDRAIL 99.
+  //
+  // The skip is NAMED in the detail rather than dropped, because "no daily file
+  // today" and "nobody passed a daily file" are different facts — the same
+  // null-versus-0 split as parseEmbeddingTokens, one level up.
+  const skipNote = skippedOptional.length
+    ? ` Skipped ${skippedOptional.length} absent optional path(s): ${skippedOptional.join(', ')}.`
+    : '';
   // ORDER MATTERS AND THIS ORDER IS THE POINT. A missing path is reported as a
   // missing path, NOT as "0 tokens" — they have different remedies (fix the
   // path vs investigate the ingest) and the CLI itself conflates them by
@@ -82,9 +97,9 @@ export function verdict({ missingPaths, tokens, ingestFailed }) {
   }
   if (tokens === 0) {
     return { code: 2, status: 'ZERO-TOKENS',
-      detail: 'the ingest completed and embedded NOTHING. The step ran and the memory store did not change.' };
+      detail: `the ingest completed and embedded NOTHING. The step ran and the memory store did not change.${skipNote}` };
   }
-  return { code: 0, status: 'INGESTED', detail: `${tokens} embedding tokens.` };
+  return { code: 0, status: 'INGESTED', detail: `${tokens} embedding tokens.${skipNote}` };
 }
 
 function selfTest() {
@@ -113,6 +128,24 @@ function selfTest() {
     // into the detail, or COULD-NOT-RUN is a dead end for whoever reads it.
     ['the failure REASON reaches the detail', () =>
       verdict({ missingPaths: [], tokens: null, ingestFailed: 'spawn EINVAL' }).detail.includes('spawn EINVAL')],
+
+    // THE OPTIONAL/REQUIRED SPLIT. Without these two, the first person to
+    // "simplify" the filter collapses them and reinstalls a PATH-MISSING on
+    // every agent at the start of every UTC day — correct by its own logic,
+    // meaningless, and it makes a REAL missing path indistinguishable from the
+    // routine one. Same null-versus-0 discipline, one level up.
+    ['an ABSENT OPTIONAL path is NOT a finding', () =>
+      verdict({ missingPaths: [], tokens: 500, ingestFailed: false, skippedOptional: ['./memory/today.md'] }).code === 0],
+    ['an ABSENT REQUIRED path IS a finding', () =>
+      verdict({ missingPaths: ['./MEMORY.md'], tokens: 500, ingestFailed: false }).code === 2],
+    ['absent-optional and absent-required give DIFFERENT statuses', () =>
+      verdict({ missingPaths: [], tokens: 500, ingestFailed: false, skippedOptional: ['./x.md'] }).status !==
+      verdict({ missingPaths: ['./x.md'], tokens: 500, ingestFailed: false }).status],
+    // Skipped, but NOT silently: if the skip vanishes from the detail, "no daily
+    // file today" and "nobody passed one" become the same observable again.
+    ['a skipped optional path is NAMED in the detail', () =>
+      verdict({ missingPaths: [], tokens: 500, ingestFailed: false, skippedOptional: ['./memory/today.md'] })
+        .detail.includes('./memory/today.md')],
   ];
   let failed = 0;
   for (const [name, fn] of cases) {
@@ -136,13 +169,19 @@ const flag = (name) => {
 };
 const agent = flag('--agent') || process.env.CTX_AGENT_NAME;
 const org = flag('--org') || process.env.CTX_ORG;
-const paths = argv.filter((a, i) => !a.startsWith('--') && !['--agent', '--org'].includes(argv[i - 1]));
+// --optional may repeat. An optional path that is absent is SKIPPED AND NAMED;
+// an absent required path is still PATH-MISSING. Keeping both concepts is the
+// point — see verdict() for why collapsing them installs a daily false alarm.
+const optionalPaths = argv.filter((a, i) => argv[i - 1] === '--optional');
+const paths = argv.filter(
+  (a, i) => !a.startsWith('--') && !['--agent', '--org', '--optional'].includes(argv[i - 1]),
+);
 
 if (!agent || !org) {
   console.log('VERDICT: COULD-NOT-RUN — need --agent and --org (or CTX_AGENT_NAME / CTX_ORG).');
   process.exit(3);
 }
-if (!paths.length) {
+if (!paths.length && !optionalPaths.length) {
   console.log('VERDICT: COULD-NOT-RUN — no input paths given.');
   process.exit(3);
 }
@@ -150,6 +189,11 @@ if (!paths.length) {
 // EXISTENCE IS CHECKED HERE, BEFORE THE CLI SEES IT, because the CLI's answer to
 // a missing path is a clean exit 0 — verified 2026-08-01, not assumed.
 const missingPaths = paths.filter((p) => !existsSync(p));
+// Optional paths split rather than fail: present ones join the ingest, absent
+// ones are recorded so the receipt says WHICH, instead of silently shrinking.
+const skippedOptional = optionalPaths.filter((p) => !existsSync(p));
+const presentOptional = optionalPaths.filter((p) => existsSync(p));
+const ingestPaths = [...paths, ...presentOptional];
 
 // CALLS dist/cli.js WITH node DIRECTLY, not the `cortextos` shim. The shim is a
 // .cmd on Windows, and Node has refused to execFile a .cmd without a shell since
@@ -169,7 +213,7 @@ if (!missingPaths.length) {
     try {
       stdout = execFileSync(
         process.execPath,
-        [CLI, 'bus', 'kb-ingest', ...paths, '--org', org, '--agent', agent, '--scope', 'private', '--force'],
+        [CLI, 'bus', 'kb-ingest', ...ingestPaths, '--org', org, '--agent', agent, '--scope', 'private', '--force'],
         { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 },
       );
     } catch (err) {
@@ -180,7 +224,7 @@ if (!missingPaths.length) {
 }
 
 const tokens = parseEmbeddingTokens(stdout);
-const { code, status, detail } = verdict({ missingPaths, tokens, ingestFailed });
+const { code, status, detail } = verdict({ missingPaths, tokens, ingestFailed, skippedOptional });
 
 // THE RECEIPT IS WRITTEN ON EVERY OUTCOME, INCLUDING THE BAD ONES. A receipt
 // that only appears on success cannot distinguish "failed" from "never ran",
@@ -194,8 +238,8 @@ try {
     agent, status, tokens,
     // Sizes travel with the receipt so the growth curve is readable from the
     // receipts alone, without re-stat'ing files that have since changed.
-    bytes: paths.reduce((n, p) => n + (existsSync(p) ? statSync(p).size : 0), 0),
-    paths,
+    bytes: [...paths, ...presentOptional].reduce((n, p) => n + (existsSync(p) ? statSync(p).size : 0), 0),
+    paths, skippedOptional,
   }) + '\n');
 } catch (err) {
   console.log(`NOTE: verdict stands but the receipt could not be written (${err.message}).`);
