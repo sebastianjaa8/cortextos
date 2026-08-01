@@ -2,19 +2,24 @@
 // Is the RUNNING daemon executing the current src? Three facts, two comparisons, nobody was
 // making either one.
 //
-//   A  newest mtime under src/        (when the code last changed)
+//   A  dist/.build-stamp             (what source the bundle was ACTUALLY built from)
 //   B  mtime of dist/daemon.js        (when the bundle was last built)
 //   C  pm2 up_since for the daemon    (when the resident copy was loaded)
 //
-// A was the last COMMIT date until 2026-07-30, when that leg fired a false positive by 278ms —
-// git commit times have 1-second resolution, file mtimes have milliseconds, and the real workflow
-// is edit->build->test->commit, so a healthy build lands a fraction of a second BEFORE its commit.
-// All three facts are now file/process timestamps on one clock. See the STALE-BUNDLE leg.
+// A WAS A TIMESTAMP UNTIL 2026-08-01 AND THAT WAS THE WRONG KIND OF FACT. It was the last commit
+// date, which fired a false positive by 278ms (commit times have 1-second resolution, mtimes have
+// milliseconds, and the real workflow is edit->build->test->commit). It was then the newest src/
+// file mtime, which fired a false positive of its own: a `git checkout` revert restored the exact
+// content the bundle was built from and bumped the mtime, so a current bundle read STALE-BUNDLE.
 //
-// The chain must hold A <= B <= C. Break it anywhere and the daemon is running code that is not
-// what the repo says:
-//   B < A   the bundle was never rebuilt after a src change      -> STALE-BUNDLE
-//   C < B   the daemon started before the current bundle existed -> STALE-DAEMON
+// BOTH ARE PROXIES FOR A CONTENT QUESTION AND NO TIMESTAMP ANSWERS ONE. Only the artifact recording
+// its own provenance does. A is now scripts/build-stamp.mjs --check, written by the tsup build.
+//
+// The chain must hold A ok, then B <= C. Break it anywhere and the daemon is running code that is
+// not what the repo says:
+//   A STALE          the bundle was built from source that is no longer HEAD  -> STALE-BUNDLE
+//   A UNVERIFIABLE   provenance cannot be established at all                  -> UNVERIFIABLE-BUNDLE
+//   C < B            the daemon started before the current bundle existed     -> STALE-DAEMON
 // Restarting an AGENT fixes neither: agents respawn from the daemon's already-loaded copy.
 //
 // WHY GENERIC, NOT ONE-SHA. This started life checking one known commit (the crons.json snapshot
@@ -33,7 +38,13 @@
 //
 // exit 0 CURRENT · 2 a real finding (stale bundle or stale daemon) · 3 could not run
 import { execSync } from 'node:child_process';
-import { statSync, existsSync, readdirSync } from 'node:fs';
+import { statSync, existsSync, readFileSync } from 'node:fs';
+// The provenance logic lives in scripts/, not here. NOT because this file is untracked — I wrote
+// that first and it was wrong: `git ls-files` shows THIS file is tracked, along with 11 other
+// orgs/ files, because .gitignore does not apply to paths already added. The reason is the other
+// direction: build-stamp.mjs genuinely was untracked, and `tsup.config.ts` is a framework file that
+// must not reach into one user's org data for a build step. See scripts/build-stamp.mjs.
+import { verdict as stampVerdict, currentProvenance } from '../../../../../scripts/build-stamp.mjs';
 
 const REPO = 'C:/Users/Sebas/cortextos';
 const BUNDLE = `${REPO}/dist/daemon.js`;
@@ -42,32 +53,27 @@ const BUNDLE = `${REPO}/dist/daemon.js`;
  * Pure verdict logic, so --self-test can drive it with fabricated times.
  * @returns {{code:0|2, lines:string[]}}
  */
-export function verdict({ newestSrcMtime, bundleMtime, daemonUpSince, dirtySrcFiles }) {
+export function verdict({ stamp, bundleMtime, daemonUpSince, dirtySrcFiles }) {
   const lines = [];
   const findings = [];
 
-  // COMPARED AGAINST THE NEWEST src/ FILE MTIME, NOT THE LAST COMMIT DATE. This leg fired a false
-  // positive on 2026-07-30 by 278 MILLISECONDS, and the cause was a clock-domain mismatch:
+  // THE PROVENANCE LEG. Two timestamps cannot answer "was this artifact produced from this source",
+  // and this leg produced a false positive under each timestamp it tried — 278ms under commit dates,
+  // and a whole clean bundle under src mtimes when a `git checkout` revert restored the exact
+  // content the bundle already contained. Both were proxies. The stamp is the fact.
   //
-  //   * git commit timestamps have ONE-SECOND resolution (the value read back ends in .000)
-  //   * file mtimes have millisecond resolution
-  //
-  // and worse, the comparison assumed build-AFTER-commit while the real workflow is
-  // edit -> build -> test -> commit. So a healthy build-then-commit leaves the bundle a fraction of
-  // a second OLDER than the commit, every time, and this leg reported that as staleness. The
-  // artifact points at "stale", so the check was biased toward firing on correct behaviour.
-  //
-  // Two file mtimes are the same clock at the same resolution, and they answer the question this
-  // leg actually asks — was the bundle built after the last source EDIT. A tolerance would only
-  // have been a guess about how long a commit takes.
-  //
-  // It also closes a gap the commit-based version could not see at all: editing src without
-  // committing never moved the old comparand, so uncommitted-and-unbuilt read as CURRENT.
-  if (bundleMtime < newestSrcMtime) {
+  // UNVERIFIABLE IS A FINDING, NOT A PASS. It is code 2, deliberately not code 3: 3 means the CHECK
+  // could not run, and conflating "the guard is broken" with "the guard cannot establish
+  // provenance" is what let a wrong invocation read as a real result once already. And it must not
+  // be silent — "we do not know what this bundle was built from" is the exact condition the whole
+  // exercise exists to surface.
+  if (stamp.status === 'STALE') {
+    findings.push(`STALE-BUNDLE — ${stamp.detail} npm run build.`);
+  } else if (stamp.status === 'UNVERIFIABLE') {
     findings.push(
-      `STALE-BUNDLE — dist/daemon.js (${bundleMtime.toISOString()}) is OLDER than the newest src/ ` +
-        `file (${newestSrcMtime.toISOString()}). The bundle was not rebuilt after the last source ` +
-        `edit. npm run build.`,
+      `UNVERIFIABLE-BUNDLE — ${stamp.detail} This is EXPECTED until the first real build after ` +
+        `2026-08-01 writes a stamp, and it will read as a regression. Absence of provenance is not ` +
+        `evidence of currency.`,
     );
   }
   if (daemonUpSince < bundleMtime) {
@@ -78,9 +84,9 @@ export function verdict({ newestSrcMtime, bundleMtime, daemonUpSince, dirtySrcFi
     );
   }
 
-  // Advisory. Now that the bundle is compared against file mtimes, uncommitted edits ARE covered by
-  // the comparison — but they are still worth naming, because a bundle built from uncommitted source
-  // is current on this box and unreproducible anywhere else.
+  // Advisory. The stamp already records dirtySrc and downgrades such a build to UNVERIFIABLE, so
+  // this no longer carries the comparison — it names the condition for a reader who is looking at a
+  // bundle that is current on this box and unreproducible anywhere else.
   if (dirtySrcFiles > 0) {
     lines.push(
       `NOTE: ${dirtySrcFiles} uncommitted file(s) under src/. The comparison below DOES cover them ` +
@@ -91,7 +97,7 @@ export function verdict({ newestSrcMtime, bundleMtime, daemonUpSince, dirtySrcFi
 
   if (findings.length === 0) {
     lines.push(
-      'VERDICT: CURRENT — the running daemon loaded a bundle built after the newest src/ edit.',
+      'VERDICT: CURRENT — the running daemon loaded a bundle whose stamp matches HEAD.',
       'This does NOT prove any given code path executes. Loaded is not exercised.',
     );
     return { code: 0, lines };
@@ -102,15 +108,20 @@ export function verdict({ newestSrcMtime, bundleMtime, daemonUpSince, dirtySrcFi
 
 function selfTest() {
   const t = (iso) => new Date(iso);
+  const OK = { status: 'CURRENT', detail: 'stamp matches HEAD.' };
   const cases = [
     // name, input, expected code, expected substring
-    ['clean chain', { newestSrcMtime: t('2026-07-30T01:00:00Z'), bundleMtime: t('2026-07-30T02:00:00Z'), daemonUpSince: t('2026-07-30T03:00:00Z'), dirtySrcFiles: 0 }, 0, 'CURRENT'],
-    ['boundary: all equal', { newestSrcMtime: t('2026-07-30T02:00:00Z'), bundleMtime: t('2026-07-30T02:00:00Z'), daemonUpSince: t('2026-07-30T02:00:00Z'), dirtySrcFiles: 0 }, 0, 'CURRENT'],
-    ['bundle older than src', { newestSrcMtime: t('2026-07-30T04:00:00Z'), bundleMtime: t('2026-07-30T02:00:00Z'), daemonUpSince: t('2026-07-30T05:00:00Z'), dirtySrcFiles: 0 }, 2, 'STALE-BUNDLE'],
-    ['daemon older than bundle', { newestSrcMtime: t('2026-07-30T01:00:00Z'), bundleMtime: t('2026-07-30T04:00:00Z'), daemonUpSince: t('2026-07-30T02:00:00Z'), dirtySrcFiles: 0 }, 2, 'STALE-DAEMON'],
-    // The real 2026-07-30 case: bundle 12:13:45Z, commit 13:51:40Z, daemon 13:56:03Z.
-    ['the case that motivated this', { newestSrcMtime: t('2026-07-30T13:51:40Z'), bundleMtime: t('2026-07-30T12:13:45Z'), daemonUpSince: t('2026-07-30T13:56:03Z'), dirtySrcFiles: 0 }, 2, 'STALE-BUNDLE'],
-    ['dirty src still passes but says so', { newestSrcMtime: t('2026-07-30T01:00:00Z'), bundleMtime: t('2026-07-30T02:00:00Z'), daemonUpSince: t('2026-07-30T03:00:00Z'), dirtySrcFiles: 3 }, 0, 'uncommitted'],
+    ['clean chain', { stamp: OK, bundleMtime: t('2026-07-30T02:00:00Z'), daemonUpSince: t('2026-07-30T03:00:00Z'), dirtySrcFiles: 0 }, 0, 'CURRENT'],
+    // THE 2026-07-31 REGRESSION CASE, AND IT IS HERE AS A *CLEAN* ONE ON PURPOSE. A `git checkout`
+    // revert restored the exact content the bundle was built from and bumped src mtime to 04:08:13,
+    // AFTER the bundle. The mtime leg called that STALE-BUNDLE. The stamp says CURRENT because the
+    // CONTENT never changed. This case is the whole reason the leg was replaced, so it is asserted
+    // rather than described — delete the stamp leg and it goes red.
+    ['revert bumped src mtime, content unchanged', { stamp: OK, bundleMtime: t('2026-07-31T04:00:00Z'), daemonUpSince: t('2026-07-31T05:00:00Z'), dirtySrcFiles: 0 }, 0, 'CURRENT'],
+    ['dirty src still passes but says so', { stamp: OK, bundleMtime: t('2026-07-30T02:00:00Z'), daemonUpSince: t('2026-07-30T03:00:00Z'), dirtySrcFiles: 3 }, 0, 'uncommitted'],
+    ['stamp says HEAD moved on', { stamp: { status: 'STALE', detail: 'built from 1111111, HEAD is 2222222.' }, bundleMtime: t('2026-07-30T02:00:00Z'), daemonUpSince: t('2026-07-30T03:00:00Z'), dirtySrcFiles: 0 }, 2, 'STALE-BUNDLE'],
+    ['no stamp at all', { stamp: { status: 'UNVERIFIABLE', detail: 'no dist/.build-stamp.' }, bundleMtime: t('2026-07-30T02:00:00Z'), daemonUpSince: t('2026-07-30T03:00:00Z'), dirtySrcFiles: 0 }, 2, 'UNVERIFIABLE-BUNDLE'],
+    ['daemon older than bundle', { stamp: OK, bundleMtime: t('2026-07-30T04:00:00Z'), daemonUpSince: t('2026-07-30T02:00:00Z'), dirtySrcFiles: 0 }, 2, 'STALE-DAEMON'],
   ];
 
   let failed = 0;
@@ -157,38 +168,30 @@ try {
   fail(`could not read git state: ${err.message}`);
 }
 
-/**
- * Newest mtime under src/. Deliberately a FILE mtime, so it is the same clock and the same
- * resolution as the bundle mtime it gets compared against — see the note on the STALE-BUNDLE leg.
- */
-function newestSrcMtimeMs(dir) {
-  let newest = 0;
-  for (const e of readdirSync(dir, { withFileTypes: true })) {
-    const full = `${dir}/${e.name}`;
-    if (e.isDirectory()) newest = Math.max(newest, newestSrcMtimeMs(full));
-    else if (e.name.endsWith('.ts')) newest = Math.max(newest, statSync(full).mtimeMs);
-  }
-  return newest;
-}
-
-let newestMs;
+// A is now a CONTENT fact, read from the stamp the build wrote, not a timestamp this file derives.
+// The src/ mtime walk that used to live here is gone with the leg it fed.
+let stamp;
 try {
-  newestMs = newestSrcMtimeMs(`${REPO}/src`);
+  const stampPath = `${REPO}/dist/.build-stamp`;
+  stamp = stampVerdict({
+    stamp: existsSync(stampPath) ? JSON.parse(readFileSync(stampPath, 'utf-8')) : null,
+    current: currentProvenance(REPO),
+    bundleMtime: existsSync(BUNDLE) ? statSync(BUNDLE).mtime : null,
+  });
 } catch (err) {
-  fail(`could not walk src/: ${err.message}`);
+  // COULD-NOT-RUN, not UNVERIFIABLE. If the stamp reader itself throws, this check has no opinion —
+  // reporting that as a provenance finding would blame the bundle for the guard's own breakage.
+  fail(`could not evaluate build provenance: ${err.message}`);
 }
-// A zero here would make EVERY bundle look current — failure in the reassuring direction, which is
-// the one this whole check exists to refuse. Could-not-run rather than a silent pass.
-if (!newestMs) fail('found no .ts files under src/ — wrong repo path?');
 
 const input = {
-  newestSrcMtime: new Date(newestMs),
+  stamp,
   bundleMtime: statSync(BUNDLE).mtime,
   daemonUpSince: new Date(proc.pm2_env.pm_uptime),
   dirtySrcFiles,
 };
 
-console.log(`A newest src/ edit  ${input.newestSrcMtime.toISOString()}`);
+console.log(`A build provenance  ${stamp.status} — ${stamp.detail}`);
 console.log(`B dist bundle built ${input.bundleMtime.toISOString()}`);
 console.log(`C daemon up_since   ${input.daemonUpSince.toISOString()} (pid ${proc.pid}, restarts ${proc.pm2_env.restart_time})`);
 

@@ -26,4 +26,12 @@ export default defineConfig({
     js: '#!/usr/bin/env node',
   },
   external: ['node-pty'],
+  // Provenance stamp, written ONLY by a real build. `guard-arm-check` reads it to answer "was this
+  // bundle produced from this source" — a content question that two clocks cannot answer, which is
+  // how a `git checkout` revert once reported STALE-BUNDLE against a current bundle.
+  //
+  // NOT `|| true` and NOT existence-guarded ON PURPOSE. Either would let the stamp silently fail to
+  // write, and a provenance tool that quietly reports nothing is worse than no tool: it trains its
+  // reader to ignore it. If this step fails, the build should fail loudly.
+  onSuccess: 'node scripts/build-stamp.mjs --write',
 });
