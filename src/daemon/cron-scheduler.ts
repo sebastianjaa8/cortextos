@@ -171,6 +171,50 @@ function computeNextFireAt(cron: CronDefinition, referenceMs: number): number {
 }
 
 /**
+ * The reference time for a cron that has NEVER fired — no last_fired_at, no
+ * last_fire_attempted_at, no cron-state last_fire.
+ *
+ * THE BUG THIS FIXES (measured 2026-08-01, analyst/wip-aging-scan). The fallback used to be `now`
+ * unconditionally. For an INTERVAL cron that is a countdown restarted from zero on every daemon
+ * start, so any interval longer than the gap between daemon starts NEVER FIRES, ever.
+ * wip-aging-scan: enabled, "3d", created 2026-07-26, zero fires in 6.3 days. Control that isolates
+ * the variable: sibling analyst cron autoresearch-pulse is ALSO "3d" and has fired 18 times — so 3d
+ * works when anchored, and the interval is not the cause.
+ *
+ * SELF-REINFORCING, WHICH IS WHY IT SURVIVED. One fire buys a persistent anchor and permanent
+ * immunity. A cron that has never fired can never acquire one. The population able to report the
+ * bug is exactly the population it silences.
+ *
+ * ONLY INTERVAL SCHEDULES GET created_at, AND THE ASYMMETRY IS THE WHOLE DESIGN. An interval is
+ * RELATIVE and is meaningless without an anchor. A cron expression is ABSOLUTE — "0 11 * * 0" names
+ * its own instants and `now` is the correct reference, because nextFireFromCron finds the next
+ * matching slot after it regardless. Feeding created_at to a cron expression would resolve to a
+ * matching slot in the PAST, hit the catch-up branch in loadCrons, and fire immediately on the next
+ * daemon start: builder_1/sabotage-weekly ("0 11 * * 0", never fired) would fire on a Saturday.
+ * That is a behaviour change for four currently-correct fleet crons, caused by a fix aimed at a
+ * fifth. Enumerating what else the change switches on is the point — the naive version of this fix
+ * is a one-line edit to the candidates array and it breaks the legs it was not reasoning about.
+ *
+ * NOT A BACKFILL. created_at is used as a REFERENCE POINT here and is never written to
+ * last_fired_at, because that would be a fabricated fire timestamp — a record asserting an event
+ * that did not happen. Reading a real field as an anchor and inventing a fake fire are different
+ * acts and only one of them is honest.
+ *
+ * FAR-PAST created_at IS SAFE AND STILL FIRES ONCE. created_at + interval lands in the past, so
+ * loadCrons' existing single-catch-up branch clamps nextFireAt to `now` and fires exactly one time;
+ * that fire writes last_fired_at, and from then on this function is never consulted again for that
+ * cron. The catch-up policy is unchanged, not widened.
+ */
+function fallbackAnchorMs(cron: CronDefinition, now: number): number {
+  if (isNaN(parseDurationMs(cron.schedule))) return now; // cron expression — absolute, needs no anchor
+  if (!cron.created_at) return now;
+  const created = new Date(cron.created_at).getTime();
+  // An unparseable or future created_at would push the first fire out instead of pulling it in,
+  // i.e. fail in the direction of the bug being fixed. `now` is the safe reading of a bad field.
+  return isNaN(created) || created > now ? now : created;
+}
+
+/**
  * Advance a cron's nextFireAt after it fires (successfully or not).
  *
  * BUG 1 fix: the previous implementation always computed the next slot from
@@ -434,7 +478,8 @@ export class CronScheduler {
       if (def.last_fired_at) candidates.push(new Date(def.last_fired_at).getTime());
       if (def.last_fire_attempted_at) candidates.push(new Date(def.last_fire_attempted_at).getTime());
       if (stateFire) candidates.push(new Date(stateFire).getTime());
-      const referenceMs = candidates.length > 0 ? Math.max(...candidates) : now;
+      const referenceMs =
+        candidates.length > 0 ? Math.max(...candidates) : fallbackAnchorMs(def, now);
 
       let nextFireAt = computeNextFireAt(def, referenceMs);
 

@@ -867,4 +867,88 @@ describe('CronScheduler', () => {
     expect(names).toContain('b');
     expect(names).not.toContain('c'); // disabled, not scheduled
   });
+
+  // -------------------------------------------------------------------------
+  // NEVER-FIRED ANCHOR (2026-08-01)
+  //
+  // A cron with no last_fired_at, no last_fire_attempted_at and no cron-state
+  // last_fire used to fall back to `now`, restarting its countdown on every
+  // daemon start. Any interval longer than the gap between daemon starts
+  // therefore never fired at all. Measured live: analyst/wip-aging-scan,
+  // enabled, "3d", created 2026-07-26, ZERO fires in 6.3 days, while its
+  // sibling autoresearch-pulse — also "3d" but anchored by a past fire — had
+  // fired 18 times.
+  //
+  // Self-reinforcing, which is why nobody caught it: one fire buys a permanent
+  // anchor, so the bug is invisible to every cron that works and total for
+  // every cron it touches. The population that could report it is exactly the
+  // population it silences.
+  //
+  // These four are a SET, not four independent cases. The first two prove the
+  // fix works; the last two prove it did not switch off something else.
+  // -------------------------------------------------------------------------
+
+  it('never-fired INTERVAL cron anchors to created_at, not now', async () => {
+    // Created 3 days ago with a 3d interval: it was due essentially now.
+    // Under the old `now` fallback, nextFireAt would be now + 3d and nothing
+    // fires. THIS IS THE TEST THAT GOES RED IF THE FALLBACK RETURNS TO now.
+    mockReadCrons.mockReturnValue([makeCron({
+      name: 'wip-aging-scan-like',
+      schedule: '3d',
+      created_at: new Date(Date.now() - 3 * 24 * 3600_000).toISOString(),
+    })]);
+    scheduler.start();
+
+    await vi.advanceTimersByTimeAsync(TICK * 2);
+    expect(fired.map(c => c.name)).toEqual(['wip-aging-scan-like']);
+  });
+
+  it('a far-past created_at still fires exactly ONCE, not once per missed window', async () => {
+    // 30 days of 3d windows is ten missed slots. The existing single-catch-up
+    // policy must clamp that to one — widening catch-up would turn this fix
+    // into a flood, which is the failure mode a naive anchor introduces.
+    mockReadCrons.mockReturnValue([makeCron({
+      name: 'ancient',
+      schedule: '3d',
+      created_at: new Date(Date.now() - 30 * 24 * 3600_000).toISOString(),
+    })]);
+    scheduler.start();
+
+    await vi.advanceTimersByTimeAsync(TICK * 6);
+    expect(fired.filter(c => c.name === 'ancient')).toHaveLength(1);
+  });
+
+  it('a freshly-created interval cron does NOT fire immediately', async () => {
+    // CONTROL. Without this, "anchor to created_at" could be satisfied by a
+    // fix that simply fires everything on load, and both tests above would
+    // still pass. A check that can only fire is as broken as one that cannot.
+    mockReadCrons.mockReturnValue([makeCron({
+      name: 'brand-new',
+      schedule: '3d',
+      created_at: new Date().toISOString(),
+    })]);
+    scheduler.start();
+
+    await vi.advanceTimersByTimeAsync(TICK * 4);
+    expect(fired).toHaveLength(0);
+  });
+
+  it('never-fired CRON-EXPRESSION cron is unaffected by created_at', async () => {
+    // A cron expression is ABSOLUTE — it names its own instants, so `now` is
+    // the correct reference and created_at must not be substituted. Feeding a
+    // 30-day-old created_at to "0 11 * * 0" resolves to a Sunday in the PAST,
+    // which would hit the catch-up branch and fire immediately on any day of
+    // the week. builder_1/sabotage-weekly is exactly this shape and is
+    // currently correct; the one-line version of this fix breaks it.
+    const farPast = new Date(Date.now() - 30 * 24 * 3600_000).toISOString();
+    mockReadCrons.mockReturnValue([makeCron({
+      name: 'weekly-expr',
+      schedule: '0 11 * * 0',
+      created_at: farPast,
+    })]);
+    scheduler.start();
+
+    await vi.advanceTimersByTimeAsync(TICK * 4);
+    expect(fired).toHaveLength(0);
+  });
 });
