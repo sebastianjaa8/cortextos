@@ -36,7 +36,18 @@
  *   node scripts/build-stamp.mjs --check [root]  compare stamp against current HEAD + working tree
  *   node scripts/build-stamp.mjs --self-test     prove every verdict can be reached
  *
- * Exit: 0 CURRENT · 2 STALE · 3 UNVERIFIABLE / could not run
+ * Exit: 0 CURRENT · 2 a real finding (STALE or UNVERIFIABLE) · 3 the check could not run
+ *
+ * UNVERIFIABLE IS 2, NOT 3, AND THIS FILE SAID 3 UNTIL 2026-08-01. guard-arm-check has always
+ * mapped it to 2 and reserved 3 for could-not-run, with a comment saying the two must not be
+ * conflated — so the conflation the comment forbids lived at the SEAM between the two files, where
+ * neither file's own reasoning was looking. Any caller applying the documented semantics to
+ * `--check` read an unprovable bundle as a broken check. 2 is the correct one on the merits: "we
+ * cannot establish what this bundle was built from" is a FINDING about the bundle, and 3 must stay
+ * reserved for "this tool did not work", or a wrong invocation reads as a real result again.
+ * STALE and UNVERIFIABLE now share exit 2 deliberately. They are distinguished by `status`, which
+ * is what guard-arm-check branches on; an exit code separates could-not-run from found-something,
+ * not one finding from another. (seb_boss, reading the ACTIVATION 4 diff.)
  */
 import { writeFileSync, readFileSync, existsSync, statSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
@@ -92,15 +103,15 @@ export function verdict({ stamp, current, bundleMtime }) {
   //
   // A stamp far newer than the artifact it describes was not written by the build that produced it.
   if (stamp && bundleMtime && new Date(stamp.builtAt) - bundleMtime > STAMP_LAG_TOLERANCE_MS) {
-    return { code: 3, status: 'UNVERIFIABLE',
+    return { code: 2, status: 'UNVERIFIABLE',
       detail: `stamp says ${stamp.builtAt} but the bundle's mtime is ${bundleMtime.toISOString()} — the stamp was written well after the bundle, so it was not produced by that build. Rebuild rather than re-stamping.` };
   }
   if (!stamp) {
-    return { code: 3, status: 'UNVERIFIABLE',
+    return { code: 2, status: 'UNVERIFIABLE',
       detail: 'no dist/.build-stamp — this bundle predates provenance stamping, or the build did not write one. Absence is NOT evidence the bundle is current.' };
   }
   if (stamp.dirtySrc) {
-    return { code: 3, status: 'UNVERIFIABLE',
+    return { code: 2, status: 'UNVERIFIABLE',
       detail: `bundle was built from a DIRTY src/ at ${stamp.builtAt}. The exact source is not recoverable from any commit, so currency cannot be established — rebuild from a clean tree to get a checkable answer.` };
   }
   if (stamp.head !== current.head) {
@@ -133,11 +144,11 @@ if (IS_ENTRY && process.argv[2] === '--self-test') {
     ['clean match',        { stamp: { head: H, dirtySrc: false, builtAt: 't' }, current: { head: H, dirtySrc: false } }, 0, 'CURRENT'],
     ['HEAD moved on',      { stamp: { head: H, dirtySrc: false, builtAt: 't' }, current: { head: H2, dirtySrc: false } }, 2, 'STALE'],
     ['uncommitted now',    { stamp: { head: H, dirtySrc: false, builtAt: 't' }, current: { head: H, dirtySrc: true } },  2, 'STALE'],
-    ['built from dirty',   { stamp: { head: H, dirtySrc: true,  builtAt: 't' }, current: { head: H, dirtySrc: false } }, 3, 'UNVERIFIABLE'],
-    ['no stamp',           { stamp: null, current: { head: H, dirtySrc: false } },                                       3, 'UNVERIFIABLE'],
+    ['built from dirty',   { stamp: { head: H, dirtySrc: true,  builtAt: 't' }, current: { head: H, dirtySrc: false } }, 2, 'UNVERIFIABLE'],
+    ['no stamp',           { stamp: null, current: { head: H, dirtySrc: false } },                                       2, 'UNVERIFIABLE'],
     // The hand-written-stamp footgun: stamp two hours newer than the bundle it claims to describe.
     ['stamp after build',  { stamp: { head: H, dirtySrc: false, builtAt: '2026-07-31T09:00:00Z' },
-                             current: { head: H, dirtySrc: false }, bundleMtime: new Date('2026-07-31T07:00:00Z') }, 3, 'UNVERIFIABLE'],
+                             current: { head: H, dirtySrc: false }, bundleMtime: new Date('2026-07-31T07:00:00Z') }, 2, 'UNVERIFIABLE'],
     // CONTROL: a stamp written BY the build sits within seconds of it and must stay CURRENT — a
     // lag check that rejects every stamp is as useless as one that rejects none.
     ['stamp from build',   { stamp: { head: H, dirtySrc: false, builtAt: '2026-07-31T07:00:03Z' },
@@ -154,8 +165,13 @@ if (IS_ENTRY && process.argv[2] === '--self-test') {
   // produce is dead code pretending to be a safety net.
   const reached = new Set(cases.map(([, i]) => verdict(i).status));
   const allThree = ['CURRENT', 'STALE', 'UNVERIFIABLE'].every(s => reached.has(s));
-  console.log(`\nself-test: ${pass}/${cases.length} cases, all three verdicts reachable: ${allThree}`);
-  process.exit(pass === cases.length && allThree ? 0 : 1);
+  // NO verdict may return 3. 3 means "this tool did not work" and verdict() only ever runs when it
+  // did. Asserted as an INVARIANT rather than left to the per-case codes above, because those pin
+  // the cases someone thought to write and this pins the boundary itself — the mapping drifted to 3
+  // once already and each individual case looked locally reasonable while it did.
+  const noThree = cases.every(([, i]) => verdict(i).code !== 3);
+  console.log(`\nself-test: ${pass}/${cases.length} cases, all three verdicts reachable: ${allThree}, no verdict returns 3: ${noThree}`);
+  process.exit(pass === cases.length && allThree && noThree ? 0 : 1);
 }
 
 const mode = IS_ENTRY ? process.argv[2] : null;

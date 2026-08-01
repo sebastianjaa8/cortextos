@@ -36,7 +36,10 @@
 //   node work/guard-arm-check.mjs              check the live daemon
 //   node work/guard-arm-check.mjs --self-test  prove the verdict logic can fire AND come back clean
 //
-// exit 0 CURRENT · 2 a real finding (stale bundle or stale daemon) · 3 could not run
+// exit 0 CURRENT · 2 a real finding (stale bundle, unprovable bundle, or stale daemon) · 3 the
+// check could not run. IDENTICAL TO scripts/build-stamp.mjs SINCE 2026-08-01 — it documented
+// UNVERIFIABLE as 3, this file mapped the same verdict to 2, and both headers claimed 3 meant
+// could-not-run. The conflation this file's comments forbid was living in the gap between the two.
 import { execSync } from 'node:child_process';
 import { statSync, existsSync, readFileSync } from 'node:fs';
 // The provenance logic lives in scripts/, not here. NOT because this file is untracked — I wrote
@@ -176,7 +179,14 @@ try {
   stamp = stampVerdict({
     stamp: existsSync(stampPath) ? JSON.parse(readFileSync(stampPath, 'utf-8')) : null,
     current: currentProvenance(REPO),
-    bundleMtime: existsSync(BUNDLE) ? statSync(BUNDLE).mtime : null,
+    // NOT a ternary. The `if (!existsSync(BUNDLE)) fail(...)` above already exited if it were
+    // missing, so the guard here was dead and the file read as if the same expression needed
+    // guarding in one place and not the other ten lines later. Measured before removing it, not
+    // reasoned: a scratch root with no dist/daemon.js exits 3 "COULD-NOT-RUN — no bundle at ...",
+    // and the same root WITH one gets all the way to a verdict. Both directions.
+    // AND THE UNGUARDED FORM IS THE SAFER ONE: a null here silently skips the stamp-lag check and
+    // returns a verdict anyway, so restoring the ternary buys a wrong answer instead of a crash.
+    bundleMtime: statSync(BUNDLE).mtime,
   });
 } catch (err) {
   // COULD-NOT-RUN, not UNVERIFIABLE. If the stamp reader itself throws, this check has no opinion —
