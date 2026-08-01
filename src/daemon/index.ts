@@ -265,6 +265,8 @@ function handleFatal(
 // lock.
 const DAEMON_LOCK_HEARTBEAT_MS = 30_000;
 const DAEMON_LOCK_STALE_MS = 90_000;
+export const PM2_SUPERVISOR_FENCE_INTERVAL_MS = 2_000;
+export const PM2_SUPERVISOR_FENCE_FAILURE_THRESHOLD = 3;
 
 export function acquireDaemonInstanceLock(ctxRoot: string): boolean {
   const lockRoot = join(ctxRoot, '.daemon-instance');
@@ -302,6 +304,7 @@ class Daemon {
   private ctxRoot: string;
   private lockHeld = false;
   private lockHeartbeat: NodeJS.Timeout | null = null;
+  private supervisorFence: NodeJS.Timeout | null = null;
 
   constructor() {
     this.instanceId = process.env.CTX_INSTANCE_ID || 'default';
@@ -350,7 +353,17 @@ class Daemon {
         return;
       }
 
-      if (pm2SupervisorOwnsCurrentProcess() !== false) return;
+    }, DAEMON_LOCK_HEARTBEAT_MS);
+    this.lockHeartbeat.unref();
+
+    let supervisorFenceFailures = 0;
+    this.supervisorFence = setInterval(() => {
+      if (pm2SupervisorOwnsCurrentProcess() !== false) {
+        supervisorFenceFailures = 0;
+        return;
+      }
+      supervisorFenceFailures += 1;
+      if (supervisorFenceFailures < PM2_SUPERVISOR_FENCE_FAILURE_THRESHOLD) return;
       if (fenceFailureHandled) return;
       fenceFailureHandled = true;
       handleFatal(
@@ -363,8 +376,8 @@ class Daemon {
         frameworkRoot,
         true,
       );
-    }, DAEMON_LOCK_HEARTBEAT_MS);
-    this.lockHeartbeat.unref();
+    }, PM2_SUPERVISOR_FENCE_INTERVAL_MS);
+    this.supervisorFence.unref();
     const pidFile = join(this.ctxRoot, 'daemon.pid');
     let exitCleanupRan = false;
     const cleanupForExit = () => {
@@ -373,6 +386,10 @@ class Daemon {
       if (this.lockHeartbeat) {
         clearInterval(this.lockHeartbeat);
         this.lockHeartbeat = null;
+      }
+      if (this.supervisorFence) {
+        clearInterval(this.supervisorFence);
+        this.supervisorFence = null;
       }
       try {
         if (this.ipcServer) this.ipcServer.stop();
@@ -505,22 +522,6 @@ class Daemon {
   }
 }
 
-// Exit code PM2 is configured to treat as terminal (`stop_exit_codes` in
-// ecosystem.config.js). A duplicate-daemon lock conflict is NOT a crash worth
-// retrying: another daemon holds the lock and is heartbeating it, so every
-// respawn dies the same way. min_uptime/max_restarts do not catch this —
-// startup lives well past min_uptime before reaching the lock check, so PM2
-// never marks the restarts unstable and the circuit breaker never trips
-// (measured 2026-08-01: 20 restarts in 15 min, ~45s apart, unstable_restarts=0,
-// cumulative counter at 1168). A genuinely dead holder is already handled
-// upstream: acquireLock takes a lock idle past DAEMON_LOCK_STALE_MS, so
-// reaching this path means the holder is alive.
-export const DAEMON_EXIT_LOCK_CONFLICT = 2;
-
-export function daemonFatalExitCode(errMessage: string): number {
-  return /already running/i.test(errMessage) ? DAEMON_EXIT_LOCK_CONFLICT : 1;
-}
-
 // Only auto-start when run directly (e.g. `node dist/daemon.js` or via PM2).
 // Guarding with require.main prevents accidental daemon spawn when the module
 // is require()'d for testing or class imports — which would start a full daemon
@@ -530,7 +531,6 @@ if (require.main === module) {
   const daemon = new Daemon();
   daemon.start().catch(err => {
     console.error('[daemon] Fatal error:', err);
-    const exitCode = daemonFatalExitCode(err instanceof Error ? err.message : String(err));
 
     // Startup failures must feed the same crash-history + operator-alert
     // machinery as runtime crashes. Before this, a duplicate-daemon lock
@@ -548,7 +548,7 @@ if (require.main === module) {
       const ctxRoot = join(homedir(), '.cortextos', instanceId);
       const frameworkRoot = process.env.CTX_FRAMEWORK_ROOT || '';
       const errStr = err instanceof Error ? err.message : String(err);
-      const isLockConflict = exitCode === DAEMON_EXIT_LOCK_CONFLICT;
+      const isLockConflict = /already running/i.test(errStr);
       const history = recordCrash(ctxRoot, errStr);
       if (shouldSendCrashLoopAlert(history)) {
         const recent = countRecentCrashes(history);
@@ -565,7 +565,7 @@ if (require.main === module) {
       }
     } catch { /* alerting is best-effort — never mask the original failure */ }
 
-    process.exit(exitCode);
+    process.exit(1);
   });
 }
 

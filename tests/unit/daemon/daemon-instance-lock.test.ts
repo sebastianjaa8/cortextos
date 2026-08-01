@@ -32,7 +32,11 @@ describe('daemon instance lock', () => {
     const ownsCurrentProcess = daemonModule.pm2SupervisorOwnsCurrentProcess as
       | ((env: NodeJS.ProcessEnv, pid: number) => boolean | undefined)
       | undefined;
+    const fenceIntervalMs = daemonModule.PM2_SUPERVISOR_FENCE_INTERVAL_MS as number;
+    const failureThreshold = daemonModule.PM2_SUPERVISOR_FENCE_FAILURE_THRESHOLD as number;
     expect(ownsCurrentProcess).toBeTypeOf('function');
+    expect(fenceIntervalMs).toBe(2_000);
+    expect(fenceIntervalMs * failureThreshold).toBeLessThanOrEqual(6_000);
 
     const root = mkdtempSync(join(tmpdir(), 'cortextos-pm2-fence-'));
     roots.push(root);
@@ -48,18 +52,5 @@ describe('daemon instance lock', () => {
     expect(ownsCurrentProcess!({ pm_pid_path: pidPath }, 1234)).toBe(false);
     expect(ownsCurrentProcess!({ pm_pid_path: join(root, 'missing.pid') }, 1234)).toBe(false);
     expect(ownsCurrentProcess!({}, 1234)).toBeUndefined();
-  });
-});
-
-describe('daemon fatal exit code', () => {
-  it('maps a duplicate-daemon lock conflict to the PM2 stop_exit_codes value', () => {
-    const exitCodeFor = daemonModule.daemonFatalExitCode as ((msg: string) => number);
-    const terminal = daemonModule.DAEMON_EXIT_LOCK_CONFLICT as number;
-
-    // Must match ecosystem.config.js stop_exit_codes, or PM2 respawns forever.
-    expect(terminal).toBe(2);
-    expect(exitCodeFor('Another cortextOS daemon is already running for instance "default"')).toBe(terminal);
-    // Every other startup failure stays retryable.
-    expect(exitCodeFor('ECONNREFUSED talking to Telegram')).toBe(1);
   });
 });

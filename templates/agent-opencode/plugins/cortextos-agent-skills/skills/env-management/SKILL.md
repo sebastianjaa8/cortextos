@@ -95,7 +95,8 @@ Is this an agent-specific key (BOT_TOKEN, CHAT_ID, OAuth token)?
   → Update agents/{agent}/.env → hard-restart THAT AGENT ONLY
 
 Is this ANTHROPIC_API_KEY?
-  → Update ~/.zshrc or ~/.bashrc → restart the daemon via PM2
+  → Update ~/.zshrc or ~/.bashrc → restart safely with `cortextos restart --daemon --instance default`
+  → On Windows, direct `pm2 restart` is forbidden because it can orphan the daemon generation
   → Do NOT store in any .env file
 ```
 
