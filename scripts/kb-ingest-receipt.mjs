@@ -238,8 +238,14 @@ try {
     agent, status, tokens,
     // Sizes travel with the receipt so the growth curve is readable from the
     // receipts alone, without re-stat'ing files that have since changed.
-    bytes: [...paths, ...presentOptional].reduce((n, p) => n + (existsSync(p) ? statSync(p).size : 0), 0),
-    paths, skippedOptional,
+    bytes: ingestPaths.reduce((n, p) => n + (existsSync(p) ? statSync(p).size : 0), 0),
+    // `paths` is WHAT WAS ACTUALLY SENT, not what was asked for. The first
+    // version recorded only the required paths, so seb_boss's receipt read
+    // paths:["./MEMORY.md"] while bytes proved a 135KB daily file had also been
+    // ingested — the receipt under-describing its own coverage, in the file
+    // whose entire job is describing coverage. Reading `paths` would have
+    // understated what was indexed; only the byte count disagreed.
+    paths: ingestPaths, skippedOptional,
   }) + '\n');
 } catch (err) {
   console.log(`NOTE: verdict stands but the receipt could not be written (${err.message}).`);
