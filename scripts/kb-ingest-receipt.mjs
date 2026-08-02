@@ -285,6 +285,34 @@ function selfTest() {
       { status: 'INGESTED', fingerprint: [{ path: 'a', sha256: 'x' }] },
       [{ path: 'a', sha256: 'x' }, { path: 'NEW.md', sha256: 'z' }]).changed[0] === 'NEW.md'],
     // An unreadable file hashes to null. Two nulls must NOT compare equal and skip.
+    // FAIL-SAFE UNDER A DEGRADED PRIOR RECEIPT. These pin the property the fleet rollout was
+    // authorised on: every way the prior receipt can be damaged — rotated file, truncated jsonl,
+    // lost or empty fingerprint — must force a FULL ingest, never a silent skip. The failure
+    // direction is a redundant re-embed (costs tokens) rather than a stale index (costs
+    // correctness), which is why a lane that skips for TEN DAYS is not more dangerous than one
+    // that skips for an hour, only more expensive to be wrong about. atlas is 230h stale; the
+    // canary only ever tested a 0-hour interval.
+    ['prior INGESTED but fingerprint MISSING -> full ingest', () => {
+      const now = [{ path: 'a', sha256: 'x' }, { path: 'b', sha256: 'y' }];
+      const r = partitionChanged({ status: 'INGESTED' }, now);
+      return r.changed.length === 2 && r.unchangedPaths.length === 0;
+    }],
+    ['prior INGESTED but fingerprint null -> full ingest', () => {
+      const now = [{ path: 'a', sha256: 'x' }];
+      const r = partitionChanged({ status: 'INGESTED', fingerprint: null }, now);
+      return r.changed.length === 1 && r.unchangedPaths.length === 0;
+    }],
+    ['prior INGESTED with an EMPTY fingerprint -> full ingest', () => {
+      const now = [{ path: 'a', sha256: 'x' }];
+      const r = partitionChanged({ status: 'INGESTED', fingerprint: [] }, now);
+      return r.changed.length === 1 && r.unchangedPaths.length === 0;
+    }],
+    // THE CONTROL. Without it the three above are satisfiable by a partitioner that never skips
+    // anything, which would pass fail-safe and defeat the entire feature.
+    ['CONTROL: an intact prior with identical hashes STILL skips', () => {
+      const now = [{ path: 'a', sha256: 'x' }];
+      return partitionChanged({ status: 'INGESTED', fingerprint: now }, now).changed.length === 0;
+    }],
     ['a null hash never permits a skip', () => partitionChanged(
       { status: 'INGESTED', fingerprint: [{ path: 'a', sha256: null }] },
       [{ path: 'a', sha256: null }]).changed.length === 1],
