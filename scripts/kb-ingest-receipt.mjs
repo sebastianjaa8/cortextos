@@ -97,10 +97,49 @@ export function isUnchanged(prev, now) {
 }
 
 /**
+ * Split the inputs into the ones that actually changed and the ones that did not.
+ *
+ * PER FILE, NOT ALL-OR-NOTHING, and the difference is the whole value of this feature. The first
+ * version compared the WHOLE fingerprint as one boolean, which on the heartbeat path can never be
+ * true: HEARTBEAT.md step 5 writes the daily memory file and step 10 ingests, in that order, so the
+ * daily file has ALWAYS just changed. One moved file dragged the other into a full re-embed.
+ *
+ * MEASURED on builder_1 2026-08-01: MEMORY.md 173,278 bytes unchanged for six hours, daily 192,519
+ * bytes rewritten every cycle, 0.2585 tokens/byte. So 47% OF EVERY FIRE was re-embedding a file
+ * nobody had touched, and the all-or-nothing skip saved NONE of it.
+ *
+ * The prior fingerprint is already a per-path list, so the data was always there — it was being
+ * collapsed to one comparison at the point of use.
+ *
+ * THE DAILY FILE IS DIRTY ON EVERY FIRE FOR REASONS THAT DIFFER PER AGENT — DO NOT "FIX" THIS BY
+ * REORDERING ANYONE'S HEARTBEAT STEPS. builder_1's HEARTBEAT.md has an explicit step 5 that writes
+ * daily memory before step 10 ingests. seb_boss has NO such step and writes daily memory on decision
+ * triggers under Context-Save Discipline — and measured the same day, his MEMORY.md had been
+ * unchanged for FIFTEEN hours while his daily file moved constantly. Two different causes, one
+ * effect, worse ratio on his lane. The staleness is a property of what the files ARE, not of any
+ * step order, so per-file partitioning is the fix and step reordering is not.
+ */
+export function partitionChanged(prev, now) {
+  const usable = prev && ["INGESTED", "UNCHANGED"].includes(prev.status) ? prev : null;
+  // A prior FAILURE re-ingests everything, same reasoning as isUnchanged: unchanged inputs after a
+  // failed run are exactly when to retry, and a partial retry would leave the failure half-standing.
+  if (!usable) return { changed: now.map((f) => f.path), unchangedPaths: [] };
+  const before = new Map((usable.fingerprint || []).map((f) => [f.path, f.sha256]));
+  const changed = [];
+  const unchangedPaths = [];
+  for (const f of now) {
+    // A path absent from the prior receipt is NEW, therefore changed. Never skip on a missing entry.
+    if (before.has(f.path) && before.get(f.path) === f.sha256 && f.sha256 !== null) unchangedPaths.push(f.path);
+    else changed.push(f.path);
+  }
+  return { changed, unchangedPaths };
+}
+
+/**
  * Pure verdict logic so --self-test can drive it without touching the CLI.
  * @returns {{code:0|2|3, status:string, detail:string}}
  */
-export function verdict({ missingPaths, tokens, ingestFailed, skippedOptional = [], unchanged = false }) {
+export function verdict({ missingPaths, tokens, ingestFailed, skippedOptional = [], unchanged = false, unchangedPaths = [] }) {
   // AN ABSENT OPTIONAL PATH IS NOT A FINDING, AND IT IS NOT SILENT EITHER.
   // seb_boss caught this before it did damage: `./memory/<today>.md` does not
   // exist until something writes memory that day, so treating every path as
@@ -158,7 +197,13 @@ export function verdict({ missingPaths, tokens, ingestFailed, skippedOptional = 
     return { code: 2, status: 'ZERO-TOKENS',
       detail: `the ingest completed and embedded NOTHING. The step ran and the memory store did not change.${skipNote}` };
   }
-  return { code: 0, status: 'INGESTED', detail: `${tokens} embedding tokens.${skipNote}` };
+  // NAMES WHAT IT SKIPPED. "96,466 tokens" and "49,766 tokens, MEMORY.md skipped" are different
+  // facts about the same success, and a reader comparing two receipts needs to know which happened
+  // before concluding the cost fell.
+  const partNote = unchangedPaths.length
+    ? ` Skipped ${unchangedPaths.length} unchanged input(s): ${unchangedPaths.join(', ')}.`
+    : '';
+  return { code: 0, status: 'INGESTED', detail: `${tokens} embedding tokens.${skipNote}${partNote}` };
 }
 
 function selfTest() {
@@ -209,6 +254,59 @@ function selfTest() {
                   [{ path: 'a', sha256: 'y' }]) === false],
     ['no prior receipt never permits a skip (first run must actually run)', () =>
       isUnchanged(null, [{ path: 'a', sha256: 'x' }]) === false],
+
+    // --- PER-FILE partitioning. The all-or-nothing version could never fire on a heartbeat,
+    // because step 5 writes the daily file and step 10 ingests, in that order. These are the
+    // cases that distinguish "skips the right subset" from "skips nothing" and from "skips too much".
+    ['THE HEARTBEAT SHAPE: one changed, one not -> ingest only the changed one', () => {
+      const r = partitionChanged(
+        { status: 'INGESTED', fingerprint: [{ path: 'MEMORY.md', sha256: 'a' }, { path: 'daily.md', sha256: 'b' }] },
+        [{ path: 'MEMORY.md', sha256: 'a' }, { path: 'daily.md', sha256: 'CHANGED' }]);
+      return r.changed.length === 1 && r.changed[0] === 'daily.md' && r.unchangedPaths[0] === 'MEMORY.md';
+    }],
+    ['all unchanged -> nothing to ingest', () => partitionChanged(
+      { status: 'INGESTED', fingerprint: [{ path: 'a', sha256: 'x' }] },
+      [{ path: 'a', sha256: 'x' }]).changed.length === 0],
+    ['no prior receipt -> EVERYTHING is changed, nothing skipped', () => {
+      const r = partitionChanged(null, [{ path: 'a', sha256: 'x' }, { path: 'b', sha256: 'y' }]);
+      return r.changed.length === 2 && r.unchangedPaths.length === 0;
+    }],
+    // A partial retry after a failure would leave the failure half-standing, so a bad prior status
+    // must re-ingest EVERY input, not just the ones that moved.
+    ['a prior FAILURE re-ingests everything, not just the changed subset', () => {
+      const r = partitionChanged(
+        { status: 'ZERO-TOKENS', fingerprint: [{ path: 'a', sha256: 'x' }] },
+        [{ path: 'a', sha256: 'x' }]);
+      return r.changed.length === 1 && r.unchangedPaths.length === 0;
+    }],
+    // A path the prior receipt never saw is NEW. Skipping on a missing entry would silently never
+    // index a newly-added input — the never-wired failure this whole file exists to surface.
+    ['a path absent from the prior receipt counts as CHANGED', () => partitionChanged(
+      { status: 'INGESTED', fingerprint: [{ path: 'a', sha256: 'x' }] },
+      [{ path: 'a', sha256: 'x' }, { path: 'NEW.md', sha256: 'z' }]).changed[0] === 'NEW.md'],
+    // An unreadable file hashes to null. Two nulls must NOT compare equal and skip.
+    ['a null hash never permits a skip', () => partitionChanged(
+      { status: 'INGESTED', fingerprint: [{ path: 'a', sha256: null }] },
+      [{ path: 'a', sha256: null }]).changed.length === 1],
+    // seb_boss's case 3, and it FIRES TONIGHT rather than hypothetically — it was 00:00Z when he
+    // raised it. At UTC rollover the daily path changes name and does not exist, so it is
+    // skipped-OPTIONAL, while MEMORY.md is unchanged and is skipped-UNCHANGED. Every input skipped,
+    // zero tokens — and that must land in UNCHANGED (healthy) and NOT in ZERO-TOKENS (a finding).
+    ['UTC ROLLOVER: daily absent + MEMORY.md unchanged -> UNCHANGED, not ZERO-TOKENS', () => {
+      const prev = { status: 'INGESTED', fingerprint: [
+        { path: './MEMORY.md', sha256: 'a' }, { path: './memory/2026-08-01.md', sha256: 'b' }] };
+      // the new day: only MEMORY.md is present, the daily path has changed name and is absent
+      const now = [{ path: './MEMORY.md', sha256: 'a' }];
+      const part = partitionChanged(prev, now);
+      const v = verdict({ missingPaths: [], tokens: null, ingestFailed: null,
+                          skippedOptional: ['./memory/2026-08-02.md'],
+                          unchanged: part.changed.length === 0,
+                          unchangedPaths: part.unchangedPaths });
+      return part.changed.length === 0 && v.status === 'UNCHANGED' && v.code === 0;
+    }],
+    ['a partial skip NAMES what it skipped', () =>
+      verdict({ missingPaths: [], tokens: 500, ingestFailed: null, unchangedPaths: ['MEMORY.md'] })
+        .detail.includes('MEMORY.md')],
     // Asserting only the CODE would pass while the receipt says nothing useful,
     // which is the failure this file already made once. The reason must survive
     // into the detail, or COULD-NOT-RUN is a dead end for whoever reads it.
@@ -309,7 +407,12 @@ try {
 const SKIP_ENABLED = process.env.FT_KB_SKIP_UNCHANGED === '1';
 
 const nowPrint = missingPaths.length ? null : fingerprint(ingestPaths);
-const unchanged = SKIP_ENABLED && nowPrint !== null && isUnchanged(prevReceipt, nowPrint);
+// PER-FILE. `unchanged` is now "every input was unchanged", and the far more common case on a
+// heartbeat is SOME unchanged — MEMORY.md sits still while the daily file moves every cycle.
+const part = SKIP_ENABLED && nowPrint !== null
+  ? partitionChanged(prevReceipt, nowPrint)
+  : { changed: ingestPaths, unchangedPaths: [] };
+const unchanged = SKIP_ENABLED && nowPrint !== null && part.changed.length === 0;
 
 let stdout = '';
 let ingestFailed = null;
@@ -320,7 +423,7 @@ if (!missingPaths.length && !unchanged) {
     try {
       stdout = execFileSync(
         process.execPath,
-        [CLI, 'bus', 'kb-ingest', ...ingestPaths, '--org', org, '--agent', agent, '--scope', 'private', '--force'],
+        [CLI, 'bus', 'kb-ingest', ...part.changed, '--org', org, '--agent', agent, '--scope', 'private', '--force'],
         { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 },
       );
     } catch (err) {
@@ -331,7 +434,7 @@ if (!missingPaths.length && !unchanged) {
 }
 
 const tokens = parseEmbeddingTokens(stdout);
-const { code, status, detail } = verdict({ missingPaths, tokens, ingestFailed, skippedOptional, unchanged });
+const { code, status, detail } = verdict({ missingPaths, tokens, ingestFailed, skippedOptional, unchanged, unchangedPaths: part.unchangedPaths });
 
 // THE RECEIPT IS WRITTEN ON EVERY OUTCOME, INCLUDING THE BAD ONES. A receipt
 // that only appears on success cannot distinguish "failed" from "never ran",
@@ -356,6 +459,9 @@ try {
     // The fingerprint is what makes the NEXT run's skip decision possible. Without it in the
     // receipt there is no prior state to compare against and every run re-embeds forever.
     fingerprint: nowPrint,
+    // Which inputs were actually sent, so a later reader can tell a cheap fire from a full one.
+    ingested: unchanged ? [] : part.changed,
+    skippedUnchanged: part.unchangedPaths,
     // Carried forward on a skip so the receipt line still says how much is indexed. A receipt that
     // reads "tokens: null" on every quiet cycle loses the number the whole file exists to report.
     tokens_carried: unchanged ? (prevReceipt && (prevReceipt.tokens ?? prevReceipt.tokens_carried)) : undefined,
