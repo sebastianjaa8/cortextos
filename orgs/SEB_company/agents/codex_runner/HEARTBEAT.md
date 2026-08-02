@@ -101,9 +101,43 @@ Patterns / user preferences / system behaviors learned this cycle → append.
 
 ## Step 10: KB re-ingest
 ```bash
-cortextos bus kb-ingest ./MEMORY.md ./memory/$(date -u +%Y-%m-%d).md \
-  --org $CTX_ORG --agent $CTX_AGENT_NAME --scope private --force
+node C:/Users/Sebas/cortextos/scripts/kb-ingest-receipt.mjs \
+  --agent $CTX_AGENT_NAME --org $CTX_ORG ./MEMORY.md \
+  --optional ./memory/$(date -u +%Y-%m-%d).md
 ```
+
+**Wrapped 2026-08-01 (builder_1, task_1785615335534_46337286, authorised by seb_boss, announced on the
+bus before landing). This step used to call `cortextos bus kb-ingest` directly. Three things changed,
+each because the raw form could not tell you it had failed.**
+
+1. **The daily file is now `--optional`.** It used to be REQUIRED — and `cortextos bus kb-ingest`
+   EXITS 0 ON A PATH THAT DOES NOT EXIST while reporting 0 chunks. Your daily memory file does not
+   exist until something writes memory that day, so on every cycle before that, this step ingested
+   LESS THAN IT CLAIMED and reported success. Verified, not theorised. Absent optional paths are now
+   SKIPPED AND NAMED in the verdict rather than silently dropped.
+2. **Every run writes a receipt** to `${CTX_ROOT}/state/$CTX_AGENT_NAME/.kb-ingest-receipts.jsonl`
+   with the embedding-token count and the paths ACTUALLY SENT, on failure as well as success. A
+   receipt written only on success cannot distinguish "failed" from "never ran", which is the pair
+   that hid this. Before today this step had no receipt at all.
+3. **Give it a generous timeout, 600000ms.** The usual harness default is 120000ms. A ~350KB ingest
+   takes ~204s and is killed at 120s with exit 143 (128+15, SIGTERM), which reads exactly like the
+   ingest failing when it is the ingest being STOPPED. Opposite problems, same transcript.
+
+**Read the VERDICT line, not the exit code alone.** `INGESTED` (0) means real embedding tokens were
+spent — a success.
+- `UNCHANGED` (exit 0) — your inputs are byte-identical (sha256) to what the last receipt recorded,
+  so nothing was re-embedded. ALSO A SUCCESS. The previous receipt still describes what is indexed.
+  Added 2026-08-01 (commit a96490dc): the wrapper hardcoded `--force` and re-embedded unchanged files
+  on every fire — 96,466 tokens and 199s per cycle for builder_1, 12 cycles a day. We did NOT simply
+  drop the flag: without it kb-ingest prints "Ingested 0 new chunk(s) / Tokens: 0" for an
+  already-indexed file, which this wrapper correctly calls ZERO-TOKENS, a FINDING — so dropping it
+  would have turned every quiet cycle red on all 15 agents. It skips the CALL instead of weakening
+  the check. CURRENTLY GATED OFF behind `FT_KB_SKIP_UNCHANGED`, so you will keep seeing INGESTED
+  until a canary on builder_1 proves UNCHANGED renders correctly in two real cycles.
+
+`ZERO-TOKENS` / `NO-TOKEN-LINE` / `PATH-MISSING` (2) are real findings —
+report the VERDICT line to seb_boss. `COULD-NOT-RUN` (3) means the wrapper is broken, not your memory.
+
 
 > There is no `--collection` flag. This file previously documented
 > `--collection memory-$CTX_AGENT_NAME`, which the CLI rejects outright with
