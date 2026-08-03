@@ -374,6 +374,16 @@ function selfTest() {
 if (process.argv.includes('--self-test')) selfTest();
 
 // ---------------------------------------------------------------------------
+// STARTED-AT IS CAPTURED HERE, BEFORE ANY WORK, NOT NEAR THE RECEIPT WRITE.
+// WHY IT EXISTS: analyst pre-registered at 2026-08-02 14:0xZ that skip-heavy runs finish FASTER
+// than ingest-heavy ones. The receipt recorded COMPLETION TIME ONLY, so a member that finished
+// last may simply have STARTED last — there is no arrangement of completion-only data that answers
+// a duration question, and more spikes would not have changed that. The prediction was relabelled
+// UNRESOLVABLE-BY-INSTRUMENT rather than logged as weak evidence. One field makes it testable.
+// PLACED BEFORE ARG PARSING ON PURPOSE: a start captured later would silently exclude whatever ran
+// before it, which is the same under-reporting the receipt exists to prevent.
+const startedAt = new Date().toISOString();
+
 const argv = process.argv.slice(2);
 const flag = (name) => {
   const i = argv.indexOf(name);
@@ -472,7 +482,13 @@ const receipt = `${root.replace(/\\/g, '/')}/state/${agent}/.kb-ingest-receipts.
 try {
   mkdirSync(dirname(receipt), { recursive: true });
   appendFileSync(receipt, JSON.stringify({
+    // ts is COMPLETION. startedAt is when this process began, captured before arg parsing.
+    // durationMs is redundant with the pair ON PURPOSE: a reader gets the answer without a
+    // subtraction, and a mismatch between durationMs and (ts - startedAt) means the receipt is
+    // internally inconsistent, which is a defect no single field could reveal.
     ts: new Date().toISOString(),
+    startedAt,
+    durationMs: Date.now() - Date.parse(startedAt),
     agent, status, tokens,
     // Sizes travel with the receipt so the growth curve is readable from the
     // receipts alone, without re-stat'ing files that have since changed.

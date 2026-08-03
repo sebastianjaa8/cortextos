@@ -52,7 +52,7 @@ Ref: `plugins/cortextos-agent-skills/skills/tasks/SKILL.md`
 cortextos bus list-tasks --agent $CTX_AGENT_NAME --status pending
 cortextos bus list-tasks --agent $CTX_AGENT_NAME --status in_progress
 ```
-- Pending → pick highest priority
+- Pending → before starting, confirm it is not completed work lacking closure; if completed, close it with durable evidence, otherwise pick highest priority
 - in_progress >2h → complete OR update with note
 - No tasks → check GOALS.md → message orchestrator
 
@@ -101,7 +101,8 @@ Patterns / user preferences / system behaviors learned this cycle → append.
 
 ## Step 10: KB re-ingest
 ```bash
-node C:/Users/Sebas/cortextos/scripts/kb-ingest-receipt.mjs \
+FT_KB_SKIP_UNCHANGED=1 \
+  node C:/Users/Sebas/cortextos/scripts/kb-ingest-receipt.mjs \
   --agent $CTX_AGENT_NAME --org $CTX_ORG ./MEMORY.md \
   --optional ./memory/$(date -u +%Y-%m-%d).md
 ```
@@ -132,8 +133,10 @@ spent — a success.
   drop the flag: without it kb-ingest prints "Ingested 0 new chunk(s) / Tokens: 0" for an
   already-indexed file, which this wrapper correctly calls ZERO-TOKENS, a FINDING — so dropping it
   would have turned every quiet cycle red on all 15 agents. It skips the CALL instead of weakening
-  the check. CURRENTLY GATED OFF behind `FT_KB_SKIP_UNCHANGED`, so you will keep seeing INGESTED
-  until a canary on builder_1 proves UNCHANGED renders correctly in two real cycles.
+  the check. ACTIVE SINCE 2026-08-02 on all 15 agents: the step-10 line sets FT_KB_SKIP_UNCHANGED=1,
+  so an unchanged file is skipped and the wrapper renders UNCHANGED with zero embedding tokens.
+  UNCHANGED IS A SUCCESS VERDICT, NOT A FINDING. The builder_1 canary passed both real cycles before
+  the fleet rollout; if you see INGESTED for a file you did not edit, that is the finding.
 
 `ZERO-TOKENS` / `NO-TOKEN-LINE` / `PATH-MISSING` (2) are real findings —
 report the VERDICT line to seb_boss. `COULD-NOT-RUN` (3) means the wrapper is broken, not your memory.

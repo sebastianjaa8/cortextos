@@ -151,6 +151,54 @@ function warnsAboutIt(line) {
 // Prose denials for direction (b).
 const DENY = /\b(cannot|can't|no way to|there is no|unable to|not possible|only exposes|does not support|has no|impossible to)\b/i;
 
+// ---- --self-test: prove the splitter can still FAIL, on demand, without a scan ----
+// WHY IT EXISTS: guard-arm-check, build-stamp and kb-ingest-receipt each carry a --self-test with
+// negative fixtures. This script did not, so the only evidence it worked was its own green output —
+// and green output is exactly what a broken splitter produces.
+// THE FIXTURE IS THE v1 REGRESSION: running WARNS_RE over the whole line let a flag whose NAME held
+// a warning word classify its own use as a warning. Two identical prose lines, opposite verdicts,
+// and a real documented --dead-letter would have vanished from direction (a) in silence.
+// IT REPORTS BOTH DIRECTIONS ON PURPOSE. A splitter that always says WARNING is as broken as one
+// that never does, and only the second failure is visible in a normal scan.
+if (process.argv.includes('--self-test')) {
+  const cases = [
+    ['plain use of a bad flag is NOT a warning', 'Run `cortextos bus update-task <id> --plainflag-abc123` to set it.', false],
+    ['identifier CONTAINING a warning word is still NOT a warning', 'Run `cortextos bus update-task <id> --nonexistent-flag-abc123` to set it.', false],
+    ['kebab identifier holding a warning word is NOT a warning', 'Use `cortextos bus send-message --dead-letter-queue x`.', false],
+    ['warning word only inside a code span does NOT count', 'See `--removed` in the table above.', false],
+    ['bare flag outside spans is stripped before matching', 'Pass --nonexistent to the runner.', false],
+    ['real prose warning IS a warning', 'The frobnicate option does not exist; do not use it.', true],
+    ['real prose warning, second vocabulary', 'That command was removed and now fails loudly.', true],
+    ['prose warning survives an adjacent code span', 'The `--frob` flag is not a flag; it never existed.', true],
+  ];
+  let pass = 0;
+  const fail = [];
+  for (const [label, line, want] of cases) {
+    const got = warnsAboutIt(line);
+    if (got === want) { pass += 1; continue; }
+    fail.push([label, line, want, got]);
+  }
+  const mustNot = cases.filter((c) => c[2] === false).length;
+  const must = cases.filter((c) => c[2] === true).length;
+  console.log('cli-doc-drift --self-test: ' + pass + '/' + cases.length + '  (' + mustNot + ' must-NOT-warn, ' + must + ' must-warn)');
+  if (fail.length) {
+    console.log('FAILURES:');
+    for (const [label, line, want, got] of fail) {
+      console.log('  ' + label);
+      console.log('    line: ' + line);
+      console.log('    want ' + want + ', got ' + got);
+    }
+    console.log('');
+    console.log('A splitter that cannot separate the first two cases is the v1 defect returning:');
+    console.log('they are the SAME PROSE and differ only in an identifier.');
+    process.exit(2);
+  }
+  console.log('BOUNDARY: this proves warnsAboutIt() separates identifiers from commentary on 8 cases.');
+  console.log('It does NOT test directions (a), (b) or (c), the invocation predicate, or the coverage');
+  console.log('count. Those still have no on-demand floor. Treat a clean run as a floor, not a ceiling.');
+  process.exit(0);
+}
+
 const findings = { a: [], b: [], ambiguous: [] };
 
 for (const file of files) {
