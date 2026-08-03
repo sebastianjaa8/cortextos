@@ -25,6 +25,12 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/_ctx-env.sh"
 
+# Paths below get embedded into python3 -c heredocs. Bash and native-Windows
+# python disagree on path form (/c/Users/... vs C:/Users/...) — see
+# scripts/pathform.py for the incident record. Resolve through it so the
+# embedded literal is a form python's own open()/os.path.exists() can read.
+PATHFORM_PY="$SCRIPT_DIR/../scripts/pathform.py"
+
 # ── Defaults ────────────────────────────────────────────────────────────────
 WARN_7DAY=80
 WARN_5H=90
@@ -54,6 +60,7 @@ _codex_wham_usage() {
   local cache_ttl=300  # 5 minutes
 
   [[ -f "$auth_file" ]] || return 1
+  auth_file=$(python3 "$PATHFORM_PY" "$auth_file") || return 1
 
   # Return cached result if fresh
   if [[ "$FORCE" == "false" && -f "$cache_file" ]]; then
@@ -116,6 +123,10 @@ _codex_json() {
   local auth_file="$HOME/.codex/auth.json"
   local db_file="$HOME/.codex/logs_2.sqlite"
   [[ -f "$auth_file" ]] || { echo '{"error":"~/.codex/auth.json not found"}'; return; }
+  auth_file=$(python3 "$PATHFORM_PY" "$auth_file") || { echo '{"error":"pathform could not resolve auth_file"}'; return; }
+  if [[ -f "$db_file" ]]; then
+    db_file=$(python3 "$PATHFORM_PY" "$db_file") || true
+  fi
 
   local wham_json=""
   wham_json=$(_codex_wham_usage 2>/dev/null) || true
