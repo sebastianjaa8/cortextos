@@ -32,7 +32,7 @@ vi.mock('../../../src/daemon/cron-snapshot.js', async (importOriginal) => {
   };
 });
 
-import { detectConfigCronDrift, detectMissingMigrationMarker, detectScheduleContradictsPrompt, formatDriftFindings, statedTimeCoverage, sweepConfigCronDrift, listExcludedRetiredAgents, wipeConditionArmed } from '../../../src/daemon/cron-drift.js';
+import { detectConfigCronDrift, detectMissingMigrationMarker, detectScheduleContradictsPrompt, formatDriftFindings, countActionableFindings, statedTimeCoverage, sweepConfigCronDrift, listExcludedRetiredAgents, wipeConditionArmed } from '../../../src/daemon/cron-drift.js';
 import type { CronDriftFinding } from '../../../src/daemon/cron-drift.js';
 import { migrateCronsForAgent } from '../../../src/daemon/cron-migration.js';
 import { CRONS_DIRECTORY } from '../../../src/bus/crons-schema.js';
@@ -589,6 +589,47 @@ describe('formatDriftFindings', () => {
     expect(formatDriftFindings([])).toBe(
       'config.json and the live scheduler agree everywhere they can be compared.',
     );
+  });
+});
+
+/**
+ * ADDED 2026-08-04 (seb_boss): the --notify bus message headline used raw findings.length, so a run
+ * with 22 prompt-differs and nothing else produced "22 edit(s) not in effect" — an alarm headline
+ * immediately contradicted by formatDriftFindings's own body, which already demotes prompt-differs
+ * to "the norm, not an event". This is the single source of truth both the headline and the report
+ * body now share, so they cannot say opposite things again.
+ */
+describe('countActionableFindings', () => {
+  const f = (over: Partial<CronDriftFinding>): CronDriftFinding => ({
+    agent: 'someagent',
+    cron: 'somecron',
+    kind: 'prompt-differs',
+    configValue: '100 chars',
+    liveValue: '200 chars',
+    ...over,
+  });
+
+  it('is zero when every finding is prompt-differs — the exact shape that triggered this fix', () => {
+    const findings = [f({}), f({ cron: 'b' }), f({ cron: 'c' })];
+    expect(countActionableFindings(findings)).toBe(0);
+  });
+
+  it('counts missing-live as actionable', () => {
+    const findings = [f({ kind: 'missing-live', liveValue: '(absent)' }), f({ cron: 'b' })];
+    expect(countActionableFindings(findings)).toBe(1);
+  });
+
+  it('counts marker-missing and interval-mismatch as actionable alongside prompt-differs', () => {
+    const findings = [
+      f({ kind: 'marker-missing', cron: '(agent-level)' }),
+      f({ kind: 'interval-mismatch' }),
+      f({ cron: 'noise' }),
+    ];
+    expect(countActionableFindings(findings)).toBe(2);
+  });
+
+  it('is zero on an empty finding set — no false alarm from nothing', () => {
+    expect(countActionableFindings([])).toBe(0);
   });
 });
 

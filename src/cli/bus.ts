@@ -3090,7 +3090,7 @@ busCommand
   .option('--json', 'Emit raw JSON instead of the formatted report')
   .option('--notify', 'Send ONE consolidated message to the org orchestrator when drift is found')
   .action(async (opts: { json?: boolean; notify?: boolean }) => {
-    const { sweepConfigCronDrift, formatDriftFindings, countLatentMarkerAbsent, statedTimeCoverage, listExcludedRetiredAgents } = await import('../daemon/cron-drift.js');
+    const { sweepConfigCronDrift, formatDriftFindings, countActionableFindings, countLatentMarkerAbsent, statedTimeCoverage, listExcludedRetiredAgents } = await import('../daemon/cron-drift.js');
     const env = resolveEnv();
     const projectRoot = env.projectRoot || env.frameworkRoot || process.cwd();
 
@@ -3204,6 +3204,14 @@ Out of scope: ${retired.length} disabled agent(s) — ${retired.join(', ')}. The
     // for a fleet-wide condition is how a real finding gets filtered out as noise.
     if (!opts.notify) return;
     try {
+      // HEADLINE COUNTS ACTIONABLE ONLY (seb_boss, 2026-08-04) — prompt-differs is the norm, not an
+      // event (see countActionableFindings), and a headline that fires the same alarm on a clean run
+      // and a real one trains the reader to stop reading it. Silent when there is nothing actionable,
+      // even if prompt-differs findings exist — that class already has a weekly liveness line elsewhere
+      // in this cron's own prompt; this message is for things that need a human today.
+      const actionable = countActionableFindings(findings);
+      if (actionable === 0) return;
+      const promptDiffersCount = findings.length - actionable;
       const contextPath = join(projectRoot, 'orgs', env.org, 'context.json');
       if (!existsSync(contextPath)) return;
       const ctx = JSON.parse(readFileSync(contextPath, 'utf-8'));
@@ -3213,7 +3221,9 @@ Out of scope: ${retired.length} disabled agent(s) — ${retired.join(', ')}. The
         env.agentName,
         ctx.orchestrator,
         'normal',
-        `config.json cron drift: ${findings.length} edit(s) not in effect.\n\n${formatDriftFindings(findings)}`,
+        `config.json cron drift: ${actionable} actionable finding(s)` +
+          (promptDiffersCount > 0 ? ` (+${promptDiffersCount} prompt-differs, the norm)` : '') +
+          `.\n\n${formatDriftFindings(findings)}`,
       );
     } catch { /* the event above already carries the finding */ }
   });
