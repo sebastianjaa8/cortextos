@@ -193,9 +193,26 @@ export function verdict({ missingPaths, tokens, ingestFailed, skippedOptional = 
       detail: 'kb-ingest produced no "Tokens:" line. It was almost certainly cut off mid-run — the ' +
         'caller timeout is the first thing to check (the harness default is 120s; a 350KB ingest takes ~204s).' };
   }
+  // WHAT ZERO-TOKENS ACTUALLY MEANS, EXERCISED IN PRODUCTION 2026-08-03T17:4xZ RATHER THAN REASONED.
+  // task_1785723004813_36146080 said the route was "a file whose bytes change but whose chunks are
+  // already fully indexed", citing kb-ingest's no---force behaviour. THAT ROUTE IS UNREACHABLE HERE:
+  // line ~498 passes --force on every changed run. Measured A-B-A on a real lane — content A (13
+  // tokens), content B (9), then A AGAIN: INGESTED, 13 tokens, THE SAME COUNT AS ITS FIRST EMBED.
+  // Already-indexed chunks are re-embedded, so they can never yield zero.
+  //
+  // THE ROUTE THAT DOES REACH IT is a changed input with NO EMBEDDABLE CONTENT — a file truncated to
+  // whitespace reached ZERO-TOKENS at exit 2, with INGESTED on either side of it. So this verdict is
+  // narrower and more actionable than its first wording: it does not mean "the ingest mysteriously
+  // did nothing", it means AN INPUT THAT CHANGED HAS NOTHING IN IT.
+  //
+  // AND IT IS NOT THE todoist_keeper CASE. That receipt reported 195 tokens with a document count
+  // that did not move — nonzero tokens, nothing embedded. ZERO-TOKENS CANNOT SEE THAT, and assuming
+  // it would have is what this comment exists to stop.
   if (tokens === 0) {
     return { code: 2, status: 'ZERO-TOKENS',
-      detail: `the ingest completed and embedded NOTHING. The step ran and the memory store did not change.${skipNote}` };
+      detail: `the ingest completed and embedded NOTHING despite at least one input having CHANGED. ` +
+        `Since changed inputs are re-embedded with --force, the reachable cause is an input with no ` +
+        `embeddable content — check whether a file was truncated or emptied.${skipNote}` };
   }
   // NAMES WHAT IT SKIPPED. "96,466 tokens" and "49,766 tokens, MEMORY.md skipped" are different
   // facts about the same success, and a reader comparing two receipts needs to know which happened
@@ -229,6 +246,40 @@ function selfTest() {
     ['broken call is 3, not 2', () => verdict({ missingPaths: [], tokens: null, ingestFailed: 'spawn EINVAL' }).code === 3],
 
     // --- the UNCHANGED skip (analyst 2026-08-01: --force re-embedded everything every fire) ---
+    // --- UTC ROLLOVER: the fingerprint must stay PER-INPUT (task_1785622930763_68411636) ---
+    //
+    // seb_boss found this 2026-08-01 checking his own lane, the only one passing an --optional daily
+    // file, and it sat as PROSE IN A TASK DESCRIPTION for two days — a must-fail case with no
+    // instrument, which is the exact shape audited and found wanting on 2026-08-03. Converting it to
+    // a case is the whole point: it now runs whenever anyone touches this file.
+    //
+    // THE BREAK IS INVISIBLE EXCEPT AT MIDNIGHT UTC. If fingerprint() is ever collapsed to ONE hash
+    // over the concatenated bytes — a plausible simplification, and smaller code — it behaves
+    // identically every day except the one where the optional daily path CHANGES NAME while its
+    // CONTENT is unchanged. On a quiet night the concatenation hash is identical, isUnchanged returns
+    // true, AND THE SKIP FIRES ON A DAY THE INPUT SET GENUINELY CHANGED. The file that would be
+    // skipped is the new day's, which is the one nobody has ingested yet.
+    ['UTC ROLLOVER: same content, CHANGED daily path -> NOT unchanged', () => {
+      const prev = { status: 'INGESTED', fingerprint: [
+        { path: './MEMORY.md', sha256: 'aaa' },
+        { path: './memory/2026-08-01.md', sha256: 'bbb' }] };
+      const now = [
+        { path: './MEMORY.md', sha256: 'aaa' },
+        { path: './memory/2026-08-02.md', sha256: 'bbb' }];
+      return isUnchanged(prev, now) === false;
+    }],
+    // PAIRED NEGATIVE: identical paths AND identical hashes must still be UNCHANGED, or the guard
+    // above is satisfied by a function that simply never returns true.
+    ['same content and SAME daily path -> unchanged', () => {
+      const fp = [{ path: './MEMORY.md', sha256: 'aaa' }, { path: './memory/2026-08-01.md', sha256: 'bbb' }];
+      return isUnchanged({ status: 'INGESTED', fingerprint: fp }, fp) === true;
+    }],
+    // AND THE CONVERSE HALF: same path, CHANGED content must also be not-unchanged. Without it, a
+    // path-only comparison would pass both cases above.
+    ['same daily path, CHANGED content -> NOT unchanged', () => {
+      const prev = { status: 'INGESTED', fingerprint: [{ path: './memory/2026-08-01.md', sha256: 'bbb' }] };
+      return isUnchanged(prev, [{ path: './memory/2026-08-01.md', sha256: 'ccc' }]) === false;
+    }],
     ['unchanged is a SUCCESS, not a finding', () =>
       verdict({ missingPaths: [], tokens: null, ingestFailed: null, unchanged: true }).code === 0],
     // Without this, UNCHANGED and ZERO-TOKENS could collapse — and they are opposites: one is

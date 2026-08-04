@@ -220,6 +220,28 @@ def nominal_period(schedule):
     return timedelta(days=1)
 
 
+
+def count_enabled_crons():
+    """Enabled crons across the expected-productive roster — the POPULATION, not the fire count.
+
+    Same roster filter and enabled flag as audit_overdue, so the two numbers are comparable.
+    Read from crons.json rather than derived from fires, which is what makes it MOVE when a
+    cron is enabled or disabled. A population that cannot move is a label, not a measurement.
+    """
+    enabled_agents = load_enabled_agents()
+    total = 0
+    for agent in sorted(os.listdir(STATE_DIR)):
+        if not is_expected_productive(agent, enabled_agents):
+            continue
+        path = os.path.join(STATE_DIR, agent, "crons.json")
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                crons = json.load(fh).get("crons", [])
+        except (OSError, ValueError):
+            continue
+        total += sum(1 for c in crons if c.get("enabled"))
+    return total
+
 def audit_overdue(now):
     """Flag enabled crons whose last fire (or created_at) is > 2x period ago.
 
@@ -469,7 +491,18 @@ def run(quiet=False):
     # recreates the silence this fix removes: an accidentally-disabled real agent would drop out
     # of the population with no trace, and a shrinking denominator reads exactly like good news.
     # A DROP in the agent count between runs is itself a finding.
-    coverage = "%d crons across %d expected-productive agent(s)" % (checked, len(included))
+    # UNIT, added 2026-08-03 after `checked` was read as a population three times in one day.
+    # `checked` counts CRONS THAT FIRED in the window; it is NOT the enabled population, and the
+    # two answer different questions. Printing the first while it reads as the second is the
+    # wrong-unit defect: 90 crons that FIRED reading as 90 crons that EXIST.
+    enabled_total = count_enabled_crons()
+    coverage = "%d of %d enabled crons FIRED across %d expected-productive agent(s)" % (
+        checked, enabled_total, len(included))
+    if enabled_total > checked:
+        coverage += "; %d enabled crons did NOT fire in the window (longer periods than the window, or newly added)" % (
+            enabled_total - checked)
+    # DO NOT BUILD A DROP-GUARD ON `checked`. It legitimately falls whenever a long-period cron
+    # sits outside the window, so a guard there fires on correct behaviour and gets muted.
     if excluded:
         coverage += "; %d excluded as not-enabled/not-in-roster: %s" % (len(excluded), ", ".join(excluded))
 

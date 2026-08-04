@@ -518,9 +518,40 @@ def ingest_text_file(client, config, collection, file_path):
         overlap=config.get("text_chunk_overlap", DEFAULT_TEXT_CHUNK_OVERLAP),
     )
 
+    # WHICH CHUNKS ARE NEW AND WHICH ARE BEING REPLACED — INFORMATIONAL, BEHAVIOUR UNCHANGED.
+    #
+    # WHY: with --force, already_exists() returns False unconditionally, so every chunk takes the
+    # upsert path and the run reports "N chunks" with no way to tell a first-ever embed from a
+    # replacement. AN UPSERT TO AN EXISTING ID REPLACES IN PLACE AND DOES NOT MOVE
+    # collection.count(), so a caller watching the document count sees ZERO MOVEMENT ON A FULLY
+    # SUCCESSFUL RUN. On 2026-08-03 seb_boss and builder_1 read exactly that flat count as proof
+    # that todoist_keeper had embedded nothing, and filed a finding against that lane. todoist_keeper
+    # refuted it from the mechanism. Reproduced afterwards on a controlled file: a 69-byte change
+    # moved the count 0, a 23KB change moved it +29 — the count rises only when a chunk INDEX is
+    # used for the first time.
+    #
+    # ONE BATCHED get() RATHER THAN ONE PER CHUNK: the per-chunk version is the obvious shape and
+    # costs a round trip per chunk on every forced run of every agent.
+    doc_ids = [file_id(file_path, i) for i in range(len(chunks))]
+    known = set()
+    if args_force and doc_ids:
+        try:
+            got = collection.get(ids=doc_ids)
+            known = set(got.get("ids") or [])
+        except Exception:
+            # CLASSIFICATION IS A NICETY AND MUST NEVER FAIL AN INGEST. An empty `known` degrades
+            # the line to "all new", which is the pre-existing behaviour rather than a new lie.
+            known = set()
+    new_chunks = 0
+    updated_chunks = 0
+
     count = 0
     for i, chunk in enumerate(chunks):
         doc_id = file_id(file_path, i)
+        if doc_id in known:
+            updated_chunks += 1
+        else:
+            new_chunks += 1
         if already_exists(collection, doc_id):
             continue
 
@@ -541,6 +572,12 @@ def ingest_text_file(client, config, collection, file_path):
         )
         count += 1
 
+    # ONLY UNDER --force, because without it `known` was never read and every survivor of the
+    # already_exists() filter is genuinely new — printing "0 updated" there would be a measurement
+    # nobody took.
+    if args_force and doc_ids:
+        print(f"  Chunks: {new_chunks} new, {updated_chunks} updated "
+              f"(updated chunks do NOT move the collection count)")
     return count
 
 
