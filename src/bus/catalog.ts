@@ -584,18 +584,37 @@ export function submitCommunityItem(
   }
 
   const timestamp = new Date().toISOString();
-  catalog.items.push({
-    name: itemName,
-    description,
-    author,
-    type: itemType as 'skill' | 'agent' | 'org',
-    version: '1.0.0',
-    tags: [],
-    review_status: 'community',
-    dependencies: [],
-    install_path: installPath,
-    submitted_at: timestamp,
-  });
+  // Upsert, not push: re-submitting the same name (e.g. a re-run after a failed
+  // --contribute, or a version bump) used to append a second catalog entry every
+  // time, so browseCatalog would list the item twice. Preserve curated fields
+  // (tags, review_status, dependencies) on an existing entry rather than
+  // resetting them, since those are set by review after submission, not by the
+  // submitter.
+  const existingIdx = catalog.items.findIndex((i) => i.name === itemName);
+  if (existingIdx >= 0) {
+    const existing = catalog.items[existingIdx];
+    catalog.items[existingIdx] = {
+      ...existing,
+      description,
+      author,
+      type: itemType as 'skill' | 'agent' | 'org',
+      install_path: installPath,
+      submitted_at: timestamp,
+    };
+  } else {
+    catalog.items.push({
+      name: itemName,
+      description,
+      author,
+      type: itemType as 'skill' | 'agent' | 'org',
+      version: '1.0.0',
+      tags: [],
+      review_status: 'community',
+      dependencies: [],
+      install_path: installPath,
+      submitted_at: timestamp,
+    });
+  }
 
   writeFileSync(catalogPath, JSON.stringify(catalog, null, 2) + '\n', 'utf-8');
 
@@ -641,17 +660,30 @@ export function submitCommunityItem(
       // Stage the new community files and updated catalog
       execSync('git add community/', { ...execOpts, stdio: 'pipe' });
 
-      // Commit
+      // Commit. A re-run with nothing changed since the last commit on this
+      // branch (e.g. the branch already carries this exact submission) makes
+      // `git commit` fail with "nothing to commit" — that is not a contribution
+      // failure, it means the branch is already up to date, so skip rather than
+      // falling into the outer catch and reporting status: 'error'.
       const commitMsg = `community: add ${itemType} ${itemName}\n\n${description}\n\nSubmitted-by: ${author}`;
-      execFileSync('git', ['commit', '-m', commitMsg], { ...execOpts, stdio: 'pipe' });
+      try {
+        execFileSync('git', ['commit', '-m', commitMsg], { ...execOpts, stdio: 'pipe' });
+      } catch (e: unknown) {
+        const out = execErrorText(e);
+        if (!/nothing to commit/i.test(out)) throw e;
+      }
 
-      // Push to origin
+      // Push to origin. A no-op push (nothing new since last push) exits 0, so
+      // no special-casing needed here.
       execFileSync('git', ['push', 'origin', branch], { ...execOpts, stdio: 'pipe' });
 
       // Extract upstream repo (owner/repo) from upstream remote URL
       const upstreamRepo = extractRepoPath(upstreamUrl);
 
-      // Open PR via gh CLI
+      // Open PR via gh CLI. A re-run against a branch that already has an open
+      // PR makes `gh pr create` fail with "already exists: <url>" — that is the
+      // idempotent success case (the PR is already there), not a failure, so
+      // extract and return the existing URL instead of an error hint.
       let prUrl = '';
       try {
         const prTitle = `Community ${itemType}: ${itemName}`;
@@ -663,13 +695,25 @@ export function submitCommunityItem(
         ) as string).trim();
         prUrl = ghOut.split('\n').find((l: string) => l.startsWith('https://')) || ghOut;
       } catch (e: unknown) {
-        const msg = e instanceof Error ? e.message : String(e);
+        const out = execErrorText(e);
+        if (/already exists/i.test(out)) {
+          const existingUrl = out.split('\n').map((l) => l.trim()).find((l) => l.startsWith('https://'));
+          if (existingUrl) {
+            return {
+              status: 'contributed',
+              name: itemName,
+              branch,
+              pr_url: existingUrl,
+              file_count: files.length,
+            };
+          }
+        }
         return {
           status: 'contributed',
           name: itemName,
           branch,
           file_count: files.length,
-          hint: `Branch pushed to origin/${branch} but gh pr create failed: ${msg.split('\n')[0]}. Open the PR manually.`,
+          hint: `Branch pushed to origin/${branch} but gh pr create failed: ${out.split('\n')[0]}. Open the PR manually.`,
         };
       }
 
@@ -681,7 +725,7 @@ export function submitCommunityItem(
         file_count: files.length,
       };
     } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : String(e);
+      const msg = execErrorText(e);
       return { status: 'error', name: itemName, error: `contribution failed: ${msg.split('\n')[0]}` };
     }
   }
@@ -694,6 +738,21 @@ export function submitCommunityItem(
 }
 
 // --- Helpers ---
+
+/**
+ * execFileSync/execSync errors carry the process's stdout/stderr as Buffer or
+ * string properties separately from `.message` (which is often just "Command
+ * failed: <cmd>" with no output). Git and gh both write the text we need to
+ * match against — "nothing to commit", "already exists" — to one of those, not
+ * reliably to `.message`, so check all three.
+ */
+function execErrorText(e: unknown): string {
+  if (!(e instanceof Error)) return String(e);
+  const err = e as Error & { stdout?: Buffer | string; stderr?: Buffer | string };
+  const stdout = err.stdout ? err.stdout.toString() : '';
+  const stderr = err.stderr ? err.stderr.toString() : '';
+  return [stderr, stdout, err.message].filter(Boolean).join('\n');
+}
 
 /** Extract "owner/repo" from a git remote URL (https or ssh) */
 function extractRepoPath(remoteUrl: string): string {

@@ -385,5 +385,45 @@ describe('Sprint 4: Community Catalog', () => {
       expect(result.status).toBe('error');
       expect(result.error).toContain('invalid item name');
     });
+
+    it('re-submitting the same item name updates the existing catalog entry instead of duplicating it', () => {
+      submitCommunityItem(frameworkRoot, ctxRoot, 'my-skill', 'skill', 'First description');
+
+      // Re-stage the same item (submit consumes/removes the staging dir each time)
+      const stagingDir = join(ctxRoot, 'community-staging', 'my-skill');
+      mkdirSync(stagingDir, { recursive: true });
+      writeFileSync(join(stagingDir, 'SKILL.md'), '---\nname: my-skill\n---\nUpdated content', 'utf-8');
+
+      const result = submitCommunityItem(frameworkRoot, ctxRoot, 'my-skill', 'skill', 'Second description');
+      expect(result.status).toBe('submitted');
+
+      const catalog = JSON.parse(readFileSync(join(frameworkRoot, 'community', 'catalog.json'), 'utf-8'));
+      const matches = catalog.items.filter((i: any) => i.name === 'my-skill');
+      expect(matches.length).toBe(1);
+      expect(matches[0].description).toBe('Second description');
+    });
+
+    it('preserves curated fields (tags, review_status, dependencies) across a re-submit', () => {
+      submitCommunityItem(frameworkRoot, ctxRoot, 'my-skill', 'skill', 'First description');
+      const catalogPath = join(frameworkRoot, 'community', 'catalog.json');
+      const catalog = JSON.parse(readFileSync(catalogPath, 'utf-8'));
+      const entry = catalog.items.find((i: any) => i.name === 'my-skill');
+      entry.tags = ['curated-tag'];
+      entry.review_status = 'official';
+      entry.dependencies = ['some-dep'];
+      writeFileSync(catalogPath, JSON.stringify(catalog, null, 2), 'utf-8');
+
+      const stagingDir = join(ctxRoot, 'community-staging', 'my-skill');
+      mkdirSync(stagingDir, { recursive: true });
+      writeFileSync(join(stagingDir, 'SKILL.md'), '---\nname: my-skill\n---\nUpdated content', 'utf-8');
+      submitCommunityItem(frameworkRoot, ctxRoot, 'my-skill', 'skill', 'Second description');
+
+      const after = JSON.parse(readFileSync(catalogPath, 'utf-8'));
+      const updated = after.items.find((i: any) => i.name === 'my-skill');
+      expect(updated.tags).toEqual(['curated-tag']);
+      expect(updated.review_status).toBe('official');
+      expect(updated.dependencies).toEqual(['some-dep']);
+      expect(updated.description).toBe('Second description');
+    });
   });
 });
