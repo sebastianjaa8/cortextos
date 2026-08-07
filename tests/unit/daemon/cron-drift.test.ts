@@ -550,6 +550,69 @@ describe('statedTimeCoverage accounting', () => {
     expect(c.disclaimed).toBe(1);
     expect(c.threshold).toBe(0);
   });
+
+  // task_1785780835345_12163173, fix 1: the aggregate must name WHICH crons it counted, not just
+  // how many — a frozen number cannot be audited without membership.
+  it('publishes membership for stating/disclaimed/threshold, not just counts', () => {
+    seedCrons([
+      { name: 'claim', schedule: '0 16 * * *', prompt: 'Runs 12pm ET.' },
+      { name: 'neg', schedule: '0 16 * * 0', prompt: 'Runs 12pm ET, not 8am ET.' },
+      { name: 'thresh', schedule: '0 16 * * 1', prompt: 'Flag anything older than 6pm ET.' },
+    ]);
+    const c = statedTimeCoverage();
+    expect(c.statingCrons).toEqual([{ agent: A, cron: 'claim' }, { agent: A, cron: 'neg' }]);
+    expect(c.disclaimedCrons).toEqual([{ agent: A, cron: 'neg' }]);
+    expect(c.thresholdCrons).toEqual([{ agent: A, cron: 'thresh' }]);
+  });
+
+  // task_1785780835345_12163173, fix 2, THE MUST-FAIL CASE: a cron whose only time signal is a
+  // stated UTC time must not inflate the denominator. extractLocalHours is blind to UTC BY
+  // DESIGN (unambiguous, no conversion to verify) — counting it anyway is what let the metric
+  // fall as prompts got MORE precise, the exact regression this fix removes.
+  it('excludes a UTC-only-stated cron from timeAnchored entirely (out of scope, not uncovered)', () => {
+    seedCrons([{ name: 'utc-only', schedule: '0 13 * * *', prompt: 'Fires 13:07Z, checks the queue.' }]);
+    const c = statedTimeCoverage();
+    expect(c.timeAnchored).toBe(0);
+    expect(c.stating).toBe(0);
+    expect(c.utcOnlyExcluded).toEqual([{ agent: A, cron: 'utc-only' }]);
+  });
+
+  it('also excludes the "H UTC" word form, not just the "HH:MMZ" form', () => {
+    seedCrons([{ name: 'utc-word', schedule: '0 3 * * *', prompt: 'Nightly batch, fires 3am UTC.' }]);
+    const c = statedTimeCoverage();
+    expect(c.timeAnchored).toBe(0);
+    expect(c.utcOnlyExcluded).toEqual([{ agent: A, cron: 'utc-word' }]);
+  });
+
+  // PAIRED NEGATIVE: a cron stating a real ET claim must still raise timeAnchored AND stating
+  // together — otherwise the UTC guard has silently narrowed the check into never firing.
+  it('a cron stating a real ET time still counts normally (paired negative)', () => {
+    seedCrons([{ name: 'et-claim', schedule: '0 11 * * *', prompt: 'Fires 7am ET.' }]);
+    const c = statedTimeCoverage();
+    expect(c.timeAnchored).toBe(1);
+    expect(c.stating).toBe(1);
+    expect(c.utcOnlyExcluded).toEqual([]);
+  });
+
+  // A prompt with NO time signal at all (not even UTC) is a DIFFERENT claim than "out of scope" —
+  // it is a real, uncovered gap, and must still count in timeAnchored so the ratio reflects it.
+  it('a fully silent prompt still counts as time-anchored (uncovered, not out-of-scope)', () => {
+    seedCrons([{ name: 'silent', schedule: '0 16 * * *', prompt: 'Do the thing. See AGENTS.md.' }]);
+    const c = statedTimeCoverage();
+    expect(c.timeAnchored).toBe(1);
+    expect(c.stating).toBe(0);
+    expect(c.utcOnlyExcluded).toEqual([]);
+  });
+
+  // ORDER MATTERS: an incidental UTC mention alongside a real local-time signal must NOT trigger
+  // the out-of-scope exclusion — the exclusion only applies when local extraction found nothing.
+  it('does not exclude a cron that has BOTH a UTC mention and a real local-time signal', () => {
+    seedCrons([{ name: 'both-tz', schedule: '0 16 * * 0', prompt: 'Runs 12pm ET (16:00 UTC), not 8am ET.' }]);
+    const c = statedTimeCoverage();
+    expect(c.timeAnchored).toBe(1);
+    expect(c.disclaimed).toBe(1);
+    expect(c.utcOnlyExcluded).toEqual([]);
+  });
 });
 
 /**

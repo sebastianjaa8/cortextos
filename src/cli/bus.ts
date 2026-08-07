@@ -3130,7 +3130,15 @@ Stated-time coverage: ${coverage.stating} of ${coverage.timeAnchored} time-ancho
           `comparison ("older than 6pm ET", "before the 7am ET brief", "received after 6:30am ET") ` +
           `is what the cron reasons ABOUT, and it may fire at any hour to evaluate it. Counted ` +
           `separately from disclaimed so neither guard's false positives can hide inside the ` +
-          `other's expected number. A RISE here is the tell, same as above.`,
+          `other's expected number. A RISE here is the tell, same as above.` +
+          `
+  ${coverage.utcOnlyExcluded.length} cron(s) OUT OF SCOPE — their only time signal is a stated ` +
+          `UTC time, which is already unambiguous and needs no local-time verification. Excluded ` +
+          `from the denominator rather than counted as uncovered, and named here rather than ` +
+          `silently narrowed: ${coverage.utcOnlyExcluded.map((c) => `${c.agent}/${c.cron}`).join(', ') || '(none)'}` +
+          `
+  Membership for stating/disclaimed/threshold is in --json (stated_time_coverage.statingCrons etc) ` +
+          `— a count alone cannot be audited without it.`,
       );
       if (latent.length > 0) {
         console.log(
@@ -3182,6 +3190,7 @@ Out of scope: ${retired.length} disabled agent(s) — ${retired.join(', ')}. The
           latent_marker_absent: latent.length,
           stated_time_stating: coverage.stating,
           stated_time_anchored: coverage.timeAnchored,
+          stated_time_utc_excluded: coverage.utcOnlyExcluded.length,
         });
       }
     } catch { /* a receipt that cannot be written must not suppress the report */ }

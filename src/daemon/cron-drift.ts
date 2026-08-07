@@ -599,35 +599,83 @@ const KIND_ORDER: Record<CronDriftKind, number> = {
  * rise in the other. It also accounts for the one-time `stating` drop that guard causes on the run
  * it ships: this metric treats an unexplained fall as a finding, so a suppression that does not
  * report itself would be indistinguishable from the regression the whole function exists to catch.
+ *
+ * TWO GAPS FIXED 2026-08-07 (task_1785780835345_12163173, seb_boss + builder_1):
+ *
+ * (1) THE AGGREGATE PUBLISHED NO MEMBERS. Auditing a frozen number (the drop-guard's whole reason
+ * to exist) required a source read, because the counts named nothing. `statingCrons`/
+ * `disclaimedCrons`/`thresholdCrons` now carry the agent/cron identity behind each count, so the
+ * check that exists to catch a frozen number can itself be audited from `--json` alone.
+ *
+ * (2) THE METRIC DEGRADED AS PROMPTS IMPROVED. `extractLocalHours` is blind to UTC BY DESIGN —
+ * "09:00 UTC" is already unambiguous and needs no local-time verification — but `timeAnchored`
+ * used to count every 5-field cron regardless, so a correctly-written UTC-only prompt lifted the
+ * denominator while leaving the numerator flat. The fix is NOT to match UTC too (that widens the
+ * checker rather than fixing the metric). Instead, a cron whose ONLY time signal is a stated UTC
+ * time is OUT OF SCOPE for this metric — excluded from `timeAnchored` entirely, listed under
+ * `utcOnlyExcluded` rather than silently dropped, same "state what was narrowed" discipline as
+ * `listExcludedRetiredAgents`. A cron with NO time signal at all (truly silent) is a different
+ * claim — a real, uncovered gap — and STILL counts in `timeAnchored`, contributing zero to
+ * `stating`. Order matters: a cron with any ET/local signal (stated, disclaimed OR threshold)
+ * counts as time-anchored regardless of an incidental UTC mention elsewhere in the same prompt —
+ * the UTC-only exclusion applies only when local-time extraction found NOTHING to work with.
  */
+const UTC_STATED = /\b\d{1,2}(?::\d{2})?\s*(?:am|pm)?\s*UTC\b|\b\d{1,2}:\d{2}Z\b/i;
+
 export function statedTimeCoverage(): {
   timeAnchored: number;
   stating: number;
   disclaimed: number;
   threshold: number;
   agents: string[];
+  statingCrons: Array<{ agent: string; cron: string }>;
+  disclaimedCrons: Array<{ agent: string; cron: string }>;
+  thresholdCrons: Array<{ agent: string; cron: string }>;
+  utcOnlyExcluded: Array<{ agent: string; cron: string }>;
 } {
   let timeAnchored = 0;
   let stating = 0;
   let disclaimed = 0;
   let threshold = 0;
   const agents: string[] = [];
+  const statingCrons: Array<{ agent: string; cron: string }> = [];
+  const disclaimedCrons: Array<{ agent: string; cron: string }> = [];
+  const thresholdCrons: Array<{ agent: string; cron: string }> = [];
+  const utcOnlyExcluded: Array<{ agent: string; cron: string }> = [];
   for (const agentName of listStateAgents()) {
     try {
       for (const cron of readCrons(agentName)) {
         if (cron.schedule.trim().split(/\s+/).length !== 5) continue;
-        timeAnchored++;
         const { stated, disclaimed: d, threshold: t } = extractLocalHours(cron.prompt ?? '');
+        const hasLocalSignal = stated.length > 0 || d > 0 || t > 0;
+        if (!hasLocalSignal && UTC_STATED.test(cron.prompt ?? '')) {
+          utcOnlyExcluded.push({ agent: agentName, cron: cron.name });
+          continue;
+        }
+        timeAnchored++;
         disclaimed += d;
         threshold += t;
+        if (d > 0) disclaimedCrons.push({ agent: agentName, cron: cron.name });
+        if (t > 0) thresholdCrons.push({ agent: agentName, cron: cron.name });
         if (stated.length > 0) {
           stating++;
+          statingCrons.push({ agent: agentName, cron: cron.name });
           if (!agents.includes(agentName)) agents.push(agentName);
         }
       }
     } catch { /* skip */ }
   }
-  return { timeAnchored, stating, disclaimed, threshold, agents };
+  return {
+    timeAnchored,
+    stating,
+    disclaimed,
+    threshold,
+    agents,
+    statingCrons,
+    disclaimedCrons,
+    thresholdCrons,
+    utcOnlyExcluded,
+  };
 }
 
 /**
