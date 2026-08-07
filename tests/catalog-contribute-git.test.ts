@@ -77,6 +77,10 @@ describe('submitCommunityItem --contribute: git-only idempotency (no gh, no netw
     try { rmSync(testDir, { recursive: true, force: true }); } catch { /* ignore */ }
   });
 
+  // Longer per-test timeout: each test shells out to ~8-10 real git/gh child
+  // processes (init, remotes, checkout, add, commit, push, gh) — the default
+  // 10s vitest timeout is too tight for that under load, unrelated to the
+  // behavior under test.
   it('creates the branch and commits on the first contribute', () => {
     stageItem('v1');
     const result = submitCommunityItem(frameworkRoot, ctxRoot, 'test-item', 'skill', 'First run', {
@@ -92,7 +96,7 @@ describe('submitCommunityItem --contribute: git-only idempotency (no gh, no netw
 
     const log = git('log --oneline', frameworkRoot).trim().split('\n');
     expect(log.length).toBe(2); // init + this commit
-  });
+  }, 60000);
 
   it('reuses the existing branch instead of erroring on a second contribute', () => {
     stageItem('v1');
@@ -111,7 +115,7 @@ describe('submitCommunityItem --contribute: git-only idempotency (no gh, no netw
     expect(result.branch).toBe('community/test-item');
     const branch = git('branch --show-current', frameworkRoot).trim();
     expect(branch).toBe('community/test-item');
-  });
+  }, 60000);
 
   it('does not error when the second contribute has nothing new to commit', () => {
     stageItem('v1');
@@ -131,5 +135,5 @@ describe('submitCommunityItem --contribute: git-only idempotency (no gh, no netw
 
     const log = git('log --oneline', frameworkRoot).trim().split('\n');
     expect(log.length).toBe(2); // still just init + the one real commit
-  });
+  }, 60000);
 });
