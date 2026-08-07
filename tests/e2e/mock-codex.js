@@ -67,9 +67,7 @@ class MockCodexServer {
   async listen() {
     if (this.server) return;
     if (this.socketPath) {
-      if (this.socketPath) {
       try { await unlink(this.socketPath); } catch { /* ok */ }
-    }
     }
 
     const server = net.createServer((socket) => this._handleConnection(socket));

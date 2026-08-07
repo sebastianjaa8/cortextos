@@ -509,6 +509,93 @@ busCommand
   });
 
 busCommand
+  .command('compact-tasks')
+  .description('Archive completed tasks older than N days into a per-month archive-YYYY-MM.jsonl and remove them from the active list — preserves audit logs, skips tasks still needed as blockers')
+  .option('--older-than <days>', 'Cutoff in days (default: 30)', '30')
+  .option('--dry-run', 'Report what would be compacted without modifying anything')
+  .action((opts: { olderThan: string; dryRun?: boolean }) => {
+    const env = resolveEnv();
+    const paths = resolvePaths(env.agentName, env.instanceId, env.org);
+    const olderThanDays = parseInt(opts.olderThan, 10);
+    if (isNaN(olderThanDays) || olderThanDays < 0) {
+      console.error('--older-than must be a non-negative integer');
+      process.exit(1);
+    }
+    const report = compactTasks(paths, { olderThanDays, dryRun: opts.dryRun });
+    const verb = report.dry_run ? 'would compact' : 'compacted';
+    console.log(`${verb} ${report.archived.length} task${report.archived.length === 1 ? '' : 's'}, skipped ${report.skipped.length}`);
+    for (const a of report.archived) console.log(`  ✓ ${a.id}  ->  ${a.archive_file}`);
+    if (report.skipped.length > 0) {
+      console.log(`\nSkipped (common reasons: within cutoff, still needed as blocker):`);
+      for (const s of report.skipped) console.log(`  - ${s.id}  (${s.reason})`);
+    }
+  });
+
+busCommand
+  .command('check-deps')
+  .description('Show open dependencies blocking a task — lists blocked_by entries that are not yet completed')
+  .argument('<id>', 'Task ID')
+  .action((id: string) => {
+    const env = resolveEnv();
+    const paths = resolvePaths(env.agentName, env.instanceId, env.org);
+    const open = checkTaskDependencies(paths, id);
+    if (open.length === 0) {
+      console.log(`${id}: no open dependencies — ready to work`);
+      return;
+    }
+    console.log(`${id} blocked by ${open.length} dependency${open.length === 1 ? '' : 's'}:`);
+    for (const d of open) console.log(`  ${d.id}  [${d.status}]`);
+  });
+
+busCommand
+  .command('task-history')
+  .description("Show a task's append-only audit log (every status change, claim, and completion)")
+  .argument('<id>', 'Task ID')
+  .option('--json', 'Emit raw JSONL instead of formatted text')
+  .action((id: string, opts: { json?: boolean }) => {
+    const env = resolveEnv();
+    const paths = resolvePaths(env.agentName, env.instanceId, env.org);
+    const entries = readTaskAudit(paths, id);
+    if (entries.length === 0) {
+      console.log(`No audit log for task ${id}`);
+      return;
+    }
+    if (opts.json) {
+      for (const e of entries) console.log(JSON.stringify(e));
+      return;
+    }
+    console.log(`Audit log for ${id} (${entries.length} entries):`);
+    for (const e of entries) {
+      const transition = e.from && e.to ? `${e.from} -> ${e.to}` : e.to || '';
+      const note = e.note ? ` | ${e.note}` : '';
+      console.log(`  ${e.ts}  ${e.event.padEnd(8)}  ${e.agent.padEnd(16)}  ${transition}${note}`);
+    }
+  });
+
+busCommand
+  .command('claim-task')
+  .description('Atomically claim a pending task — marks in_progress + sets assignee in one shot, rejecting if another agent already owns it')
+  .argument('<id>', 'Task ID')
+  .option('--agent <name>', 'Agent claiming the task (defaults to CTX_AGENT_NAME)')
+  .action((id: string, opts: { agent?: string }) => {
+    const env = resolveEnv();
+    const paths = resolvePaths(env.agentName, env.instanceId, env.org);
+    const agent = opts.agent || env.agentName;
+    if (!agent) {
+      console.error('ERROR: --agent or CTX_AGENT_NAME required');
+      process.exit(1);
+    }
+    try {
+      const task = claimTask(paths, id, agent);
+      console.log(`Claimed ${id} -> in_progress (assigned to ${agent})`);
+      console.log(`  Title: ${task.title}`);
+    } catch (err) {
+      console.error(err instanceof Error ? err.message : String(err));
+      process.exit(1);
+    }
+  });
+
+busCommand
   .command('complete-task')
   .argument('<id>', 'Task ID')
   .argument('[result]', 'Completion result (optional positional form)')
@@ -534,6 +621,36 @@ busCommand
       console.log(`Completed ${id}`);
     } catch (err) {
       console.error(err instanceof Error ? err.message : String(err));
+      process.exit(1);
+    }
+  });
+
+busCommand
+  .command('save-output')
+  .description('Copy a file into the per-task deliverables tree and link it to the task as a file output')
+  .argument('<task-id>', 'Target task ID')
+  .argument('<source>', 'Source file to save (absolute or relative to cwd)')
+  .option('--label <label>', 'Human-readable label for the linked output (defaults to filename)')
+  .option('--move', 'Delete the source file after a successful copy')
+  .option('--no-link', 'Save file without linking to task.outputs[]')
+  .action((taskId: string, source: string, opts: { label?: string; move?: boolean; link?: boolean }) => {
+    const noLink = opts.link === false;
+    const env = resolveEnv();
+    const paths = resolvePaths(env.agentName, env.instanceId, env.org);
+    try {
+      const result = saveOutput(paths, {
+        taskId,
+        sourcePath: source,
+        label: opts.label,
+        move: opts.move ?? false,
+        noLink,
+      });
+      console.log(result.targetPath);
+      if (result.linked) {
+        console.log(`Linked to ${taskId} as [snapshot] ${opts.label ?? result.storedPath}`);
+      }
+    } catch (err) {
+      console.error((err as Error).message);
       process.exit(1);
     }
   });
