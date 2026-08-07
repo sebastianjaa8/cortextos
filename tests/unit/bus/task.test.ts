@@ -272,302 +272,6 @@ describe('Task Management', () => {
     });
 });
 
-describe('UTF-8 BOM tolerance (2026-07-30 incident)', () => {
-  // A UTF-8 BOM on ONE task file of 708 made that task invisible to every reader in this module,
-  // because each wrapped JSON.parse in a silent catch. It hid a HIGH-priority, blocked, 49-day-old task
-  // from listTasks AND from checkStaleTasks — the detector whose whole job is finding forgotten work.
-  // The same BOM broke the symmetric-edge WRITE while createTask reported success.
-  //
-  // Self-contained on purpose: an earlier version relied on an enclosing describe's `paths` and silently
-  // landed in the wrong one, producing ENOENT instead of testing anything.
-  let dir: string;
-  let p: BusPaths;
-
-  beforeEach(() => {
-    dir = mkdtempSync(join(tmpdir(), 'cortextos-bom-test-'));
-    p = {
-      ctxRoot: dir, inbox: join(dir, 'inbox'), inflight: join(dir, 'inflight'),
-      processed: join(dir, 'processed'), logDir: join(dir, 'logs'), stateDir: join(dir, 'state'),
-      taskDir: join(dir, 'tasks'), approvalDir: join(dir, 'approvals'),
-      analyticsDir: join(dir, 'analytics'), heartbeatDir: join(dir, 'heartbeats'),
-    } as BusPaths;
-    mkdirSync(p.taskDir, { recursive: true });
-  });
-  afterEach(() => rmSync(dir, { recursive: true, force: true }));
-
-  const withBom = (id: string, over: Record<string, unknown> = {}) => {
-    const t = {
-      id, title: 'bom task', description: '', type: 'agent', needs_approval: false,
-      status: 'pending', assigned_to: 'boris', created_by: 'paul', org: 'acme',
-      priority: 'high', project: '', kpi_key: null,
-      created_at: '2026-06-11T02:34:52Z', updated_at: '2026-06-11T02:34:52Z',
-      completed_at: null, due_date: null, archived: false, ...over,
-    };
-    writeFileSync(join(p.taskDir, `${id}.json`), '﻿' + JSON.stringify(t), 'utf-8');
-  };
-
-  it('listTasks SEES a BOM-prefixed task — it was invisible before', () => {
-    withBom('task_bom_001');
-    expect(listTasks(p).map((t) => t.id)).toContain('task_bom_001');
-  });
-
-  it('checkStaleTasks SEES a BOM-prefixed task — the forgotten-work detector was blind to it', () => {
-    withBom('task_bom_002', { created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-01T00:00:00Z' });
-    expect(checkStaleTasks(p).stale_pending.map((t) => t.id)).toContain('task_bom_002');
-  });
-
-  it('a symmetric edge WRITES onto a BOM-prefixed peer — the half-recorded-relationship bug', () => {
-    withBom('task_bom_003');
-    const blocker = createTask(p, 'paul', 'acme', 'blocker', { blocks: ['task_bom_003'] });
-    const peer = JSON.parse(
-      readFileSync(join(p.taskDir, 'task_bom_003.json'), 'utf-8').replace(/^﻿/, ''),
-    );
-    expect(peer.blocked_by).toContain(blocker);
-  });
-
-  it('NEGATIVE CONTROL: a genuinely corrupt peer is REPORTED, not silently skipped', () => {
-    // The BOM was one cause of failure; the SILENT CATCH was the defect. Without this, the edge test
-    // above could pass while every other cause stayed swallowed.
-    writeFileSync(join(p.taskDir, 'task_corrupt_1.json'), '{ not valid json', 'utf-8');
-    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
-    const id = createTask(p, 'paul', 'acme', 'blocker2', { blocks: ['task_corrupt_1'] });
-    expect(spy).toHaveBeenCalled();
-    expect(String(spy.mock.calls[0][0])).toMatch(/HALF-RECORDED/);
-    spy.mockRestore();
-    const notes = readTaskAudit(p, id).map((e) => e.note ?? '').join(' ');
-    expect(notes).toMatch(/PARTIAL: 1 dependency edge\(s\) NOT written/);
-  });
-});
-
-describe('stale_blocked bucket (2026-07-30)', () => {
-  // `blocked` was in NO bucket, so a blocked task aged indefinitely and the stale detector never
-  // mentioned it. Real case: a HIGH task blocked 49 days, invisible even after a BOM fix made it
-  // visible to list-tasks. Blocked is the worst status to omit — pending gets picked up, in_progress
-  // trips an alarm, blocked waits on a third party with nobody watching.
-  let dir: string;
-  let p: BusPaths;
-
-  const write = (id: string, over: Record<string, unknown>) => {
-    const t = {
-      id, title: 't', description: '', type: 'agent', needs_approval: false,
-      status: 'pending', assigned_to: 'boris', created_by: 'paul', org: 'acme',
-      priority: 'high', project: '', kpi_key: null,
-      created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-01T00:00:00Z',
-      completed_at: null, due_date: null, archived: false, ...over,
-    };
-    writeFileSync(join(p.taskDir, `${id}.json`), JSON.stringify(t), 'utf-8');
-  };
-  const hoursAgo = (h: number) =>
-    new Date(Date.now() - h * 3600_000).toISOString().replace(/\.\d{3}Z$/, 'Z');
-
-  beforeEach(() => {
-    dir = mkdtempSync(join(tmpdir(), 'cortextos-blocked-test-'));
-    p = {
-      ctxRoot: dir, inbox: join(dir, 'i'), inflight: join(dir, 'f'), processed: join(dir, 'p'),
-      logDir: join(dir, 'l'), stateDir: join(dir, 's'), taskDir: join(dir, 'tasks'),
-      approvalDir: join(dir, 'a'), analyticsDir: join(dir, 'an'), heartbeatDir: join(dir, 'h'),
-    } as BusPaths;
-    mkdirSync(p.taskDir, { recursive: true });
-  });
-  afterEach(() => rmSync(dir, { recursive: true, force: true }));
-
-  it('reports a long-blocked task — it was in no bucket at all before', () => {
-    write('task_blk_old', { status: 'blocked', updated_at: hoursAgo(49 * 24),
-                            blocked_by: ['task_blocker_1'] });
-    const r = checkStaleTasks(p);
-    expect(r.stale_blocked.map((t) => t.id)).toContain('task_blk_old');
-    // blocked_by travels on the Task, so a caller can see WHAT it waits on without a new field.
-    expect(r.stale_blocked[0].blocked_by).toEqual(['task_blocker_1']);
-  });
-
-  it('NEGATIVE CONTROL: a freshly blocked task is NOT reported — this is a re-check cadence', () => {
-    write('task_blk_new', { status: 'blocked', updated_at: hoursAgo(2) });
-    expect(checkStaleTasks(p).stale_blocked).toEqual([]);
-  });
-
-  it('NEGATIVE CONTROL: blocked does NOT leak into the alarm buckets', () => {
-    // If it did, moving an in_progress item to `blocked` would keep tripping the alarm, and callers
-    // that key severity off those buckets would start treating a normal waiting state as a failure.
-    write('task_blk_leak', { status: 'blocked', updated_at: hoursAgo(49 * 24) });
-    const r = checkStaleTasks(p);
-    expect(r.stale_in_progress).toEqual([]);
-    expect(r.stale_pending).toEqual([]);
-    expect(r.stale_human).toEqual([]);
-  });
-
-  it('recording a blocker does NOT reset the blocked-age clock — the fix must not defeat itself', () => {
-    // ENFORCES an accidental correctness. `addSymmetricEdge` does not bump `updated_at`, which is why a
-    // 49-day blocked task still read 43d after its blocker was recorded rather than resetting to 0.
-    // If it DID bump — the obvious "tidy this to match the other writers" change — then writing a
-    // blocker would reset the age and hide the task from stale_blocked for another 24h. The fix would
-    // be defeated by an unrelated write, and nothing would say so.
-    //
-    // This is the same shape as a sabotage harness that only passes because nobody has touched the
-    // source yet: correctness that survives by luck rather than by constraint.
-    write('task_blk_edge', { status: 'blocked', updated_at: hoursAgo(49 * 24) });
-    const blocker = createTask(p, 'paul', 'acme', 'the blocker', { blocks: ['task_blk_edge'] });
-
-    // FIRST assert the edge actually landed. Without this the test could pass vacuously: a broken
-    // addSymmetricEdge writes nothing, updated_at is trivially unchanged, and the real assertion below
-    // would hold for the wrong reason.
-    const peer = JSON.parse(readFileSync(join(p.taskDir, 'task_blk_edge.json'), 'utf-8'));
-    expect(peer.blocked_by).toContain(blocker);
-
-    // THEN the thing that matters: it is still reported as long-blocked.
-    expect(checkStaleTasks(p).stale_blocked.map((t) => t.id)).toContain('task_blk_edge');
-  });
-
-  it('NEGATIVE CONTROL: the pre-existing buckets still fire — the new branch changed nothing else', () => {
-    write('task_ip', { status: 'in_progress', updated_at: hoursAgo(9) });
-    write('task_pd', { status: 'pending', created_at: hoursAgo(30), updated_at: hoursAgo(30) });
-    const r = checkStaleTasks(p);
-    expect(r.stale_in_progress.map((t) => t.id)).toContain('task_ip');
-    expect(r.stale_pending.map((t) => t.id)).toContain('task_pd');
-  });
-});
-
-/**
- * The task mutation verb gap (2026-07-30). `updateTask` exposed status and priority only, so five
- * agents routed around it in one day — notes into log-event meta, a constraint into a chat message,
- * dependency edges hand-mirrored across three JSON files, and the orchestrator unable to reassign
- * a task at all.
- */
-describe('task mutation verbs', () => {
-  let testDir: string;
-  let paths: BusPaths;
-
-  beforeEach(() => {
-    testDir = mkdtempSync(join(tmpdir(), 'cortextos-verbgap-'));
-    paths = {
-      ctxRoot: testDir,
-      inbox: join(testDir, 'inbox', 'a'),
-      inflight: join(testDir, 'inflight', 'a'),
-      processed: join(testDir, 'processed', 'a'),
-      logDir: join(testDir, 'logs', 'a'),
-      stateDir: join(testDir, 'state', 'a'),
-      taskDir: join(testDir, 'tasks'),
-      approvalDir: join(testDir, 'approvals'),
-      analyticsDir: join(testDir, 'analytics'),
-      heartbeatDir: join(testDir, 'heartbeats'),
-    };
-  });
-  afterEach(() => rmSync(testDir, { recursive: true, force: true }));
-
-  const read = (id: string) => JSON.parse(readFileSync(findTaskFile(paths, id)!, 'utf-8'));
-
-  it('description, project and due_date are mutable after creation', () => {
-    const id = createTask(paths, 'a', 'org', 'T', { description: 'old', project: 'p1' });
-    updateTask(paths, id, 'in_progress', { description: 'new', project: 'p2', dueDate: '2026-08-01T00:00:00Z' });
-    const t = read(id);
-    expect(t.description).toBe('new');
-    expect(t.project).toBe('p2');
-    expect(t.due_date).toBe('2026-08-01T00:00:00Z');
-  });
-
-  /**
-   * THE CHECK NAMED IN THE SCOPE DOC, AND UNTIL NOW IT WAS UNWRITEABLE.
-   *
-   * `createTask` always accepted `dueDate`, but no CLI path passed it, so no task could carry a due
-   * date — which made `checkStaleTasks`'s `overdue` count structurally 0 forever. It was reported
-   * as `overdue: 0` and read as good news the entire time. A gap that renders its own health metric
-   * unfalsifiable is the sharpest possible argument for closing it.
-   */
-  it('overdue can now be non-zero — the metric is falsifiable for the first time', () => {
-    const id = createTask(paths, 'a', 'org', 'overdue one');
-    expect(checkStaleTasks(paths).overdue.length).toBe(0); // control: not yet due
-    updateTask(paths, id, 'pending', { dueDate: '2020-01-01T00:00:00Z' });
-    expect(checkStaleTasks(paths).overdue.map((t) => t.id)).toContain(id);
-  });
-
-  it('reassignment works, and is audited with both sides', () => {
-    const id = createTask(paths, 'a', 'org', 'T', { assignee: 'agent_one' });
-    updateTask(paths, id, 'pending', { assignee: 'agent_two' });
-    expect(read(id).assigned_to).toBe('agent_two');
-    const audit = readTaskAudit(paths, id).find((e) => e.from_assignee !== undefined);
-    expect(audit).toMatchObject({ from_assignee: 'agent_one', to_assignee: 'agent_two' });
-  });
-
-  it('REFUSES to reassign a task another agent holds the claim-lock on', () => {
-    // The one place this work can BREAK something rather than unblock it. Silently overwriting
-    // assigned_to around an O_EXCL claim-lock is the double-pick race the lock exists to prevent.
-    const id = createTask(paths, 'a', 'org', 'T');
-    claimTask(paths, id, 'holder_agent');
-    expect(() => updateTask(paths, id, 'in_progress', { assignee: 'thief_agent' })).toThrow(/claimed by holder_agent/);
-    expect(read(id).assigned_to).toBe('holder_agent'); // and did not partially apply
-  });
-
-  it('allows a reassignment that agrees with the existing lock holder', () => {
-    // Control for the refusal: a guard that refuses everything is as broken as one that refuses
-    // nothing, it just fails loudly instead of silently.
-    const id = createTask(paths, 'a', 'org', 'T');
-    claimTask(paths, id, 'holder_agent');
-    expect(() => updateTask(paths, id, 'in_progress', { assignee: 'holder_agent' })).not.toThrow();
-  });
-
-  it('evidence is stored on the TASK, not only in the audit log', () => {
-    // An answer only the audit log can see is the workaround this field replaces.
-    const id = createTask(paths, 'a', 'org', 'T');
-    claimTask(paths, id, 'a', 'will land in work/foo-SCOPE.md');
-    expect(read(id).evidence).toBe('will land in work/foo-SCOPE.md');
-    completeTask(paths, id, 'done', 'commit abc123');
-    expect(read(id).evidence).toBe('commit abc123');
-  });
-
-  it('evidence set via updateTask is persisted too — not just via claim/complete', () => {
-    // Found by sabotage, not by review: dropping the evidence write in updateTask left the suite
-    // GREEN because both existing evidence tests went through claimTask and completeTask. Three
-    // transitions can set this field and only two were covered.
-    const id = createTask(paths, 'a', 'org', 'T');
-    updateTask(paths, id, 'blocked', { evidence: 'waiting on task_123; nothing produced yet' });
-    expect(read(id).evidence).toBe('waiting on task_123; nothing produced yet');
-  });
-
-  it('accepts a written NEGATIVE RESULT as evidence — the case that killed the typed version', () => {
-    // A field accepting only commit-or-filepath re-creates the blindness it exists to fix.
-    // Eliminations are the most losable results we have because nobody commits a negative.
-    const id = createTask(paths, 'a', 'org', 'investigate');
-    const elimination = 'no commit: ruled out all three theories; the bug does not fire on the cited case';
-    completeTask(paths, id, undefined, elimination);
-    expect(read(id).evidence).toBe(elimination);
-  });
-
-  it('add-dependency writes BOTH edges on an existing task', () => {
-    const blocked = createTask(paths, 'a', 'org', 'blocked');
-    const blocker = createTask(paths, 'a', 'org', 'blocker');
-    addTaskDependency(paths, blocked, blocker);
-    expect(read(blocked).blocked_by).toContain(blocker);
-    expect(read(blocker).blocks).toContain(blocked); // the hand-mirrored half
-  });
-
-  it('add-dependency rejects a cycle introduced AFTER creation', () => {
-    // A cycle added later is identical in effect to one added at creation, so it gets the same check.
-    const x = createTask(paths, 'a', 'org', 'x');
-    const y = createTask(paths, 'a', 'org', 'y');
-    addTaskDependency(paths, x, y);
-    expect(() => addTaskDependency(paths, y, x)).toThrow(/cycle/i);
-  });
-
-  it('remove-dependency clears BOTH edges', () => {
-    // A one-sided removal leaves the blocker claiming to block a task that no longer lists it,
-    // which is worse than the edge existing — the record disagrees with itself.
-    const blocked = createTask(paths, 'a', 'org', 'blocked');
-    const blocker = createTask(paths, 'a', 'org', 'blocker');
-    addTaskDependency(paths, blocked, blocker);
-    removeTaskDependency(paths, blocked, blocker);
-    expect(read(blocked).blocked_by ?? []).not.toContain(blocker);
-    expect(read(blocker).blocks ?? []).not.toContain(blocked);
-  });
-
-  it('add-dependency is idempotent and refuses self-blocking', () => {
-    const a = createTask(paths, 'a', 'org', 'a');
-    const b = createTask(paths, 'a', 'org', 'b');
-    addTaskDependency(paths, a, b);
-    addTaskDependency(paths, a, b);
-    expect(read(a).blocked_by).toEqual([b]);
-    expect(() => addTaskDependency(paths, a, a)).toThrow(/cannot block itself/);
-  });
-});
-
 /**
  * Cross-org task lifecycle — exercises the findTaskFile fallback so an
  * assignee in one org can drive the lifecycle of a task filed by an
@@ -1220,5 +924,304 @@ describe('compactTasks — semantic compaction of old completed tasks', () => {
     expect(report.archived.map(a => a.id)).toEqual([id]);
     // Active JSON still present
     expect(existsSync(join(paths.taskDir, `${id}.json`))).toBe(true);
+  });
+
+  });
+
+});
+
+describe('UTF-8 BOM tolerance (2026-07-30 incident)', () => {
+  // A UTF-8 BOM on ONE task file of 708 made that task invisible to every reader in this module,
+  // because each wrapped JSON.parse in a silent catch. It hid a HIGH-priority, blocked, 49-day-old task
+  // from listTasks AND from checkStaleTasks — the detector whose whole job is finding forgotten work.
+  // The same BOM broke the symmetric-edge WRITE while createTask reported success.
+  //
+  // Self-contained on purpose: an earlier version relied on an enclosing describe's `paths` and silently
+  // landed in the wrong one, producing ENOENT instead of testing anything.
+  let dir: string;
+  let p: BusPaths;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'cortextos-bom-test-'));
+    p = {
+      ctxRoot: dir, inbox: join(dir, 'inbox'), inflight: join(dir, 'inflight'),
+      processed: join(dir, 'processed'), logDir: join(dir, 'logs'), stateDir: join(dir, 'state'),
+      taskDir: join(dir, 'tasks'), approvalDir: join(dir, 'approvals'),
+      analyticsDir: join(dir, 'analytics'), heartbeatDir: join(dir, 'heartbeats'),
+    } as BusPaths;
+    mkdirSync(p.taskDir, { recursive: true });
+  });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  const withBom = (id: string, over: Record<string, unknown> = {}) => {
+    const t = {
+      id, title: 'bom task', description: '', type: 'agent', needs_approval: false,
+      status: 'pending', assigned_to: 'boris', created_by: 'paul', org: 'acme',
+      priority: 'high', project: '', kpi_key: null,
+      created_at: '2026-06-11T02:34:52Z', updated_at: '2026-06-11T02:34:52Z',
+      completed_at: null, due_date: null, archived: false, ...over,
+    };
+    writeFileSync(join(p.taskDir, `${id}.json`), '﻿' + JSON.stringify(t), 'utf-8');
+  };
+
+  it('listTasks SEES a BOM-prefixed task — it was invisible before', () => {
+    withBom('task_bom_001');
+    expect(listTasks(p).map((t) => t.id)).toContain('task_bom_001');
+  });
+
+  it('checkStaleTasks SEES a BOM-prefixed task — the forgotten-work detector was blind to it', () => {
+    withBom('task_bom_002', { created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-01T00:00:00Z' });
+    expect(checkStaleTasks(p).stale_pending.map((t) => t.id)).toContain('task_bom_002');
+  });
+
+  it('a symmetric edge WRITES onto a BOM-prefixed peer — the half-recorded-relationship bug', () => {
+    withBom('task_bom_003');
+    const blocker = createTask(p, 'paul', 'acme', 'blocker', { blocks: ['task_bom_003'] });
+    const peer = JSON.parse(
+      readFileSync(join(p.taskDir, 'task_bom_003.json'), 'utf-8').replace(/^﻿/, ''),
+    );
+    expect(peer.blocked_by).toContain(blocker);
+  });
+
+  it('NEGATIVE CONTROL: a genuinely corrupt peer is REPORTED, not silently skipped', () => {
+    // The BOM was one cause of failure; the SILENT CATCH was the defect. Without this, the edge test
+    // above could pass while every other cause stayed swallowed.
+    writeFileSync(join(p.taskDir, 'task_corrupt_1.json'), '{ not valid json', 'utf-8');
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const id = createTask(p, 'paul', 'acme', 'blocker2', { blocks: ['task_corrupt_1'] });
+    expect(spy).toHaveBeenCalled();
+    expect(String(spy.mock.calls[0][0])).toMatch(/HALF-RECORDED/);
+    spy.mockRestore();
+    const notes = readTaskAudit(p, id).map((e) => e.note ?? '').join(' ');
+    expect(notes).toMatch(/PARTIAL: 1 dependency edge\(s\) NOT written/);
+  });
+});
+
+describe('stale_blocked bucket (2026-07-30)', () => {
+  // `blocked` was in NO bucket, so a blocked task aged indefinitely and the stale detector never
+  // mentioned it. Real case: a HIGH task blocked 49 days, invisible even after a BOM fix made it
+  // visible to list-tasks. Blocked is the worst status to omit — pending gets picked up, in_progress
+  // trips an alarm, blocked waits on a third party with nobody watching.
+  let dir: string;
+  let p: BusPaths;
+
+  const write = (id: string, over: Record<string, unknown>) => {
+    const t = {
+      id, title: 't', description: '', type: 'agent', needs_approval: false,
+      status: 'pending', assigned_to: 'boris', created_by: 'paul', org: 'acme',
+      priority: 'high', project: '', kpi_key: null,
+      created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-01T00:00:00Z',
+      completed_at: null, due_date: null, archived: false, ...over,
+    };
+    writeFileSync(join(p.taskDir, `${id}.json`), JSON.stringify(t), 'utf-8');
+  };
+  const hoursAgo = (h: number) =>
+    new Date(Date.now() - h * 3600_000).toISOString().replace(/\.\d{3}Z$/, 'Z');
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'cortextos-blocked-test-'));
+    p = {
+      ctxRoot: dir, inbox: join(dir, 'i'), inflight: join(dir, 'f'), processed: join(dir, 'p'),
+      logDir: join(dir, 'l'), stateDir: join(dir, 's'), taskDir: join(dir, 'tasks'),
+      approvalDir: join(dir, 'a'), analyticsDir: join(dir, 'an'), heartbeatDir: join(dir, 'h'),
+    } as BusPaths;
+    mkdirSync(p.taskDir, { recursive: true });
+  });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  it('reports a long-blocked task — it was in no bucket at all before', () => {
+    write('task_blk_old', { status: 'blocked', updated_at: hoursAgo(49 * 24),
+                            blocked_by: ['task_blocker_1'] });
+    const r = checkStaleTasks(p);
+    expect(r.stale_blocked.map((t) => t.id)).toContain('task_blk_old');
+    // blocked_by travels on the Task, so a caller can see WHAT it waits on without a new field.
+    expect(r.stale_blocked[0].blocked_by).toEqual(['task_blocker_1']);
+  });
+
+  it('NEGATIVE CONTROL: a freshly blocked task is NOT reported — this is a re-check cadence', () => {
+    write('task_blk_new', { status: 'blocked', updated_at: hoursAgo(2) });
+    expect(checkStaleTasks(p).stale_blocked).toEqual([]);
+  });
+
+  it('NEGATIVE CONTROL: blocked does NOT leak into the alarm buckets', () => {
+    // If it did, moving an in_progress item to `blocked` would keep tripping the alarm, and callers
+    // that key severity off those buckets would start treating a normal waiting state as a failure.
+    write('task_blk_leak', { status: 'blocked', updated_at: hoursAgo(49 * 24) });
+    const r = checkStaleTasks(p);
+    expect(r.stale_in_progress).toEqual([]);
+    expect(r.stale_pending).toEqual([]);
+    expect(r.stale_human).toEqual([]);
+  });
+
+  it('recording a blocker does NOT reset the blocked-age clock — the fix must not defeat itself', () => {
+    // ENFORCES an accidental correctness. `addSymmetricEdge` does not bump `updated_at`, which is why a
+    // 49-day blocked task still read 43d after its blocker was recorded rather than resetting to 0.
+    // If it DID bump — the obvious "tidy this to match the other writers" change — then writing a
+    // blocker would reset the age and hide the task from stale_blocked for another 24h. The fix would
+    // be defeated by an unrelated write, and nothing would say so.
+    //
+    // This is the same shape as a sabotage harness that only passes because nobody has touched the
+    // source yet: correctness that survives by luck rather than by constraint.
+    write('task_blk_edge', { status: 'blocked', updated_at: hoursAgo(49 * 24) });
+    const blocker = createTask(p, 'paul', 'acme', 'the blocker', { blocks: ['task_blk_edge'] });
+
+    // FIRST assert the edge actually landed. Without this the test could pass vacuously: a broken
+    // addSymmetricEdge writes nothing, updated_at is trivially unchanged, and the real assertion below
+    // would hold for the wrong reason.
+    const peer = JSON.parse(readFileSync(join(p.taskDir, 'task_blk_edge.json'), 'utf-8'));
+    expect(peer.blocked_by).toContain(blocker);
+
+    // THEN the thing that matters: it is still reported as long-blocked.
+    expect(checkStaleTasks(p).stale_blocked.map((t) => t.id)).toContain('task_blk_edge');
+  });
+
+  it('NEGATIVE CONTROL: the pre-existing buckets still fire — the new branch changed nothing else', () => {
+    write('task_ip', { status: 'in_progress', updated_at: hoursAgo(9) });
+    write('task_pd', { status: 'pending', created_at: hoursAgo(30), updated_at: hoursAgo(30) });
+    const r = checkStaleTasks(p);
+    expect(r.stale_in_progress.map((t) => t.id)).toContain('task_ip');
+    expect(r.stale_pending.map((t) => t.id)).toContain('task_pd');
+  });
+});
+
+/**
+ * The task mutation verb gap (2026-07-30). `updateTask` exposed status and priority only, so five
+ * agents routed around it in one day — notes into log-event meta, a constraint into a chat message,
+ * dependency edges hand-mirrored across three JSON files, and the orchestrator unable to reassign
+ * a task at all.
+ */
+describe('task mutation verbs', () => {
+  let testDir: string;
+  let paths: BusPaths;
+
+  beforeEach(() => {
+    testDir = mkdtempSync(join(tmpdir(), 'cortextos-verbgap-'));
+    paths = {
+      ctxRoot: testDir,
+      inbox: join(testDir, 'inbox', 'a'),
+      inflight: join(testDir, 'inflight', 'a'),
+      processed: join(testDir, 'processed', 'a'),
+      logDir: join(testDir, 'logs', 'a'),
+      stateDir: join(testDir, 'state', 'a'),
+      taskDir: join(testDir, 'tasks'),
+      approvalDir: join(testDir, 'approvals'),
+      analyticsDir: join(testDir, 'analytics'),
+      heartbeatDir: join(testDir, 'heartbeats'),
+    };
+  });
+  afterEach(() => rmSync(testDir, { recursive: true, force: true }));
+
+  const read = (id: string) => JSON.parse(readFileSync(findTaskFile(paths, id)!, 'utf-8'));
+
+  it('description, project and due_date are mutable after creation', () => {
+    const id = createTask(paths, 'a', 'org', 'T', { description: 'old', project: 'p1' });
+    updateTask(paths, id, 'in_progress', { description: 'new', project: 'p2', dueDate: '2026-08-01T00:00:00Z' });
+    const t = read(id);
+    expect(t.description).toBe('new');
+    expect(t.project).toBe('p2');
+    expect(t.due_date).toBe('2026-08-01T00:00:00Z');
+  });
+
+  /**
+   * THE CHECK NAMED IN THE SCOPE DOC, AND UNTIL NOW IT WAS UNWRITEABLE.
+   *
+   * `createTask` always accepted `dueDate`, but no CLI path passed it, so no task could carry a due
+   * date — which made `checkStaleTasks`'s `overdue` count structurally 0 forever. It was reported
+   * as `overdue: 0` and read as good news the entire time. A gap that renders its own health metric
+   * unfalsifiable is the sharpest possible argument for closing it.
+   */
+  it('overdue can now be non-zero — the metric is falsifiable for the first time', () => {
+    const id = createTask(paths, 'a', 'org', 'overdue one');
+    expect(checkStaleTasks(paths).overdue.length).toBe(0); // control: not yet due
+    updateTask(paths, id, 'pending', { dueDate: '2020-01-01T00:00:00Z' });
+    expect(checkStaleTasks(paths).overdue.map((t) => t.id)).toContain(id);
+  });
+
+  it('reassignment works, and is audited with both sides', () => {
+    const id = createTask(paths, 'a', 'org', 'T', { assignee: 'agent_one' });
+    updateTask(paths, id, 'pending', { assignee: 'agent_two' });
+    expect(read(id).assigned_to).toBe('agent_two');
+    const audit = readTaskAudit(paths, id).find((e) => e.from_assignee !== undefined);
+    expect(audit).toMatchObject({ from_assignee: 'agent_one', to_assignee: 'agent_two' });
+  });
+
+  it('REFUSES to reassign a task another agent holds the claim-lock on', () => {
+    // The one place this work can BREAK something rather than unblock it. Silently overwriting
+    // assigned_to around an O_EXCL claim-lock is the double-pick race the lock exists to prevent.
+    const id = createTask(paths, 'a', 'org', 'T');
+    claimTask(paths, id, 'holder_agent');
+    expect(() => updateTask(paths, id, 'in_progress', { assignee: 'thief_agent' })).toThrow(/claimed by holder_agent/);
+    expect(read(id).assigned_to).toBe('holder_agent'); // and did not partially apply
+  });
+
+  it('allows a reassignment that agrees with the existing lock holder', () => {
+    // Control for the refusal: a guard that refuses everything is as broken as one that refuses
+    // nothing, it just fails loudly instead of silently.
+    const id = createTask(paths, 'a', 'org', 'T');
+    claimTask(paths, id, 'holder_agent');
+    expect(() => updateTask(paths, id, 'in_progress', { assignee: 'holder_agent' })).not.toThrow();
+  });
+
+  it('evidence is stored on the TASK, not only in the audit log', () => {
+    // An answer only the audit log can see is the workaround this field replaces.
+    const id = createTask(paths, 'a', 'org', 'T');
+    claimTask(paths, id, 'a', 'will land in work/foo-SCOPE.md');
+    expect(read(id).evidence).toBe('will land in work/foo-SCOPE.md');
+    completeTask(paths, id, 'done', 'commit abc123');
+    expect(read(id).evidence).toBe('commit abc123');
+  });
+
+  it('evidence set via updateTask is persisted too — not just via claim/complete', () => {
+    // Found by sabotage, not by review: dropping the evidence write in updateTask left the suite
+    // GREEN because both existing evidence tests went through claimTask and completeTask. Three
+    // transitions can set this field and only two were covered.
+    const id = createTask(paths, 'a', 'org', 'T');
+    updateTask(paths, id, 'blocked', { evidence: 'waiting on task_123; nothing produced yet' });
+    expect(read(id).evidence).toBe('waiting on task_123; nothing produced yet');
+  });
+
+  it('accepts a written NEGATIVE RESULT as evidence — the case that killed the typed version', () => {
+    // A field accepting only commit-or-filepath re-creates the blindness it exists to fix.
+    // Eliminations are the most losable results we have because nobody commits a negative.
+    const id = createTask(paths, 'a', 'org', 'investigate');
+    const elimination = 'no commit: ruled out all three theories; the bug does not fire on the cited case';
+    completeTask(paths, id, undefined, elimination);
+    expect(read(id).evidence).toBe(elimination);
+  });
+
+  it('add-dependency writes BOTH edges on an existing task', () => {
+    const blocked = createTask(paths, 'a', 'org', 'blocked');
+    const blocker = createTask(paths, 'a', 'org', 'blocker');
+    addTaskDependency(paths, blocked, blocker);
+    expect(read(blocked).blocked_by).toContain(blocker);
+    expect(read(blocker).blocks).toContain(blocked); // the hand-mirrored half
+  });
+
+  it('add-dependency rejects a cycle introduced AFTER creation', () => {
+    // A cycle added later is identical in effect to one added at creation, so it gets the same check.
+    const x = createTask(paths, 'a', 'org', 'x');
+    const y = createTask(paths, 'a', 'org', 'y');
+    addTaskDependency(paths, x, y);
+    expect(() => addTaskDependency(paths, y, x)).toThrow(/cycle/i);
+  });
+
+  it('remove-dependency clears BOTH edges', () => {
+    // A one-sided removal leaves the blocker claiming to block a task that no longer lists it,
+    // which is worse than the edge existing — the record disagrees with itself.
+    const blocked = createTask(paths, 'a', 'org', 'blocked');
+    const blocker = createTask(paths, 'a', 'org', 'blocker');
+    addTaskDependency(paths, blocked, blocker);
+    removeTaskDependency(paths, blocked, blocker);
+    expect(read(blocked).blocked_by ?? []).not.toContain(blocker);
+    expect(read(blocker).blocks ?? []).not.toContain(blocked);
+  });
+
+  it('add-dependency is idempotent and refuses self-blocking', () => {
+    const a = createTask(paths, 'a', 'org', 'a');
+    const b = createTask(paths, 'a', 'org', 'b');
+    addTaskDependency(paths, a, b);
+    addTaskDependency(paths, a, b);
+    expect(read(a).blocked_by).toEqual([b]);
+    expect(() => addTaskDependency(paths, a, a)).toThrow(/cannot block itself/);
   });
 });
