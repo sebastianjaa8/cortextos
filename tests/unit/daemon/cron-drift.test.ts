@@ -32,7 +32,7 @@ vi.mock('../../../src/daemon/cron-snapshot.js', async (importOriginal) => {
   };
 });
 
-import { detectConfigCronDrift, detectMissingMigrationMarker, detectScheduleContradictsPrompt, formatDriftFindings, countActionableFindings, statedTimeCoverage, sweepConfigCronDrift, listExcludedRetiredAgents, wipeConditionArmed } from '../../../src/daemon/cron-drift.js';
+import { detectConfigCronDrift, detectMissingMigrationMarker, detectScheduleContradictsPrompt, formatDriftFindings, countActionableFindings, statedTimeCoverage, sweepConfigCronDrift, listExcludedRetiredAgents, wipeConditionArmed, liveCronComparisonCoverage } from '../../../src/daemon/cron-drift.js';
 import type { CronDriftFinding } from '../../../src/daemon/cron-drift.js';
 import { migrateCronsForAgent } from '../../../src/daemon/cron-migration.js';
 import { CRONS_DIRECTORY } from '../../../src/bus/crons-schema.js';
@@ -864,5 +864,118 @@ describe('wipeConditionArmed', () => {
   it('accepts the bare-array crons.json shape as well as the wrapped one', () => {
     seed({ marker: false, crons: [{ name: 'bare-form' }] });
     expect(wipeConditionArmed(A, tmp)).toEqual(['bare-form']);
+  });
+});
+
+/**
+ * task_1785672685330_40401679: detectConfigCronDrift can only generate a finding for a live cron
+ * that has a config.json counterpart. Measured on the real fleet 2026-08-02: 36 of 118 (31%) —
+ * so a clean report was a true statement about less than a third of the fleet and read as
+ * fleet-wide. This is the denominator that makes the partial check honest instead of vacuous.
+ */
+describe('liveCronComparisonCoverage', () => {
+  const A = 'probe_agent';
+  let prevFrameworkRoot: string | undefined;
+
+  function writeLiveCrons(names: string[]): void {
+    const dir = join(tmp, CRONS_DIRECTORY, A);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, 'crons.json'),
+      JSON.stringify({
+        updated_at: '2026-08-02T00:00:00Z',
+        crons: names.map((n) => ({ name: n, schedule: '2h', prompt: 'x', enabled: true })),
+      }),
+      'utf-8',
+    );
+  }
+
+  function writeAgentConfig(names: string[]): void {
+    prevFrameworkRoot = process.env.CTX_FRAMEWORK_ROOT;
+    process.env.CTX_FRAMEWORK_ROOT = tmp;
+    const dir = join(tmp, 'orgs', 'testorg', 'agents', A);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, 'config.json'),
+      JSON.stringify({ agent_name: A, crons: names.map((n) => ({ name: n, interval: '2h', prompt: 'x' })) }),
+      'utf-8',
+    );
+  }
+
+  afterEach(() => {
+    if (prevFrameworkRoot === undefined) delete process.env.CTX_FRAMEWORK_ROOT;
+    else process.env.CTX_FRAMEWORK_ROOT = prevFrameworkRoot;
+  });
+
+  it('counts only live crons with a config.json counterpart as compared', () => {
+    writeLiveCrons(['heartbeat', 'unified-watchdog', 'sabotage-weekly']);
+    writeAgentConfig(['heartbeat']); // only 1 of 3 live crons named in config.json
+    const c = liveCronComparisonCoverage(tmp);
+    expect(c.totalLive).toBe(3);
+    expect(c.compared).toBe(1);
+    expect(c.uncomparable.sort((a, b) => a.cron.localeCompare(b.cron))).toEqual([
+      { agent: A, cron: 'sabotage-weekly' },
+      { agent: A, cron: 'unified-watchdog' },
+    ]);
+  });
+
+  // MUST-FAIL CASE (the task's own phrasing): add a live cron with no config entry and the
+  // uncomparable count must RISE — a number that has to MOVE, not a red that has to appear.
+  it('MUST-FAIL CASE: adding a live cron with no config counterpart raises uncomparable, not compared', () => {
+    writeLiveCrons(['heartbeat']);
+    writeAgentConfig(['heartbeat']);
+    const before = liveCronComparisonCoverage(tmp);
+    expect(before.compared).toBe(1);
+    expect(before.uncomparable).toEqual([]);
+
+    writeLiveCrons(['heartbeat', 'new-uncomparable-cron']);
+    const after = liveCronComparisonCoverage(tmp);
+    expect(after.totalLive).toBe(before.totalLive + 1);
+    expect(after.compared).toBe(before.compared); // unchanged — the new cron is NOT comparable
+    expect(after.uncomparable).toEqual([{ agent: A, cron: 'new-uncomparable-cron' }]);
+  });
+
+  // PAIRED NEGATIVE: adding a live cron that DOES have a config entry must raise `compared`,
+  // not `uncomparable` — otherwise the fix could pass the must-fail case by never incrementing
+  // `compared` at all.
+  it('PAIRED NEGATIVE: adding a live cron WITH a config counterpart raises compared, not uncomparable', () => {
+    writeLiveCrons(['heartbeat']);
+    writeAgentConfig(['heartbeat', 'new-comparable-cron']); // config already names the future cron
+    const before = liveCronComparisonCoverage(tmp);
+    expect(before.compared).toBe(1);
+
+    writeLiveCrons(['heartbeat', 'new-comparable-cron']);
+    const after = liveCronComparisonCoverage(tmp);
+    expect(after.compared).toBe(before.compared + 1);
+    expect(after.uncomparable).toEqual([]);
+  });
+
+  it('a live cron matches a config entry by name only after the isUnmigratable filter', () => {
+    // A one-shot config entry is never going to generate a finding either (migration declines to
+    // convert it) — it must not inflate `compared` by matching a live cron of the same name.
+    writeLiveCrons(['midnight-job']);
+    prevFrameworkRoot = process.env.CTX_FRAMEWORK_ROOT;
+    process.env.CTX_FRAMEWORK_ROOT = tmp;
+    const dir = join(tmp, 'orgs', 'testorg', 'agents', A);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, 'config.json'),
+      JSON.stringify({ agent_name: A, crons: [{ name: 'midnight-job', type: 'once', fire_at: '2026-12-01T00:00:00Z', prompt: 'x' }] }),
+      'utf-8',
+    );
+    const c = liveCronComparisonCoverage(tmp);
+    expect(c.compared).toBe(0);
+    expect(c.uncomparable).toEqual([{ agent: A, cron: 'midnight-job' }]);
+  });
+
+  it('an agent with live crons and NO config.json at all counts every live cron as uncomparable', () => {
+    writeLiveCrons(['a', 'b']);
+    prevFrameworkRoot = process.env.CTX_FRAMEWORK_ROOT;
+    process.env.CTX_FRAMEWORK_ROOT = tmp; // orgs/ exists but this agent has no config.json under it
+    mkdirSync(join(tmp, 'orgs', 'testorg', 'agents'), { recursive: true });
+    const c = liveCronComparisonCoverage(tmp);
+    expect(c.totalLive).toBe(2);
+    expect(c.compared).toBe(0);
+    expect(c.uncomparable.map((u) => u.cron).sort()).toEqual(['a', 'b']);
   });
 });

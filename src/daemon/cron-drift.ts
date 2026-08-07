@@ -274,6 +274,91 @@ export function sweepConfigCronDrift(frameworkRoot: string): CronDriftFinding[] 
   return findings;
 }
 
+/**
+ * Locate `orgs/<org>/agents/<agentName>/config.json`, or null if the agent has none.
+ *
+ * `sweepConfigCronDrift` discovers this path by walking `orgs/` outward (org, then agent). This
+ * does the same walk in reverse (agent name in, path out) so `liveCronComparisonCoverage` can ask
+ * "does THIS live agent have a config.json" without re-deriving the enumeration a second way —
+ * two independent walks of the same directory tree is how a fleet-wide claim quietly drifts from
+ * what the primary sweep actually covers.
+ */
+function findAgentConfigPath(frameworkRoot: string, agentName: string): string | null {
+  const orgsBase = join(frameworkRoot, 'orgs');
+  if (!existsSync(orgsBase)) return null;
+  for (const org of readdirSync(orgsBase, { withFileTypes: true })) {
+    if (!org.isDirectory()) continue;
+    const configPath = join(orgsBase, org.name, 'agents', agentName, 'config.json');
+    if (existsSync(configPath)) return configPath;
+  }
+  return null;
+}
+
+/**
+ * How many of the fleet's LIVE crons this tool can even see.
+ *
+ * Found 2026-08-02: `detectConfigCronDrift` drives its comparison with
+ * `for (const entry of configCrons)` — a live cron with no config.json counterpart cannot generate
+ * a finding of ANY kind, comparable or not. Measured that day: 36 of 118 live crons had a config
+ * entry at all (31%), so "22 prompt-differs, 0 missing-live" was a true statement about less than a
+ * third of the fleet that read as fleet-wide. Concrete cost: builder_1's own sabotage-weekly
+ * rewrite was invisible to the report because 8 of builder_1's 9 crons were never compared.
+ *
+ * NOT FIXED BY ADDING A NEW FINDING CLASS. A live-cron-with-no-config-entry is not a defective
+ * cron — config.json is dead text after `.crons-migrated`, so its absence from config.json is
+ * evidence config.json is not a roster, not evidence anything is wrong. Making it a finding class
+ * would manufacture ~82 permanent, unactionable findings — the guard-arm-check failure mode, a red
+ * that means nothing on every run. THE FIX IS THE DENOMINATOR: state how much of the fleet this
+ * tool actually compared, so a partial check reads as partial rather than as complete.
+ *
+ * `compared` counts live crons whose name appears in their agent's config.json (after the same
+ * `isUnmigratable` filter `detectConfigCronDrift` applies — a one-shot or scheduleless config
+ * entry was never going to generate a finding either, so it must not inflate `compared`).
+ * `uncomparable` names every live cron that fell on the other side, same "state what was excluded"
+ * discipline as `listExcludedRetiredAgents` and `utcOnlyExcluded` — a bare `M-N` invites exactly
+ * the "trust the number" failure this function exists to prevent.
+ */
+export function liveCronComparisonCoverage(frameworkRoot: string): {
+  compared: number;
+  totalLive: number;
+  uncomparable: Array<{ agent: string; cron: string }>;
+} {
+  let compared = 0;
+  let totalLive = 0;
+  const uncomparable: Array<{ agent: string; cron: string }> = [];
+  const retired = disabledAgents();
+
+  for (const agentName of listStateAgents()) {
+    if (retired.has(agentName)) continue;
+    let live: CronDefinition[];
+    try {
+      live = readCrons(agentName);
+    } catch {
+      continue;
+    }
+    totalLive += live.length;
+
+    const configPath = findAgentConfigPath(frameworkRoot, agentName);
+    const configNames = new Set<string>();
+    if (configPath) {
+      for (const entry of readConfigCrons(configPath)) {
+        if (!entry || typeof entry.name !== 'string') continue;
+        if (isUnmigratable(entry)) continue;
+        configNames.add(entry.name);
+      }
+    }
+
+    for (const cron of live) {
+      if (configNames.has(cron.name)) {
+        compared++;
+      } else {
+        uncomparable.push({ agent: agentName, cron: cron.name });
+      }
+    }
+  }
+
+  return { compared, totalLive, uncomparable };
+}
 
 /**
  * A time token is DISCLAIMED when a negator governs it in the same clause: "not 8am ET",
