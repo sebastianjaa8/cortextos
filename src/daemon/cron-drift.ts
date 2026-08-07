@@ -639,6 +639,24 @@ const KIND_EXPLAINER: Record<CronDriftKind, string> = {
 };
 
 /**
+ * How many findings are NOT the `prompt-differs` kind — the single source of truth for "actionable"
+ * used by both the console report (via the split below) and the `--notify` bus message headline.
+ *
+ * ADDED 2026-08-04 (seb_boss, on the cron-drift-daily fire that produced 22 prompt-differs and 0
+ * anything else): the `--notify` headline used raw `findings.length` while the body already demoted
+ * prompt-differs to a subordinate count — so a reader who stopped at the headline saw an alarm ("22
+ * edit(s) not in effect") that the body immediately contradicted ("the norm, not an event"). A
+ * headline that fires identically on a clean run and a real one is exactly the "22 non-actions
+ * training the reader to skip the line where the real finding appears" failure this file already
+ * built `formatDriftFindings`'s liveVsLive/configVsLive/promptDiffers split to avoid — the split just
+ * never reached the notify path. This function exists so the headline count and the report's own
+ * demotion logic cannot drift apart the way GUARDRAILS #100 describes for any duplicated fact.
+ */
+export function countActionableFindings(findings: CronDriftFinding[]): number {
+  return findings.filter((f) => f.kind !== 'prompt-differs').length;
+}
+
+/**
  * One-line-per-finding summary, used by the CLI and by the consolidated bus message.
  *
  * SPLIT BY WHETHER THE COMPARISON HAS A LIVE SOURCE OF TRUTH ON BOTH SIDES, because that split is
