@@ -66,6 +66,13 @@ export class TelegramPoller {
   /** Why the poll loop last exited; consumed by AgentManager supervision. */
   lastExitReason = '';
 
+  /**
+   * @param offsetFileSuffix Optional distinct suffix for the offset file.
+   *   When omitted, offset persists to `.telegram-offset`. Provide a suffix
+   *   when running a second poller in the same stateDir against a different
+   *   bot token (e.g. an activity-channel bot alongside the agent's own bot),
+   *   so the two pollers do not clobber each other's offsets.
+   */
   constructor(
     private readonly api: TelegramAPI,
     private readonly stateDir: string,
@@ -92,6 +99,12 @@ export class TelegramPoller {
     this.callbackHandlers.push(handler);
   }
 
+  /**
+   * Register a handler for message_reaction updates. These fire when a
+   * user adds or removes an emoji reaction on a chat message the bot can
+   * see. Requires the bot's getUpdates call to include `message_reaction`
+   * in allowed_updates (handled by TelegramAPI.getUpdates).
+   */
   onReaction(handler: ReactionHandler): void {
     this.reactionHandlers.push(handler);
   }

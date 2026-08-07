@@ -75,6 +75,10 @@ export const ecosystemCommand = new Command('ecosystem')
     }
 
     const dashboardDir = join(projectRoot, 'dashboard');
+    // BUG-019 + cycle-2 finding: require BOTH package.json AND node_modules/.bin/next.
+    // Without the second check, running `cortextos ecosystem` before `npm install`
+    // in dashboard/ produces a crash-looped PM2 entry. Skip the dashboard entry
+    // until deps are installed; re-run `cortextos ecosystem` afterwards to add it.
     const hasDashboard = existsSync(join(dashboardDir, 'package.json')) &&
       existsSync(join(dashboardDir, 'node_modules', '.bin', 'next'));
     const dashboardScriptExpression = process.platform === 'win32'

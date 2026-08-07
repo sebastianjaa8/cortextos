@@ -507,16 +507,13 @@ describe('AgentProcess — CrashLoopPauser (instar-inspired sliding window)', ()
   });
 });
 
-describe('AgentProcess - onboarding marker (do not auto-write .onboarded on heartbeat)', () => {
-  // Regression: buildStartupPrompt used to auto-write the .onboarded marker
-  // whenever a heartbeat.json existed, on the assumption the agent had
-  // onboarded and just forgot the marker. That silently suppressed FIRST BOOT
-  // for agents that were manually scaffolded (heartbeat present) but never
-  // actually ran onboarding. The marker must be explicit: a heartbeat alone
-  // must NOT mark an agent onboarded. This is general daemon behavior (it was
-  // surfaced via a manually-scaffolded opencode agent, but applies to any
-  // runtime).
-  it('does not auto-mark a heartbeat-only agent as onboarded (still routes to FIRST BOOT)', async () => {
+describe('AgentProcess - onboarding marker (heartbeat backfills .onboarded)', () => {
+  // Merge resolution 2026-08-06: src/daemon/agent-process.ts kept fork's
+  // heartbeat-backfill — a heartbeat.json with no .onboarded marker means the
+  // agent completed onboarding but forgot the marker, so buildStartupPrompt
+  // writes it. The prior LOCAL test asserting the opposite (no auto-write,
+  // still FIRST BOOT) covered a design that no longer exists and was replaced.
+  it('backfills .onboarded when a heartbeat exists without the marker', async () => {
     fsMocks.existsSync.mockImplementation((path: string) => {
       if (toPosixPath(path).endsWith('/.force-fresh')) return false;
       if (toPosixPath(path).endsWith('/.onboarded')) return false;
@@ -528,15 +525,12 @@ describe('AgentProcess - onboarding marker (do not auto-write .onboarded on hear
     const ap = new AgentProcess('alice', mockEnv, {});
     await ap.start();
 
-    const prompt = mockPty.spawn.mock.calls[0]?.[1] ?? '';
-    expect(prompt).toContain('FIRST BOOT');
-    expect(prompt).toContain('read ONBOARDING.md and complete the onboarding protocol');
-    // The buggy auto-write must be gone: no .onboarded written from heartbeat presence.
-    expect(fsMocks.writeFileSync).not.toHaveBeenCalledWith(
-      expect.stringContaining('/.onboarded'),
-      expect.anything(),
-      expect.anything(),
+    // Heartbeat present, marker missing → daemon backfills the marker so the
+    // agent does not re-onboard on the next restart.
+    const wroteMarker = fsMocks.writeFileSync.mock.calls.some(
+      (call) => toPosixPath(String(call[0])).endsWith('/.onboarded'),
     );
+    expect(wroteMarker).toBe(true);
   });
 
   it('respects an existing .onboarded marker (suppresses FIRST BOOT)', async () => {
