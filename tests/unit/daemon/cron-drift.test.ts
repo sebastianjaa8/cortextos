@@ -318,6 +318,44 @@ describe('detectScheduleContradictsPrompt', () => {
     ).toEqual([]);
   });
 
+  // Found 2026-08-07 on the real fleet: seb_boss/branch-consolidation's prompt documents its own
+  // UTC->ET conversion ("nightly 3am UTC = 11pm ET"), which is exactly the good practice this
+  // checker exists to reward. The old 20-char lookahead let "3am" reach past "11pm" to claim the
+  // distant "ET" that belongs to "11pm ET", producing a false stated hour of 3 instead of the real
+  // claim, 23 — and the schedule (0 3 * * *, 03:00 UTC = 23:00 ET) is correct and must stay silent.
+  it('does NOT flag a prompt that documents its own UTC->ET conversion (the branch-consolidation case)', () => {
+    expect(
+      detectScheduleContradictsPrompt(
+        AGENT,
+        [live({
+          name: 'branch-consolidation',
+          schedule: '0 3 * * *',
+          prompt: 'BRANCH CONSOLIDATION BATCH (nightly 3am UTC = 11pm ET). Standing directive...',
+        })],
+        TZ,
+      ),
+    ).toEqual([]);
+  });
+
+  // Both directions, same discipline as every other guard in this file: rejecting the decoy token
+  // (the one with no tz suffix of its own) must not also swallow the token that IS correctly
+  // attached to that suffix — it gets its own turn at the same "ET" once the decoy is out of the
+  // way, and a genuine mismatch on THAT token must still surface.
+  it('STILL FLAGS when the token correctly attached to ET does not match the schedule', () => {
+    const findings = detectScheduleContradictsPrompt(
+      AGENT,
+      [live({
+        name: 'probe',
+        schedule: '0 16 * * *', // 16:00 UTC = 12pm ET
+        // "9am" is the decoy (rejected, second-token-between); "5am ET" is the token immediately
+        // preceding the suffix and is the only surviving claim — 12 is not in [5].
+        prompt: 'Runs 9am UTC = 5am ET today.',
+      })],
+      TZ,
+    );
+    expect(findings).toHaveLength(1);
+  });
+
   // A matcher over prose fires on prose ABOUT the thing. Documenting WHY a schedule is right
   // introduces the rejected alternative into the same text, so the better the note the likelier
   // it trips the check. Each case below states a CORRECT schedule and must stay silent.

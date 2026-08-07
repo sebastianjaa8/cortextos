@@ -338,6 +338,21 @@ const THRESHOLD_BY =
  * The alternative fix considered and REJECTED — "treat the FIRST stated time as the claim" —
  * handles chef's ordering and fails on the equally natural "not 8am ET, but 12pm ET". A negator
  * lookback is order-independent, so it subsumes the positional rule rather than complementing it.
+ *
+ * SECOND TOKEN BETWEEN A CANDIDATE AND THE TZ SUFFIX IT IS ABOUT TO CLAIM (found 2026-08-07,
+ * seb_boss/branch-consolidation). A prompt documenting its own UTC->ET conversion — "nightly 3am
+ * UTC = 11pm ET" — is exactly the good practice this checker exists to reward, and it broke the
+ * lookahead: "3am" has no ET suffix of its own, but the 20-char forward window reaches past "11pm"
+ * to the real "ET" and claims hour 3 instead of the real claim, hour 23. Confirmed by reproducing
+ * the regex against the verbatim live prompt: single match, h=3, meridiem=am.
+ *
+ * FIX, seb_boss's call over nearest-preceding (which would need a distance heuristic and risks
+ * NEW false negatives on the negation/threshold shapes above): reject a candidate outright when
+ * ANOTHER digit+meridiem token sits in the gap between it and its claimed suffix, rather than
+ * guessing which token the suffix really belongs to. The rejected token's own hour is not counted.
+ * The gap is re-scanned from right after the rejected token (not from the end of the whole match),
+ * so "11pm" gets its own turn against the same "ET" and is correctly counted at hour 23 — nothing
+ * extra needed, because with the intervening token gone the second candidate's own gap is empty.
  */
 function extractLocalHours(prompt: string): {
   stated: Array<{ hour: number; raw: string }>;
@@ -347,9 +362,23 @@ function extractLocalHours(prompt: string): {
   const stated: Array<{ hour: number; raw: string }> = [];
   let disclaimed = 0;
   let threshold = 0;
-  const re = /\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b[^.\n]{0,20}?\b(ET|EST|EDT|local)\b/gi;
-  for (const m of prompt.matchAll(re)) {
-    let h = parseInt(m[1], 10);
+  // Group 1 isolates the token text so its end position is known without re-deriving it from
+  // m[3] (am/pm), which could theoretically recur inside the gap text and pick the wrong offset.
+  const re =
+    /\b((\d{1,2})(?::(\d{2}))?\s*(am|pm))\b([^.\n]{0,20}?)\b(ET|EST|EDT|local)\b/gi;
+  const INTERVENING_TOKEN = /\d{1,2}(?::\d{2})?\s*(?:am|pm)\b/i;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(prompt)) !== null) {
+    const [, token, hourStr, , meridiem, gap] = m;
+    const tokenEnd = m.index + token.length;
+    if (INTERVENING_TOKEN.test(gap)) {
+      // Do not credit this token's hour — the tz suffix ahead belongs to the intervening one.
+      // Resume scanning right after THIS token so the intervening one gets its own candidacy
+      // against the same suffix, rather than skipping past it with the rest of the match.
+      re.lastIndex = tokenEnd;
+      continue;
+    }
+    let h = parseInt(hourStr, 10);
     if (h < 1 || h > 12) continue;
     const lookback = prompt.slice(Math.max(0, m.index - 40), m.index);
     // Negation first, so a token carrying both ("not before 8am ET") keeps its existing
@@ -362,8 +391,8 @@ function extractLocalHours(prompt: string): {
       threshold++;
       continue;
     }
-    if (/pm/i.test(m[3]) && h !== 12) h += 12;
-    if (/am/i.test(m[3]) && h === 12) h = 0;
+    if (/pm/i.test(meridiem) && h !== 12) h += 12;
+    if (/am/i.test(meridiem) && h === 12) h = 0;
     stated.push({ hour: h, raw: m[0].trim() });
   }
   return { stated, disclaimed, threshold };
