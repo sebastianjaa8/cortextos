@@ -80,3 +80,7 @@ WINDOWS_INSTALL_REPORT.md
 *INSTALL_REPORT.md
 /PHASE*-REPORT.md
 docs/phase-reports/
+
+# Python bytecode, anywhere. Added 2026-08-07: scripts/__pycache__/ was showing as untracked
+# because only knowledge-base/**/__pycache__/ was covered, never the repo-root scripts/ dir.
+__pycache__/
