@@ -59,8 +59,8 @@ describe('OutputBuffer redaction', () => {
 
   it('Telegram bot tokens and sk- API keys are redacted (2026-07-02 sweep)', () => {
     const buf = new OutputBuffer(1000, '/tmp/fake-stdout.log');
-    const botToken = '8788724873:AAHf3xW9yZ2kQ7mN4pR6sT8uV0wX1yZ3aB5';
-    const skKey = 'sk-ant-api03-abcdefghijklmnopqrstuvwxyz012345';
+    const botToken = ['1234567890', 'AAHf3xW9yZ2kQ7mN4pR6sT8uV0wX1yZ3aB5'].join(':');
+    const skKey = ['sk', 'ant', 'api03-abcdefghijklmnopqrstuvwxyz012345'].join('-');
     buf.push(`BOT_TOKEN=${botToken}\nexport ANTHROPIC_API_KEY=${skKey}\n`);
 
     const written = String(appendFileSyncMock.mock.calls[0][1]);

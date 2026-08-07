@@ -196,7 +196,7 @@ describe('Sprint 7: Environment & Config Completeness', () => {
 
     it('TC-B leak: agentDir not under frameworkRoot throws sandbox/live leak error', () => {
       const fwRoot = join(testDir, 'sandbox');
-      const liveAgentDir = '/Users/cortextos/cortextos/orgs/testorg/agents/cortext-designer';
+      const liveAgentDir = '/home/operator/cortextos/orgs/testorg/agents/cortext-designer';
       expect(() => resolveEnv({
         frameworkRoot: fwRoot,
         agentDir: liveAgentDir,
@@ -209,7 +209,7 @@ describe('Sprint 7: Environment & Config Completeness', () => {
       expect(() => resolveEnv({
         frameworkRoot: fwRoot,
         agentDir: join(fwRoot, 'orgs', 'foo', 'agents', 'bar'),
-        projectRoot: '/Users/cortextos/cortextos',
+        projectRoot: '/home/operator/cortextos',
         agentName: 'bar',
       })).toThrow(/must equal CTX_FRAMEWORK_ROOT/);
     });
