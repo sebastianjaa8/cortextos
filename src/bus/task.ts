@@ -341,6 +341,16 @@ export function findTaskFile(paths: BusPaths, taskId: string): string | null {
  * The change is audited rather than silent. A priority edit appends a `from_priority`/`to_priority`
  * audit entry, because an unlogged mutation to the field that decides work order is exactly the kind
  * of quiet state change the append-only log exists to prevent.
+ *
+ * REASSIGNMENT USED TO BE AUDITED AND SILENT AT THE SAME TIME (task_1785781154932_38520243, found
+ * by analyst 2026-08-03). `create-task --assignee` notifies the new owner (issue #78); this path
+ * had no equivalent — the record was correct and nobody was told, which is worse than a wrong
+ * record: a wrong `assigned_to` eventually surfaces as a contradiction, an unnotified-but-correct
+ * one is silently consistent and simply never acted on. Returning `{ reassigned, prevAssignee,
+ * assignee }` (rather than notifying from inside this function) keeps the CLI as the one place
+ * that decides IF and WHOM to message — same layering as `createTask`, and it reuses the exact
+ * `assignee !== prevAssignee` condition the audit log already computes, so "was this a real
+ * reassignment" cannot answer differently for the log than for the notification.
  */
 export function updateTask(
   paths: BusPaths,
@@ -355,7 +365,7 @@ export function updateTask(
     dueDate?: string;
     evidence?: string;
   },
-): void {
+): { reassigned: boolean; prevAssignee?: string; assignee?: string } {
   const filePath = findTaskFile(paths, taskId);
   if (!filePath) {
     throw new Error(
@@ -448,6 +458,11 @@ export function updateTask(
       : {}),
     ...(opts?.evidence !== undefined ? { evidence: opts.evidence } : {}),
   });
+  return {
+    reassigned: opts?.assignee !== undefined && opts.assignee !== prevAssignee,
+    prevAssignee,
+    assignee,
+  };
 }
 
 /**

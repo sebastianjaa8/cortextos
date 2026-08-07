@@ -101,6 +101,32 @@ describe('Task Management', () => {
       expect(content.status).toBe('in_progress');
     });
 
+    // task_1785781154932_38520243: update-task reassigned silently — the record changed owner and
+    // nobody was told. Fixed by having updateTask RETURN whether a real reassignment happened (the
+    // CLI decides whom to notify from this, reusing the exact `assignee !== prevAssignee` condition
+    // the audit log already computes, so the log and the notification cannot disagree about what
+    // counts as a real change).
+    describe('return value (drives the CLI reassignment notify)', () => {
+      it('reports reassigned=true with both the old and new assignee on a real change', () => {
+        const taskId = createTask(paths, 'paul', 'acme', 'Owned', { assignee: 'boris' });
+        const result = updateTask(paths, taskId, 'in_progress', { assignee: 'nadia' });
+        expect(result).toEqual({ reassigned: true, prevAssignee: 'boris', assignee: 'nadia' });
+      });
+
+      it('reports reassigned=false when --assignee is not passed at all (status-only update)', () => {
+        const taskId = createTask(paths, 'paul', 'acme', 'Untouched', { assignee: 'boris' });
+        const result = updateTask(paths, taskId, 'in_progress');
+        expect(result.reassigned).toBe(false);
+        expect(result.assignee).toBe('boris'); // still names the CURRENT assignee, just unchanged
+      });
+
+      it('reports reassigned=false on a no-op re-assertion of the same assignee', () => {
+        const taskId = createTask(paths, 'paul', 'acme', 'Same owner', { assignee: 'boris' });
+        const result = updateTask(paths, taskId, 'in_progress', { assignee: 'boris' });
+        expect(result.reassigned).toBe(false);
+      });
+    });
+
     // Priority was CREATE-ONLY until 2026-07-30, which made every re-prioritisation narrative: an
     // agent could announce "moved off low" while the store kept `low` forever. Agents pick the
     // highest-priority task, so a frozen field means sorting by what mattered when it was FILED.
