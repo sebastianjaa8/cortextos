@@ -504,11 +504,68 @@ def already_exists(collection, doc_id):
     return bool(existing and existing["ids"])
 
 
+def _prior_chunk_count(collection, file_path):
+    """chunk0's OWN stored `total_chunks` metadata — MUST be read before this run's upsert loop
+    can overwrite chunk0 with the NEW count, or the comparison compares a value to itself.
+
+    Conservative on the unknown side: any lookup failure, missing chunk0 (never ingested before),
+    or an absent/non-integer `total_chunks` all degrade to 0 (report as "nothing prior") rather
+    than guessing — a value this function invents cannot be told apart from one it read.
+    """
+    try:
+        existing = collection.get(ids=[file_id(file_path, 0)], include=["metadatas"])
+        metadatas = existing.get("metadatas") or []
+        total = (metadatas[0] or {}).get("total_chunks", 0) if metadatas else 0
+        return total if isinstance(total, int) else 0
+    except Exception:
+        return 0
+
+
+def prune_orphaned_chunks(collection, file_path, new_chunk_count, old_chunk_count):
+    """Delete chunks left behind by a longer earlier version of this file.
+
+    task_1785777463567_02346145. `doc_id = md5(path)_chunkN`; ingest only ever writes
+    chunk0..new_chunk_count-1 for the CURRENT content. Nothing else has ever removed a higher
+    index a longer earlier version left behind, so a file that SHRINKS keeps serving its deleted
+    content forever, attributed to the still-live path. Demonstrated: a 23,468-byte file (30
+    chunks) rewritten to 4,283 bytes (6 chunks) left indices 6..29 retrievable — a query on the
+    REMOVED text still returned the current path at score 0.835.
+
+    `old_chunk_count` comes from `_prior_chunk_count`, called by the caller BEFORE its own upsert
+    loop runs — this function only does the (irreversible) delete, using a value captured at the
+    right moment, so the read-vs-write ordering bug cannot recur by someone reordering THIS
+    function's body.
+
+    CONSERVATIVE ON THE UNKNOWN SIDE, deliberately: this store's real orphan population cannot be
+    independently verified after the fact (three instruments tried and failed: similarity search
+    cannot ask an identity question, no pre-prune git history exists for gitignored org data, and
+    most prunes were never made through an Edit call to recover from). A skipped prune is
+    recoverable on the next re-ingest; a wrong deletion on shared fleet data is not. So: this
+    reports what it removed. It does not, and must not, claim the store is clean — only synthetic,
+    deliberately-constructed orphans are provable.
+    """
+    if not isinstance(old_chunk_count, int) or old_chunk_count <= new_chunk_count:
+        return 0
+    orphan_ids = [file_id(file_path, i) for i in range(new_chunk_count, old_chunk_count)]
+    try:
+        collection.delete(ids=orphan_ids)
+    except Exception as e:
+        print(f"  WARNING: could not delete {len(orphan_ids)} orphaned chunk id(s) for "
+              f"{file_path}: {e}")
+        return 0
+    print(f"  Pruned {len(orphan_ids)} orphaned chunk(s) from a longer earlier version "
+          f"(was {old_chunk_count} chunks, now {new_chunk_count})")
+    return len(orphan_ids)
+
+
 def ingest_text_file(client, config, collection, file_path):
     """Ingest a text-based file."""
     file_path = Path(file_path)
     text = file_path.read_text(errors="replace")
     if not text.strip():
+        # A file emptied to nothing is the extreme case of shrinking — every prior chunk is now
+        # orphaned, not just the tail past some smaller N.
+        prune_orphaned_chunks(collection, file_path, 0, _prior_chunk_count(collection, file_path))
         print(f"  SKIP (empty): {file_path}")
         return 0
 
@@ -517,6 +574,9 @@ def ingest_text_file(client, config, collection, file_path):
         chunk_size=config.get("text_chunk_size", DEFAULT_TEXT_CHUNK_SIZE),
         overlap=config.get("text_chunk_overlap", DEFAULT_TEXT_CHUNK_OVERLAP),
     )
+    # MUST be read here, before the upsert loop below overwrites chunk0's own metadata with this
+    # run's total_chunks — reading it any later compares this run's count to itself.
+    old_chunk_count = _prior_chunk_count(collection, file_path)
 
     # WHICH CHUNKS ARE NEW AND WHICH ARE BEING REPLACED — INFORMATIONAL, BEHAVIOUR UNCHANGED.
     #
@@ -578,6 +638,7 @@ def ingest_text_file(client, config, collection, file_path):
     if args_force and doc_ids:
         print(f"  Chunks: {new_chunks} new, {updated_chunks} updated "
               f"(updated chunks do NOT move the collection count)")
+    prune_orphaned_chunks(collection, file_path, len(chunks), old_chunk_count)
     return count
 
 
