@@ -1,5 +1,6 @@
 import { existsSync, readdirSync, readFileSync, renameSync, writeFileSync, unlinkSync, appendFileSync } from 'fs';
 import { join } from 'path';
+import { createHash } from 'node:crypto';
 import type { Task, Priority, TaskStatus, BusPaths, StaleTaskReport, ArchiveReport } from '../types/index.js';
 import { atomicWriteSync, ensureDir } from '../utils/atomic.js';
 import { randomDigits } from '../utils/random.js';
@@ -97,7 +98,7 @@ export function createTask(
     if (err) edgeFailures.push(err);
   }
 
-  appendTaskAudit(paths, taskId, { event: 'create', agent: agentName, to: 'pending', note: title });
+  appendTaskAudit(paths, taskId, { event: 'create', agent: agentName, to: 'pending', note: title }, description);
 
   // Surface a partial write on BOTH channels. The task itself is fine and deliberately kept — throwing
   // here would discard a valid task over a peer's problem — but the caller asked for an edge and did not
@@ -107,7 +108,7 @@ export function createTask(
       event: 'update',
       agent: agentName,
       note: `PARTIAL: ${edgeFailures.length} dependency edge(s) NOT written — ${edgeFailures.join('; ')}`,
-    });
+    }, description);
     console.error(
       `WARNING: task ${taskId} was created but ${edgeFailures.length} dependency edge(s) were NOT ` +
         `written. The relationship is HALF-RECORDED:\n  ${edgeFailures.join('\n  ')}`,
@@ -400,6 +401,7 @@ export function updateTask(
   let prevAssignee: string | undefined;
   let prevTitle: string | undefined;
   let assignee: string | undefined;
+  let currentDescription: string | undefined;
   try {
     const task: Task = parseTaskFile(filePath);
     prevStatus = task.status;
@@ -434,6 +436,7 @@ export function updateTask(
     if (opts?.evidence !== undefined) task.evidence = opts.evidence;
     assignee = task.assigned_to;
     task.updated_at = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
+    currentDescription = task.description;
     atomicWriteSync(filePath, JSON.stringify(task));
   } catch (err) {
     throw new Error(`Task ${taskId} update failed: ${err}`);
@@ -457,7 +460,7 @@ export function updateTask(
       ? { from_title: prevTitle, to_title: opts.title }
       : {}),
     ...(opts?.evidence !== undefined ? { evidence: opts.evidence } : {}),
-  });
+  }, currentDescription);
   return {
     reassigned: opts?.assignee !== undefined && opts.assignee !== prevAssignee,
     prevAssignee,
@@ -568,6 +571,37 @@ export interface TaskAuditEntry {
   /** Where the result lives, recorded at the transition that claimed or completed the task. */
   evidence?: string;
   note?: string;
+  /** THE CONTENT FIELD (task_1785716877580_40564517, named by seb_boss 2026-08-03 as the
+   *  highest-leverage gap of that session). `tasks/audit/<id>.jsonl` held one row per transition
+   *  — actor, status-from, status-to, ts — and NO PAYLOAD, so a description WIPE looked identical
+   *  to a routine status change: builder_1 destroyed 3,991 chars of a task description and
+   *  `task-history` returned five clean transitions and zero bytes of content. This is NOT full
+   *  version history (that is a separate, larger decision — prior-description snapshots on every
+   *  write — and is not what this field does). It is a FINGERPRINT: enough to (a) detect a shrink
+   *  after the fact by diffing consecutive rows' `desc_len`, (b) prove which write produced a
+   *  given description by matching `desc_sha256` against the live file, (c) turn the "CLI bypassed
+   *  by a direct JSON write" floor into a count (the bypassing write leaves no row at all, so the
+   *  NEXT CLI-written row's sha silently fails to chain from the last recorded one), and (d) date
+   *  a stop by finding the last row whose sha matches content that is still correct. */
+  desc_sha256?: string;
+  desc_len?: number;
+}
+
+/**
+ * The audit row's content fingerprint — not the content itself. A full snapshot on every write is
+ * a real, LARGER decision (real undo, real storage growth) that a different owner has to make;
+ * this is the minimal fingerprint that makes a change to the field DETECTABLE without storing it.
+ *
+ * `undefined`/empty description hashes to a stable, distinguishable value rather than throwing or
+ * being omitted — a task with no description is a real, common state, and the row must still be
+ * comparable to its neighbours (an omitted field cannot be diffed against a present one).
+ */
+function descFingerprint(description: string | undefined): { desc_sha256: string; desc_len: number } {
+  const text = description ?? '';
+  return {
+    desc_sha256: createHash('sha256').update(text, 'utf-8').digest('hex'),
+    desc_len: text.length,
+  };
 }
 
 /**
@@ -579,11 +613,20 @@ export interface TaskAuditEntry {
  *
  * Best-effort: a failing audit write never blocks the caller. The
  * audit log is an observability aid, not the source of truth.
+ *
+ * `description` IS A REQUIRED PARAMETER, not an optional field on `entry` — this is the whole
+ * fix for task_1785716877580_40564517. An optional field can be silently omitted by a future
+ * call site exactly the way it already was for every existing one; a required positional
+ * parameter makes that a compile error instead. Every event kind gets a fingerprint of the
+ * description AS IT STANDS at that moment, not just description-changing events — a status-only
+ * row with an UNCHANGED sha from its predecessor is itself the paired-negative evidence that
+ * nothing else touched the field, which a row that only appears on CHANGES could never show.
  */
 export function appendTaskAudit(
   paths: BusPaths,
   taskId: string,
-  entry: Omit<TaskAuditEntry, 'ts'>,
+  entry: Omit<TaskAuditEntry, 'ts' | 'desc_sha256' | 'desc_len'>,
+  description: string | undefined,
 ): void {
   // Validate before the try so a traversal id is rejected loudly rather than
   // swallowed by the audit-never-blocks catch below.
@@ -594,6 +637,7 @@ export function appendTaskAudit(
     const line: TaskAuditEntry = {
       ts: new Date().toISOString().replace(/\.\d{3}Z$/, 'Z'),
       ...entry,
+      ...descFingerprint(description),
     };
     appendFileSync(join(auditDir, `${taskId}.jsonl`), JSON.stringify(line) + '\n', { encoding: 'utf-8', mode: 0o600 });
   } catch {
@@ -723,7 +767,7 @@ export function claimTask(
     from: prevStatus,
     to: 'in_progress',
     ...(evidence !== undefined ? { evidence } : {}),
-  });
+  }, task.description);
   return task;
 }
 
@@ -754,6 +798,7 @@ export function completeTask(
   let prevStatus: TaskStatus | undefined;
   let assignee: string | undefined;
   let taskOrg: string = '';
+  let currentDescription: string | undefined;
   try {
     const task: Task = parseTaskFile(filePath);
     prevStatus = task.status;
@@ -766,6 +811,7 @@ export function completeTask(
       task.result = result;
     }
     if (evidence !== undefined) task.evidence = evidence;
+    currentDescription = task.description;
     atomicWriteSync(filePath, JSON.stringify(task));
   } catch (err) {
     throw new Error(`Task ${taskId} complete failed: ${err}`);
@@ -777,7 +823,7 @@ export function completeTask(
     to: 'completed',
     note: result,
     ...(evidence !== undefined ? { evidence } : {}),
-  });
+  }, currentDescription);
 
   // Activity-feed event. Best-effort — the task is already persisted.
   if (assignee) {
