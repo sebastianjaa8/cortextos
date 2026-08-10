@@ -274,6 +274,91 @@ export function sweepConfigCronDrift(frameworkRoot: string): CronDriftFinding[] 
   return findings;
 }
 
+/**
+ * Locate `orgs/<org>/agents/<agentName>/config.json`, or null if the agent has none.
+ *
+ * `sweepConfigCronDrift` discovers this path by walking `orgs/` outward (org, then agent). This
+ * does the same walk in reverse (agent name in, path out) so `liveCronComparisonCoverage` can ask
+ * "does THIS live agent have a config.json" without re-deriving the enumeration a second way —
+ * two independent walks of the same directory tree is how a fleet-wide claim quietly drifts from
+ * what the primary sweep actually covers.
+ */
+function findAgentConfigPath(frameworkRoot: string, agentName: string): string | null {
+  const orgsBase = join(frameworkRoot, 'orgs');
+  if (!existsSync(orgsBase)) return null;
+  for (const org of readdirSync(orgsBase, { withFileTypes: true })) {
+    if (!org.isDirectory()) continue;
+    const configPath = join(orgsBase, org.name, 'agents', agentName, 'config.json');
+    if (existsSync(configPath)) return configPath;
+  }
+  return null;
+}
+
+/**
+ * How many of the fleet's LIVE crons this tool can even see.
+ *
+ * Found 2026-08-02: `detectConfigCronDrift` drives its comparison with
+ * `for (const entry of configCrons)` — a live cron with no config.json counterpart cannot generate
+ * a finding of ANY kind, comparable or not. Measured that day: 36 of 118 live crons had a config
+ * entry at all (31%), so "22 prompt-differs, 0 missing-live" was a true statement about less than a
+ * third of the fleet that read as fleet-wide. Concrete cost: builder_1's own sabotage-weekly
+ * rewrite was invisible to the report because 8 of builder_1's 9 crons were never compared.
+ *
+ * NOT FIXED BY ADDING A NEW FINDING CLASS. A live-cron-with-no-config-entry is not a defective
+ * cron — config.json is dead text after `.crons-migrated`, so its absence from config.json is
+ * evidence config.json is not a roster, not evidence anything is wrong. Making it a finding class
+ * would manufacture ~82 permanent, unactionable findings — the guard-arm-check failure mode, a red
+ * that means nothing on every run. THE FIX IS THE DENOMINATOR: state how much of the fleet this
+ * tool actually compared, so a partial check reads as partial rather than as complete.
+ *
+ * `compared` counts live crons whose name appears in their agent's config.json (after the same
+ * `isUnmigratable` filter `detectConfigCronDrift` applies — a one-shot or scheduleless config
+ * entry was never going to generate a finding either, so it must not inflate `compared`).
+ * `uncomparable` names every live cron that fell on the other side, same "state what was excluded"
+ * discipline as `listExcludedRetiredAgents` and `utcOnlyExcluded` — a bare `M-N` invites exactly
+ * the "trust the number" failure this function exists to prevent.
+ */
+export function liveCronComparisonCoverage(frameworkRoot: string): {
+  compared: number;
+  totalLive: number;
+  uncomparable: Array<{ agent: string; cron: string }>;
+} {
+  let compared = 0;
+  let totalLive = 0;
+  const uncomparable: Array<{ agent: string; cron: string }> = [];
+  const retired = disabledAgents();
+
+  for (const agentName of listStateAgents()) {
+    if (retired.has(agentName)) continue;
+    let live: CronDefinition[];
+    try {
+      live = readCrons(agentName);
+    } catch {
+      continue;
+    }
+    totalLive += live.length;
+
+    const configPath = findAgentConfigPath(frameworkRoot, agentName);
+    const configNames = new Set<string>();
+    if (configPath) {
+      for (const entry of readConfigCrons(configPath)) {
+        if (!entry || typeof entry.name !== 'string') continue;
+        if (isUnmigratable(entry)) continue;
+        configNames.add(entry.name);
+      }
+    }
+
+    for (const cron of live) {
+      if (configNames.has(cron.name)) {
+        compared++;
+      } else {
+        uncomparable.push({ agent: agentName, cron: cron.name });
+      }
+    }
+  }
+
+  return { compared, totalLive, uncomparable };
+}
 
 /**
  * A time token is DISCLAIMED when a negator governs it in the same clause: "not 8am ET",
@@ -599,35 +684,83 @@ const KIND_ORDER: Record<CronDriftKind, number> = {
  * rise in the other. It also accounts for the one-time `stating` drop that guard causes on the run
  * it ships: this metric treats an unexplained fall as a finding, so a suppression that does not
  * report itself would be indistinguishable from the regression the whole function exists to catch.
+ *
+ * TWO GAPS FIXED 2026-08-07 (task_1785780835345_12163173, seb_boss + builder_1):
+ *
+ * (1) THE AGGREGATE PUBLISHED NO MEMBERS. Auditing a frozen number (the drop-guard's whole reason
+ * to exist) required a source read, because the counts named nothing. `statingCrons`/
+ * `disclaimedCrons`/`thresholdCrons` now carry the agent/cron identity behind each count, so the
+ * check that exists to catch a frozen number can itself be audited from `--json` alone.
+ *
+ * (2) THE METRIC DEGRADED AS PROMPTS IMPROVED. `extractLocalHours` is blind to UTC BY DESIGN —
+ * "09:00 UTC" is already unambiguous and needs no local-time verification — but `timeAnchored`
+ * used to count every 5-field cron regardless, so a correctly-written UTC-only prompt lifted the
+ * denominator while leaving the numerator flat. The fix is NOT to match UTC too (that widens the
+ * checker rather than fixing the metric). Instead, a cron whose ONLY time signal is a stated UTC
+ * time is OUT OF SCOPE for this metric — excluded from `timeAnchored` entirely, listed under
+ * `utcOnlyExcluded` rather than silently dropped, same "state what was narrowed" discipline as
+ * `listExcludedRetiredAgents`. A cron with NO time signal at all (truly silent) is a different
+ * claim — a real, uncovered gap — and STILL counts in `timeAnchored`, contributing zero to
+ * `stating`. Order matters: a cron with any ET/local signal (stated, disclaimed OR threshold)
+ * counts as time-anchored regardless of an incidental UTC mention elsewhere in the same prompt —
+ * the UTC-only exclusion applies only when local-time extraction found NOTHING to work with.
  */
+const UTC_STATED = /\b\d{1,2}(?::\d{2})?\s*(?:am|pm)?\s*UTC\b|\b\d{1,2}:\d{2}Z\b/i;
+
 export function statedTimeCoverage(): {
   timeAnchored: number;
   stating: number;
   disclaimed: number;
   threshold: number;
   agents: string[];
+  statingCrons: Array<{ agent: string; cron: string }>;
+  disclaimedCrons: Array<{ agent: string; cron: string }>;
+  thresholdCrons: Array<{ agent: string; cron: string }>;
+  utcOnlyExcluded: Array<{ agent: string; cron: string }>;
 } {
   let timeAnchored = 0;
   let stating = 0;
   let disclaimed = 0;
   let threshold = 0;
   const agents: string[] = [];
+  const statingCrons: Array<{ agent: string; cron: string }> = [];
+  const disclaimedCrons: Array<{ agent: string; cron: string }> = [];
+  const thresholdCrons: Array<{ agent: string; cron: string }> = [];
+  const utcOnlyExcluded: Array<{ agent: string; cron: string }> = [];
   for (const agentName of listStateAgents()) {
     try {
       for (const cron of readCrons(agentName)) {
         if (cron.schedule.trim().split(/\s+/).length !== 5) continue;
-        timeAnchored++;
         const { stated, disclaimed: d, threshold: t } = extractLocalHours(cron.prompt ?? '');
+        const hasLocalSignal = stated.length > 0 || d > 0 || t > 0;
+        if (!hasLocalSignal && UTC_STATED.test(cron.prompt ?? '')) {
+          utcOnlyExcluded.push({ agent: agentName, cron: cron.name });
+          continue;
+        }
+        timeAnchored++;
         disclaimed += d;
         threshold += t;
+        if (d > 0) disclaimedCrons.push({ agent: agentName, cron: cron.name });
+        if (t > 0) thresholdCrons.push({ agent: agentName, cron: cron.name });
         if (stated.length > 0) {
           stating++;
+          statingCrons.push({ agent: agentName, cron: cron.name });
           if (!agents.includes(agentName)) agents.push(agentName);
         }
       }
     } catch { /* skip */ }
   }
-  return { timeAnchored, stating, disclaimed, threshold, agents };
+  return {
+    timeAnchored,
+    stating,
+    disclaimed,
+    threshold,
+    agents,
+    statingCrons,
+    disclaimedCrons,
+    thresholdCrons,
+    utcOnlyExcluded,
+  };
 }
 
 /**

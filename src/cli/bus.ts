@@ -3112,7 +3112,7 @@ busCommand
   .option('--json', 'Emit raw JSON instead of the formatted report')
   .option('--notify', 'Send ONE consolidated message to the org orchestrator when drift is found')
   .action(async (opts: { json?: boolean; notify?: boolean }) => {
-    const { sweepConfigCronDrift, formatDriftFindings, countActionableFindings, countLatentMarkerAbsent, statedTimeCoverage, listExcludedRetiredAgents } = await import('../daemon/cron-drift.js');
+    const { sweepConfigCronDrift, formatDriftFindings, countActionableFindings, countLatentMarkerAbsent, statedTimeCoverage, listExcludedRetiredAgents, liveCronComparisonCoverage } = await import('../daemon/cron-drift.js');
     const env = resolveEnv();
     const projectRoot = env.projectRoot || env.frameworkRoot || process.cwd();
 
@@ -3127,14 +3127,28 @@ busCommand
     // Coverage, not just findings. A prompt tidied into a pointer removes the check subject and
     // shrinks the denominator silently, which reads exactly like a clean report.
     const coverage = statedTimeCoverage();
+    // A live cron with no config.json counterpart cannot generate a finding of any kind — the
+    // comparison itself only sees a fraction of the fleet unless this is stated (task_1785672685330_40401679).
+    const liveCoverage = liveCronComparisonCoverage(projectRoot);
+    // missing-live is the class most likely to read as "0 because nothing is wrong" when it is
+    // actually "0 because the branch was never exercised" — always print it, not just when nonzero.
+    const missingLiveCount = findings.filter((f) => f.kind === 'missing-live').length;
     // Stated because an unstated scope narrowing is indistinguishable from a clean bill of health,
     // and because re-enabling one of these silently returns it to scope — a disabled agent holding
     // crons.json with no marker is a wipe condition that arms on re-enable.
     const retired = listExcludedRetiredAgents();
 
     if (opts.json) {
-      console.log(JSON.stringify({ findings, latent_marker_absent: latent, stated_time_coverage: coverage, excluded_retired: retired }, null, 2));
+      console.log(JSON.stringify({ findings, missing_live_count: missingLiveCount, latent_marker_absent: latent, stated_time_coverage: coverage, live_cron_comparison_coverage: liveCoverage, excluded_retired: retired }, null, 2));
     } else {
+      console.log(
+        `Compared ${liveCoverage.compared} of ${liveCoverage.totalLive} live cron(s) against ` +
+          `config.json; ${liveCoverage.uncomparable.length} have no config counterpart and are ` +
+          `NOT COMPARABLE BY THIS TOOL (config.json is dead text post-migration, so this is not a ` +
+          `defect in those crons). missing-live: ${missingLiveCount} (0 unless config.json names a ` +
+          `cron with no live counterpart — a real class, distinct from the ` +
+          `${liveCoverage.uncomparable.length} above, which are the opposite direction).\n`,
+      );
       console.log(formatDriftFindings(findings));
       console.log(
         `
@@ -3152,7 +3166,15 @@ Stated-time coverage: ${coverage.stating} of ${coverage.timeAnchored} time-ancho
           `comparison ("older than 6pm ET", "before the 7am ET brief", "received after 6:30am ET") ` +
           `is what the cron reasons ABOUT, and it may fire at any hour to evaluate it. Counted ` +
           `separately from disclaimed so neither guard's false positives can hide inside the ` +
-          `other's expected number. A RISE here is the tell, same as above.`,
+          `other's expected number. A RISE here is the tell, same as above.` +
+          `
+  ${coverage.utcOnlyExcluded.length} cron(s) OUT OF SCOPE — their only time signal is a stated ` +
+          `UTC time, which is already unambiguous and needs no local-time verification. Excluded ` +
+          `from the denominator rather than counted as uncovered, and named here rather than ` +
+          `silently narrowed: ${coverage.utcOnlyExcluded.map((c) => `${c.agent}/${c.cron}`).join(', ') || '(none)'}` +
+          `
+  Membership for stating/disclaimed/threshold is in --json (stated_time_coverage.statingCrons etc) ` +
+          `— a count alone cannot be audited without it.`,
       );
       if (latent.length > 0) {
         console.log(
@@ -3204,6 +3226,10 @@ Out of scope: ${retired.length} disabled agent(s) — ${retired.join(', ')}. The
           latent_marker_absent: latent.length,
           stated_time_stating: coverage.stating,
           stated_time_anchored: coverage.timeAnchored,
+          stated_time_utc_excluded: coverage.utcOnlyExcluded.length,
+          live_compared: liveCoverage.compared,
+          live_total: liveCoverage.totalLive,
+          missing_live_count: missingLiveCount,
         });
       }
     } catch { /* a receipt that cannot be written must not suppress the report */ }

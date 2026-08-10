@@ -32,7 +32,7 @@ vi.mock('../../../src/daemon/cron-snapshot.js', async (importOriginal) => {
   };
 });
 
-import { detectConfigCronDrift, detectMissingMigrationMarker, detectScheduleContradictsPrompt, formatDriftFindings, countActionableFindings, statedTimeCoverage, sweepConfigCronDrift, listExcludedRetiredAgents, wipeConditionArmed } from '../../../src/daemon/cron-drift.js';
+import { detectConfigCronDrift, detectMissingMigrationMarker, detectScheduleContradictsPrompt, formatDriftFindings, countActionableFindings, statedTimeCoverage, sweepConfigCronDrift, listExcludedRetiredAgents, wipeConditionArmed, liveCronComparisonCoverage } from '../../../src/daemon/cron-drift.js';
 import type { CronDriftFinding } from '../../../src/daemon/cron-drift.js';
 import { migrateCronsForAgent } from '../../../src/daemon/cron-migration.js';
 import { CRONS_DIRECTORY } from '../../../src/bus/crons-schema.js';
@@ -550,6 +550,69 @@ describe('statedTimeCoverage accounting', () => {
     expect(c.disclaimed).toBe(1);
     expect(c.threshold).toBe(0);
   });
+
+  // task_1785780835345_12163173, fix 1: the aggregate must name WHICH crons it counted, not just
+  // how many — a frozen number cannot be audited without membership.
+  it('publishes membership for stating/disclaimed/threshold, not just counts', () => {
+    seedCrons([
+      { name: 'claim', schedule: '0 16 * * *', prompt: 'Runs 12pm ET.' },
+      { name: 'neg', schedule: '0 16 * * 0', prompt: 'Runs 12pm ET, not 8am ET.' },
+      { name: 'thresh', schedule: '0 16 * * 1', prompt: 'Flag anything older than 6pm ET.' },
+    ]);
+    const c = statedTimeCoverage();
+    expect(c.statingCrons).toEqual([{ agent: A, cron: 'claim' }, { agent: A, cron: 'neg' }]);
+    expect(c.disclaimedCrons).toEqual([{ agent: A, cron: 'neg' }]);
+    expect(c.thresholdCrons).toEqual([{ agent: A, cron: 'thresh' }]);
+  });
+
+  // task_1785780835345_12163173, fix 2, THE MUST-FAIL CASE: a cron whose only time signal is a
+  // stated UTC time must not inflate the denominator. extractLocalHours is blind to UTC BY
+  // DESIGN (unambiguous, no conversion to verify) — counting it anyway is what let the metric
+  // fall as prompts got MORE precise, the exact regression this fix removes.
+  it('excludes a UTC-only-stated cron from timeAnchored entirely (out of scope, not uncovered)', () => {
+    seedCrons([{ name: 'utc-only', schedule: '0 13 * * *', prompt: 'Fires 13:07Z, checks the queue.' }]);
+    const c = statedTimeCoverage();
+    expect(c.timeAnchored).toBe(0);
+    expect(c.stating).toBe(0);
+    expect(c.utcOnlyExcluded).toEqual([{ agent: A, cron: 'utc-only' }]);
+  });
+
+  it('also excludes the "H UTC" word form, not just the "HH:MMZ" form', () => {
+    seedCrons([{ name: 'utc-word', schedule: '0 3 * * *', prompt: 'Nightly batch, fires 3am UTC.' }]);
+    const c = statedTimeCoverage();
+    expect(c.timeAnchored).toBe(0);
+    expect(c.utcOnlyExcluded).toEqual([{ agent: A, cron: 'utc-word' }]);
+  });
+
+  // PAIRED NEGATIVE: a cron stating a real ET claim must still raise timeAnchored AND stating
+  // together — otherwise the UTC guard has silently narrowed the check into never firing.
+  it('a cron stating a real ET time still counts normally (paired negative)', () => {
+    seedCrons([{ name: 'et-claim', schedule: '0 11 * * *', prompt: 'Fires 7am ET.' }]);
+    const c = statedTimeCoverage();
+    expect(c.timeAnchored).toBe(1);
+    expect(c.stating).toBe(1);
+    expect(c.utcOnlyExcluded).toEqual([]);
+  });
+
+  // A prompt with NO time signal at all (not even UTC) is a DIFFERENT claim than "out of scope" —
+  // it is a real, uncovered gap, and must still count in timeAnchored so the ratio reflects it.
+  it('a fully silent prompt still counts as time-anchored (uncovered, not out-of-scope)', () => {
+    seedCrons([{ name: 'silent', schedule: '0 16 * * *', prompt: 'Do the thing. See AGENTS.md.' }]);
+    const c = statedTimeCoverage();
+    expect(c.timeAnchored).toBe(1);
+    expect(c.stating).toBe(0);
+    expect(c.utcOnlyExcluded).toEqual([]);
+  });
+
+  // ORDER MATTERS: an incidental UTC mention alongside a real local-time signal must NOT trigger
+  // the out-of-scope exclusion — the exclusion only applies when local extraction found nothing.
+  it('does not exclude a cron that has BOTH a UTC mention and a real local-time signal', () => {
+    seedCrons([{ name: 'both-tz', schedule: '0 16 * * 0', prompt: 'Runs 12pm ET (16:00 UTC), not 8am ET.' }]);
+    const c = statedTimeCoverage();
+    expect(c.timeAnchored).toBe(1);
+    expect(c.disclaimed).toBe(1);
+    expect(c.utcOnlyExcluded).toEqual([]);
+  });
 });
 
 /**
@@ -801,5 +864,118 @@ describe('wipeConditionArmed', () => {
   it('accepts the bare-array crons.json shape as well as the wrapped one', () => {
     seed({ marker: false, crons: [{ name: 'bare-form' }] });
     expect(wipeConditionArmed(A, tmp)).toEqual(['bare-form']);
+  });
+});
+
+/**
+ * task_1785672685330_40401679: detectConfigCronDrift can only generate a finding for a live cron
+ * that has a config.json counterpart. Measured on the real fleet 2026-08-02: 36 of 118 (31%) —
+ * so a clean report was a true statement about less than a third of the fleet and read as
+ * fleet-wide. This is the denominator that makes the partial check honest instead of vacuous.
+ */
+describe('liveCronComparisonCoverage', () => {
+  const A = 'probe_agent';
+  let prevFrameworkRoot: string | undefined;
+
+  function writeLiveCrons(names: string[]): void {
+    const dir = join(tmp, CRONS_DIRECTORY, A);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, 'crons.json'),
+      JSON.stringify({
+        updated_at: '2026-08-02T00:00:00Z',
+        crons: names.map((n) => ({ name: n, schedule: '2h', prompt: 'x', enabled: true })),
+      }),
+      'utf-8',
+    );
+  }
+
+  function writeAgentConfig(names: string[]): void {
+    prevFrameworkRoot = process.env.CTX_FRAMEWORK_ROOT;
+    process.env.CTX_FRAMEWORK_ROOT = tmp;
+    const dir = join(tmp, 'orgs', 'testorg', 'agents', A);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, 'config.json'),
+      JSON.stringify({ agent_name: A, crons: names.map((n) => ({ name: n, interval: '2h', prompt: 'x' })) }),
+      'utf-8',
+    );
+  }
+
+  afterEach(() => {
+    if (prevFrameworkRoot === undefined) delete process.env.CTX_FRAMEWORK_ROOT;
+    else process.env.CTX_FRAMEWORK_ROOT = prevFrameworkRoot;
+  });
+
+  it('counts only live crons with a config.json counterpart as compared', () => {
+    writeLiveCrons(['heartbeat', 'unified-watchdog', 'sabotage-weekly']);
+    writeAgentConfig(['heartbeat']); // only 1 of 3 live crons named in config.json
+    const c = liveCronComparisonCoverage(tmp);
+    expect(c.totalLive).toBe(3);
+    expect(c.compared).toBe(1);
+    expect(c.uncomparable.sort((a, b) => a.cron.localeCompare(b.cron))).toEqual([
+      { agent: A, cron: 'sabotage-weekly' },
+      { agent: A, cron: 'unified-watchdog' },
+    ]);
+  });
+
+  // MUST-FAIL CASE (the task's own phrasing): add a live cron with no config entry and the
+  // uncomparable count must RISE — a number that has to MOVE, not a red that has to appear.
+  it('MUST-FAIL CASE: adding a live cron with no config counterpart raises uncomparable, not compared', () => {
+    writeLiveCrons(['heartbeat']);
+    writeAgentConfig(['heartbeat']);
+    const before = liveCronComparisonCoverage(tmp);
+    expect(before.compared).toBe(1);
+    expect(before.uncomparable).toEqual([]);
+
+    writeLiveCrons(['heartbeat', 'new-uncomparable-cron']);
+    const after = liveCronComparisonCoverage(tmp);
+    expect(after.totalLive).toBe(before.totalLive + 1);
+    expect(after.compared).toBe(before.compared); // unchanged — the new cron is NOT comparable
+    expect(after.uncomparable).toEqual([{ agent: A, cron: 'new-uncomparable-cron' }]);
+  });
+
+  // PAIRED NEGATIVE: adding a live cron that DOES have a config entry must raise `compared`,
+  // not `uncomparable` — otherwise the fix could pass the must-fail case by never incrementing
+  // `compared` at all.
+  it('PAIRED NEGATIVE: adding a live cron WITH a config counterpart raises compared, not uncomparable', () => {
+    writeLiveCrons(['heartbeat']);
+    writeAgentConfig(['heartbeat', 'new-comparable-cron']); // config already names the future cron
+    const before = liveCronComparisonCoverage(tmp);
+    expect(before.compared).toBe(1);
+
+    writeLiveCrons(['heartbeat', 'new-comparable-cron']);
+    const after = liveCronComparisonCoverage(tmp);
+    expect(after.compared).toBe(before.compared + 1);
+    expect(after.uncomparable).toEqual([]);
+  });
+
+  it('a live cron matches a config entry by name only after the isUnmigratable filter', () => {
+    // A one-shot config entry is never going to generate a finding either (migration declines to
+    // convert it) — it must not inflate `compared` by matching a live cron of the same name.
+    writeLiveCrons(['midnight-job']);
+    prevFrameworkRoot = process.env.CTX_FRAMEWORK_ROOT;
+    process.env.CTX_FRAMEWORK_ROOT = tmp;
+    const dir = join(tmp, 'orgs', 'testorg', 'agents', A);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, 'config.json'),
+      JSON.stringify({ agent_name: A, crons: [{ name: 'midnight-job', type: 'once', fire_at: '2026-12-01T00:00:00Z', prompt: 'x' }] }),
+      'utf-8',
+    );
+    const c = liveCronComparisonCoverage(tmp);
+    expect(c.compared).toBe(0);
+    expect(c.uncomparable).toEqual([{ agent: A, cron: 'midnight-job' }]);
+  });
+
+  it('an agent with live crons and NO config.json at all counts every live cron as uncomparable', () => {
+    writeLiveCrons(['a', 'b']);
+    prevFrameworkRoot = process.env.CTX_FRAMEWORK_ROOT;
+    process.env.CTX_FRAMEWORK_ROOT = tmp; // orgs/ exists but this agent has no config.json under it
+    mkdirSync(join(tmp, 'orgs', 'testorg', 'agents'), { recursive: true });
+    const c = liveCronComparisonCoverage(tmp);
+    expect(c.totalLive).toBe(2);
+    expect(c.compared).toBe(0);
+    expect(c.uncomparable.map((u) => u.cron).sort()).toEqual(['a', 'b']);
   });
 });
