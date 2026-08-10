@@ -280,13 +280,20 @@ busCommand
   .command('create-task')
   .argument('<title>', 'Task title')
   .option('--desc <description>', 'Task description')
-  .option('--assignee <agent>', 'Assigned agent')
+  // CANONICAL FLAG, matching the stored field name (task_1785781068786_36016190). `--assignee`
+  // stays as a working alias below — it is in prompts, scripts and habits fleet-wide, and breaking
+  // it converts a silent query bug into a loud dispatch bug. Merged explicitly in the action
+  // handler rather than via a multi-flag Commander string, so the precedence rule (assignedTo wins
+  // if somehow both are passed) is visible in one place instead of implied by parser behaviour.
+  .option('--assigned-to <agent>', 'Assigned agent (matches the stored field name)')
+  .option('--assignee <agent>', 'Alias for --assigned-to')
   .option('--priority <p>', 'Priority (urgent, high, normal, low)', 'normal')
   .option('--project <name>', 'Project name')
   .option('--needs-approval', 'Require human approval before execution')
   .option('--blocked-by <ids>', 'Comma-separated task IDs that must complete before this task can progress')
   .option('--blocks <ids>', 'Comma-separated task IDs that this new task will block (symmetric reverse edge)')
-  .action((title: string, opts: { desc?: string; assignee?: string; priority: string; project?: string; needsApproval?: boolean; blockedBy?: string; blocks?: string }) => {
+  .action((title: string, opts: { desc?: string; assignee?: string; assignedTo?: string; priority: string; project?: string; needsApproval?: boolean; blockedBy?: string; blocks?: string }) => {
+    const assignee = opts.assignedTo ?? opts.assignee;
     // Validate at the CLI boundary, like update-task / log-event / send-message do.
     // Without this the throw from createTask()'s validatePriority escaped to the top
     // level and Node printed a raw stack trace. In a chain of create-task calls that
@@ -307,7 +314,7 @@ busCommand
     // 2026-07-18 re-sent several create-task calls and the duplicate open tasks
     // cost real cleanup. Warning goes to stderr so stdout stays exactly the task
     // id — callers do `TASK_ID=$(cortextos bus create-task ...)`.
-    const effectiveAssignee = opts.assignee ?? env.agentName;
+    const effectiveAssignee = assignee ?? env.agentName;
     const dup = findRecentDuplicate(paths, title, effectiveAssignee);
     if (dup) {
       const ageMin = Math.round((Date.now() - new Date(dup.created_at).getTime()) / 60000);
@@ -321,7 +328,7 @@ busCommand
 
     const taskId = createTask(paths, env.agentName, env.org, title, {
       description: opts.desc,
-      assignee: opts.assignee,
+      assignee,
       priority: opts.priority as Priority,
       project: opts.project,
       needsApproval: opts.needsApproval ?? false,
@@ -330,10 +337,10 @@ busCommand
     });
     console.log(taskId);
     // Auto-notify assignee so the task is visible immediately (issue #78)
-    if (opts.assignee && opts.assignee !== env.agentName) {
-      const assigneePaths = resolvePaths(opts.assignee, env.instanceId, env.org);
+    if (assignee && assignee !== env.agentName) {
+      const assigneePaths = resolvePaths(assignee, env.instanceId, env.org);
       const desc = opts.desc ? ` — ${opts.desc.slice(0, 120)}` : '';
-      sendMessage(assigneePaths, env.agentName, opts.assignee, 'normal',
+      sendMessage(assigneePaths, env.agentName, assignee, 'normal',
         `Task assigned: [${opts.priority}] ${title}${desc} (id: ${taskId})`);
     }
   });
@@ -352,10 +359,15 @@ busCommand
   .option('--title <text>', 'Correct the title — audited, and the superseded title is preserved into the description')
   .option('--desc <text>', 'Change the description')
   .option('--project <name>', 'Change the project')
-  .option('--assignee <agent>', 'Reassign — REFUSES if another agent holds the claim-lock')
+  // CANONICAL FLAG, matching the stored field name (task_1785781068786_36016190) — same rename/
+  // alias pattern as create-task, merged explicitly below rather than via a multi-flag Commander
+  // string.
+  .option('--assigned-to <agent>', 'Reassign — REFUSES if another agent holds the claim-lock')
+  .option('--assignee <agent>', 'Alias for --assigned-to')
   .option('--due <iso>', 'Set the due date (ISO 8601) — until now unreachable from any CLI path')
   .option('--evidence <text>', 'Where the result lives: commit, path, vault heading, or a written negative result')
-  .action((id: string, status: string, opts: { priority?: string; title?: string; desc?: string; project?: string; assignee?: string; due?: string; evidence?: string }) => {
+  .action((id: string, status: string, opts: { priority?: string; title?: string; desc?: string; project?: string; assignee?: string; assignedTo?: string; due?: string; evidence?: string }) => {
+    const assignee = opts.assignedTo ?? opts.assignee;
     const validStatuses: TaskStatus[] = ['pending', 'in_progress', 'completed', 'blocked', 'cancelled'];
     if (!validStatuses.includes(status as TaskStatus)) {
       console.error(`Invalid status '${status}'. Must be one of: ${validStatuses.join(', ')}`);
@@ -382,17 +394,27 @@ busCommand
           process.exit(1);
         }
       }
-      updateTask(paths, id, status as TaskStatus, {
+      const result = updateTask(paths, id, status as TaskStatus, {
         priority: opts.priority as Priority | undefined,
         title: opts.title,
         description: opts.desc,
         project: opts.project,
-        assignee: opts.assignee,
+        assignee,
         dueDate: opts.due,
         evidence: opts.evidence,
       });
       console.log(`Updated ${id} -> ${status}`);
       if (status === 'in_progress' && opts.evidence === undefined) warnMissingEvidence('claiming');
+      // Reassignment notify (task_1785781154932_38520243, found by analyst 2026-08-03): the
+      // record could change owner and the new owner would never learn of it. Same guard as
+      // create-task's auto-notify (issue #78) — never message yourself, and `result.reassigned`
+      // is false both when --assigned-to/--assignee was never passed AND when it was passed but
+      // matched the existing owner, so a no-op reassignment stays silent too.
+      if (result.reassigned && result.assignee && result.assignee !== env.agentName) {
+        const assigneePaths = resolvePaths(result.assignee, env.instanceId, env.org);
+        sendMessage(assigneePaths, env.agentName, result.assignee, 'normal',
+          `Task reassigned to you: ${id} (now ${status})`);
+      }
     } catch (err) {
       console.error(err instanceof Error ? err.message : String(err));
       process.exit(1);

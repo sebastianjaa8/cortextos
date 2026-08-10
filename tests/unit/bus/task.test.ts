@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, rmSync, readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
+import { createHash } from 'node:crypto';
 import { createTask, updateTask, completeTask, claimTask, addTaskDependency, removeTaskDependency, readTaskAudit, checkTaskDependencies, compactTasks, checkStaleTasks, listTasks, findTaskFile, archiveTasks } from '../../../src/bus/task';
 import type { BusPaths } from '../../../src/types';
 
@@ -99,6 +100,32 @@ describe('Task Management', () => {
 
       const content = JSON.parse(readFileSync(join(paths.taskDir, `${taskId}.json`), 'utf-8'));
       expect(content.status).toBe('in_progress');
+    });
+
+    // task_1785781154932_38520243: update-task reassigned silently — the record changed owner and
+    // nobody was told. Fixed by having updateTask RETURN whether a real reassignment happened (the
+    // CLI decides whom to notify from this, reusing the exact `assignee !== prevAssignee` condition
+    // the audit log already computes, so the log and the notification cannot disagree about what
+    // counts as a real change).
+    describe('return value (drives the CLI reassignment notify)', () => {
+      it('reports reassigned=true with both the old and new assignee on a real change', () => {
+        const taskId = createTask(paths, 'paul', 'acme', 'Owned', { assignee: 'boris' });
+        const result = updateTask(paths, taskId, 'in_progress', { assignee: 'nadia' });
+        expect(result).toEqual({ reassigned: true, prevAssignee: 'boris', assignee: 'nadia' });
+      });
+
+      it('reports reassigned=false when --assignee is not passed at all (status-only update)', () => {
+        const taskId = createTask(paths, 'paul', 'acme', 'Untouched', { assignee: 'boris' });
+        const result = updateTask(paths, taskId, 'in_progress');
+        expect(result.reassigned).toBe(false);
+        expect(result.assignee).toBe('boris'); // still names the CURRENT assignee, just unchanged
+      });
+
+      it('reports reassigned=false on a no-op re-assertion of the same assignee', () => {
+        const taskId = createTask(paths, 'paul', 'acme', 'Same owner', { assignee: 'boris' });
+        const result = updateTask(paths, taskId, 'in_progress', { assignee: 'boris' });
+        expect(result.reassigned).toBe(false);
+      });
     });
 
     // Priority was CREATE-ONLY until 2026-07-30, which made every re-prioritisation narrative: an
@@ -628,6 +655,72 @@ describe('Task audit log (append-only JSONL)', () => {
     const after = readFileSync(path, 'utf-8');
     expect(after.startsWith(before)).toBe(true);
     expect(after.length).toBeGreaterThan(before.length);
+  });
+
+  // task_1785716877580_40564517: one absent field (audit rows carried no CONTENT) blocked four
+  // separate questions — the wipe, the ratings stop, the weekly-review witness, and the
+  // audit-bypass scan. desc_sha256/desc_len is the minimal fingerprint that answers all four
+  // without full version history (a separate, larger decision).
+  describe('desc_sha256 / desc_len content fingerprint', () => {
+    const sha = (s: string) => createHash('sha256').update(s, 'utf-8').digest('hex');
+
+    // MUST-FAIL CASE (the task's own framing): update a description via the CLI-level function,
+    // then read the audit row. It must carry a sha matching the NEW description and a length
+    // matching it.
+    it('MUST-FAIL CASE: updateTask --desc writes a row whose sha/len match the NEW description', () => {
+      const id = createTask(paths, 'alice', 'acme', 'Fingerprinted', { description: 'v1' });
+      updateTask(paths, id, 'pending', { description: 'v2 — much longer than v1' });
+      const log = readTaskAudit(paths, id);
+      const row = log[log.length - 1];
+      expect(row.desc_sha256).toBe(sha('v2 — much longer than v1'));
+      expect(row.desc_len).toBe('v2 — much longer than v1'.length);
+    });
+
+    // PAIRED NEGATIVE: a status-only transition with NO description change must produce a row
+    // whose sha is UNCHANGED from the prior row. If sha changed on a status-only update, the
+    // field is being recomputed from something other than the actual on-disk content.
+    it('PAIRED NEGATIVE: a status-only update leaves desc_sha256 unchanged from the prior row', () => {
+      const id = createTask(paths, 'alice', 'acme', 'Untouched desc', { description: 'stays the same' });
+      updateTask(paths, id, 'in_progress'); // no --desc at all
+      const log = readTaskAudit(paths, id);
+      expect(log[0].desc_sha256).toBe(sha('stays the same'));
+      expect(log[1].desc_sha256).toBe(log[0].desc_sha256);
+      expect(log[1].desc_len).toBe(log[0].desc_len);
+    });
+
+    // BYPASS DETECTION (the task's other must-fail framing): update via a direct JSON write that
+    // skips this module entirely, then perform a normal status-only update through the CLI-level
+    // function. The bypass leaves NO audit row of its own — but the NEXT row this module DOES
+    // write must carry a sha that does not chain from the previous one, which is what makes an
+    // undetected bypass VISIBLE after the fact instead of silently absorbed.
+    it('a description change made by a DIRECT JSON WRITE (bypassing this module) shows up as a sha jump on the next real row', () => {
+      const id = createTask(paths, 'alice', 'acme', 'Bypass target', { description: 'original' });
+      const filePath = join(paths.taskDir, `${id}.json`);
+      const onDisk = JSON.parse(readFileSync(filePath, 'utf-8'));
+      onDisk.description = 'TAMPERED — written directly to disk, not through updateTask';
+      writeFileSync(filePath, JSON.stringify(onDisk));
+
+      updateTask(paths, id, 'in_progress'); // ordinary status-only call, no --desc
+
+      const log = readTaskAudit(paths, id);
+      const createRow = log[0];
+      const afterBypassRow = log[1];
+      expect(createRow.desc_sha256).toBe(sha('original'));
+      // The chain breaks: this row was NOT declared as a description change (updateTask received
+      // no --desc), yet its sha differs from the previous row's — that mismatch IS the visible
+      // evidence of the bypass, discoverable by diffing consecutive rows without any other signal.
+      expect(afterBypassRow.desc_sha256).not.toBe(createRow.desc_sha256);
+      expect(afterBypassRow.desc_sha256).toBe(sha('TAMPERED — written directly to disk, not through updateTask'));
+    });
+
+    // A task created with no description at all must still get a stable, comparable fingerprint
+    // — an omitted field cannot be diffed against a present one on the next row.
+    it('an empty/absent description still gets a real fingerprint, not an omitted field', () => {
+      const id = createTask(paths, 'alice', 'acme', 'No description at all');
+      const log = readTaskAudit(paths, id);
+      expect(log[0].desc_sha256).toBe(sha(''));
+      expect(log[0].desc_len).toBe(0);
+    });
   });
 
   it('corrupt lines are skipped without blocking replay of surrounding entries', () => {
