@@ -35,7 +35,7 @@ vi.mock('../../../src/bus/crons.js', () => ({
 // Imports AFTER mock setup
 // ---------------------------------------------------------------------------
 
-import { CronScheduler, nextFireFromCron } from '../../../src/daemon/cron-scheduler';
+import { CronScheduler, nextFireFromCron, CATCHUP_SPREAD_MS } from '../../../src/daemon/cron-scheduler';
 import type { CronDefinition } from '../../../src/types/index';
 
 // ---------------------------------------------------------------------------
@@ -367,8 +367,10 @@ describe('CronScheduler', () => {
 
     retryScheduler.start();
 
-    // Advance through one tick (fires catch-up) plus all retry back-offs (1s+4s+16s)
-    await vi.advanceTimersByTimeAsync(TICK + 1_000 + 4_000 + 16_000 + 1_000);
+    // Advance through the catch-up spread window (2026-08-13 fix: catch-up
+    // no longer clamps to exactly `now`, see CATCHUP_SPREAD_MS) plus one
+    // tick to observe it, plus all retry back-offs (1s+4s+16s).
+    await vi.advanceTimersByTimeAsync(CATCHUP_SPREAD_MS + TICK + 1_000 + 4_000 + 16_000 + 1_000);
 
     // 4 total calls: 1 initial + 3 retries
     expect(failingFire).toHaveBeenCalledTimes(4);
@@ -545,8 +547,9 @@ describe('CronScheduler', () => {
 
     auditScheduler.start();
 
-    // Tick 1: 'doomed' fires catch-up, awaits slowFire
-    await vi.advanceTimersByTimeAsync(TICK);
+    // 'doomed' fires catch-up, awaits slowFire. 2026-08-13 fix: catch-up is
+    // spread by up to CATCHUP_SPREAD_MS, so advance through the full window.
+    await vi.advanceTimersByTimeAsync(CATCHUP_SPREAD_MS + TICK);
     expect(slowFire).toHaveBeenCalledTimes(1);
 
     // Mid-fire: simulate remove-cron of 'doomed' — crons.json now only has survivor
@@ -646,8 +649,9 @@ describe('CronScheduler', () => {
 
     raceScheduler.start();
 
-    // First tick: catch-up fires, awaits our slow Promise
-    await vi.advanceTimersByTimeAsync(TICK);
+    // Catch-up fires, awaits our slow Promise. 2026-08-13 fix: catch-up is
+    // spread by up to CATCHUP_SPREAD_MS, so advance through the full window.
+    await vi.advanceTimersByTimeAsync(CATCHUP_SPREAD_MS + TICK);
     expect(slowFire).toHaveBeenCalledTimes(1);
 
     // Mid-fire: reload with a SHORTER schedule (changeKey differs).
@@ -721,7 +725,9 @@ describe('CronScheduler', () => {
     });
 
     scheduler1.start();
-    await vi.advanceTimersByTimeAsync(TICK);
+    // 2026-08-13 fix: catch-up is spread by up to CATCHUP_SPREAD_MS, so
+    // advance through the full window before expecting the fire.
+    await vi.advanceTimersByTimeAsync(CATCHUP_SPREAD_MS + TICK);
     expect(slowFire).toHaveBeenCalledTimes(1);
     // Iter 11 invariant: updateCron MUST be called with last_fire_attempted_at
     // BEFORE the slow onFire resolves (i.e. before the post-success persist).
@@ -776,8 +782,10 @@ describe('CronScheduler', () => {
 
     scheduler.start();
 
-    // The catch-up sets nextFireAt = now, so the very next tick should fire it
-    await vi.advanceTimersByTimeAsync(TICK);
+    // 2026-08-13 fix: catch-up sets nextFireAt = now + a bounded per-cron
+    // spread offset (CATCHUP_SPREAD_MS), not exactly `now` — advance through
+    // the full window so the fire is guaranteed to have happened.
+    await vi.advanceTimersByTimeAsync(CATCHUP_SPREAD_MS + TICK);
 
     expect(fired.some(c => c.name === 'overdue')).toBe(true);
   });
@@ -899,7 +907,9 @@ describe('CronScheduler', () => {
     })]);
     scheduler.start();
 
-    await vi.advanceTimersByTimeAsync(TICK * 2);
+    // 2026-08-13 fix: catch-up is spread by up to CATCHUP_SPREAD_MS instead
+    // of firing at exactly `now` — advance through the full window.
+    await vi.advanceTimersByTimeAsync(CATCHUP_SPREAD_MS + TICK * 2);
     expect(fired.map(c => c.name)).toEqual(['wip-aging-scan-like']);
   });
 
@@ -914,7 +924,9 @@ describe('CronScheduler', () => {
     })]);
     scheduler.start();
 
-    await vi.advanceTimersByTimeAsync(TICK * 6);
+    // 2026-08-13 fix: catch-up is spread by up to CATCHUP_SPREAD_MS instead
+    // of firing at exactly `now` — advance through the full window.
+    await vi.advanceTimersByTimeAsync(CATCHUP_SPREAD_MS + TICK * 6);
     expect(fired.filter(c => c.name === 'ancient')).toHaveLength(1);
   });
 
@@ -950,5 +962,114 @@ describe('CronScheduler', () => {
 
     await vi.advanceTimersByTimeAsync(TICK * 4);
     expect(fired).toHaveLength(0);
+  });
+
+  // -------------------------------------------------------------------------
+  // CATCH-UP RE-ANCHOR SPREAD (2026-08-13, task_1785766275354)
+  //
+  // THE BUG: on every daemon restart, EVERY interval cron whose real
+  // (last_fired_at-derived) nextFireAt fell in the past during the downtime
+  // hits the catch-up branch and gets clamped to the literal SAME `now` —
+  // the daemon-start instant. Because interval schedules are exact addition
+  // off that anchor forever after (advanceNextFireAt), this converged 13
+  // agents' 14 interval heartbeats onto minutes :58-:03 after the
+  // 2026-08-01T18:42 restart and never drifted apart again — confirmed
+  // against cron-execution.log (fire minutes scattered pre-restart, 1-3
+  // minutes post-restart, permanently). This is what produced the
+  // recurring step-10 kb-ingest RAM-spike window (analyst's independent
+  // series: all 10 RAM spike peaks fall in the same :58-:03 window).
+  //
+  // THE FIX: catch-up no longer clamps to exactly `now`. It adds a
+  // deterministic per-(agent,cron) offset bounded by CATCHUP_SPREAD_MS, so
+  // crons that would previously collide on the identical restart instant
+  // land at different — but still bounded, still prompt — minutes.
+  // -------------------------------------------------------------------------
+
+  describe('catch-up re-anchor spread (RAM-spike-window fix)', () => {
+    // MUST-FAIL CASE (red on unmodified code): two different agents'
+    // same-named interval cron, both overdue at daemon start, clamp to the
+    // IDENTICAL nextFireAt pre-fix. This is the exact mechanism that
+    // clustered 13 agents' heartbeats into one window on 2026-08-01.
+    it('two agents catching up the same cron at the same restart instant get DISTINCT nextFireAt (not identical)', async () => {
+      const overdueBy = new Date(Date.now() - 3 * 3_600_000).toISOString(); // 3h ago, past a 2h interval
+
+      mockReadCrons.mockReturnValue([
+        makeCron({ name: 'heartbeat', schedule: '2h', last_fired_at: overdueBy }),
+      ]);
+
+      const schedA = new CronScheduler({ agentName: 'agent-a', onFire: () => {}, logger: () => {} });
+      const schedB = new CronScheduler({ agentName: 'agent-b', onFire: () => {}, logger: () => {} });
+
+      schedA.start();
+      schedB.start();
+
+      const nextA = schedA.getNextFireTimes().find(e => e.name === 'heartbeat')!.nextFireAt;
+      const nextB = schedB.getNextFireTimes().find(e => e.name === 'heartbeat')!.nextFireAt;
+
+      // PRE-FIX: both clamp to the literal restart `now` -> nextA === nextB.
+      // POST-FIX: distinct, deterministic per-agent offsets.
+      expect(nextA).not.toBe(nextB);
+
+      schedA.stop();
+      schedB.stop();
+    });
+
+    // PAIRED NEGATIVE: the same offset must not become a real delay for a
+    // simple, single-cron fleet — it must stay inside a small bound and
+    // still fire promptly, not skip a whole extra interval. Passes both
+    // before and after the fix (offset=0 pre-fix is trivially inside the
+    // bound) — it's the control proving the fix doesn't introduce a
+    // regression for the case that isn't clustering with anything.
+    it('a lone agent/cron catch-up still fires promptly (offset is bounded, not a real delay)', async () => {
+      const overdueBy = new Date(Date.now() - 3 * 3_600_000).toISOString();
+      mockReadCrons.mockReturnValue([
+        makeCron({ name: 'solo-heartbeat', schedule: '2h', last_fired_at: overdueBy }),
+      ]);
+
+      const solo = new CronScheduler({
+        agentName: 'solo-agent',
+        onFire: (c) => { fired.push(c); },
+        logger: (m) => logs.push(m),
+      });
+      solo.start();
+
+      const entry = solo.getNextFireTimes().find(e => e.name === 'solo-heartbeat')!;
+      const now = Date.now();
+
+      // Bounded: offset must be small relative to the 2h interval (well
+      // under 10% of it), and must never push the fire before `now`.
+      expect(entry.nextFireAt).toBeGreaterThanOrEqual(now);
+      expect(entry.nextFireAt - now).toBeLessThan(10 * 60_000); // < 10 min bound
+
+      // And it actually fires within that bound — not skipped a cycle.
+      await vi.advanceTimersByTimeAsync(10 * 60_000 + TICK);
+      expect(fired.some(c => c.name === 'solo-heartbeat')).toBe(true);
+
+      solo.stop();
+    });
+
+    // DISCRIMINATING PAIR (other side of the bait): a cron that is NOT
+    // overdue — legitimately scheduled in the future — must be completely
+    // unaffected by the spread mechanism. A fix that spreads everything,
+    // not just catch-ups, would pass the two tests above and fail this one.
+    it('a cron that is NOT due yet is unaffected by the spread offset (no early fire, exact grid)', async () => {
+      const thirtyMinAgo = new Date(Date.now() - 30 * 60_000).toISOString();
+      mockReadCrons.mockReturnValue([
+        makeCron({ name: 'not-due', schedule: '2h', last_fired_at: thirtyMinAgo }),
+      ]);
+
+      const sched = new CronScheduler({
+        agentName: 'agent-c',
+        onFire: (c) => { fired.push(c); },
+        logger: () => {},
+      });
+      sched.start();
+
+      const entry = sched.getNextFireTimes().find(e => e.name === 'not-due')!;
+      // Ideal grid: thirtyMinAgo + 2h, exactly — no offset applied since not overdue.
+      expect(entry.nextFireAt).toBe(new Date(thirtyMinAgo).getTime() + 2 * 3_600_000);
+
+      sched.stop();
+    });
   });
 });

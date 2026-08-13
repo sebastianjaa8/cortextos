@@ -215,6 +215,52 @@ function fallbackAnchorMs(cron: CronDefinition, now: number): number {
 }
 
 /**
+ * Spread window for the catch-up re-anchor offset (see catchUpOffsetMs).
+ * Bounded well under any real cron interval (shortest fleet interval is the
+ * 2h heartbeat) so it only ever breaks a same-instant collision — it is
+ * never a meaningful delay to a cadence.
+ */
+export const CATCHUP_SPREAD_MS = 5 * 60_000; // 5 minutes
+
+/**
+ * Deterministic per-(agent,cron) offset applied ONLY at catch-up re-anchor
+ * time (task_1785766275354, 2026-08-13).
+ *
+ * THE BUG THIS FIXES: on every daemon restart, EVERY interval cron whose
+ * real (last_fired_at-derived) nextFireAt fell in the past during the
+ * downtime hits the catch-up clamp below and gets set to the literal SAME
+ * `now` — the daemon-start instant, identical across every agent's
+ * CronScheduler instance since they are all constructed within the same
+ * restart. Because interval schedules are exact addition off that anchor
+ * forever after (advanceNextFireAt), one restart permanently locks every
+ * overdue interval cron into phase with every other one. Measured against
+ * cron-execution.log across the 2026-08-01T18:42 restart: fire minutes went
+ * from scattered across the whole hour (20-45 distinct minutes/agent) to 1-3
+ * minutes each, all inside :58-:03, and stayed there. That convergence is
+ * what produced the recurring step-10 kb-ingest RAM-spike window (analyst's
+ * independent series: all 10 RAM spike peaks fall in the same window).
+ *
+ * A hand-applied stagger would be undone by the next restart, by the same
+ * mechanism that causes the problem — so the offset has to be computed at
+ * re-anchor time, deterministically, from identity alone (no state to lose
+ * on the next restart).
+ *
+ * Deliberately NOT random: a random offset would jitter on every reload,
+ * defeating the "unchanged nextFireAt on reload" contract this scheduler
+ * already relies on for crons whose definition hasn't changed. Hashing
+ * `agentName|cronName` gives the same offset every time for the same
+ * cron, on every daemon restart, indefinitely.
+ */
+function catchUpOffsetMs(agentName: string, cronName: string): number {
+  const key = `${agentName}|${cronName}`;
+  let hash = 0;
+  for (let i = 0; i < key.length; i++) {
+    hash = (hash * 31 + key.charCodeAt(i)) >>> 0;
+  }
+  return hash % CATCHUP_SPREAD_MS;
+}
+
+/**
  * Advance a cron's nextFireAt after it fires (successfully or not).
  *
  * BUG 1 fix: the previous implementation always computed the next slot from
@@ -491,13 +537,20 @@ export class CronScheduler {
       }
 
       // CATCH-UP POLICY: if nextFireAt is in the past (daemon was stopped),
-      // fire once immediately for the missed window, then recompute from now.
-      // We do NOT flood-fire all missed windows — one catch-up is sufficient.
+      // fire once for the missed window, then recompute from now. We do NOT
+      // flood-fire all missed windows — one catch-up is sufficient.
+      //
+      // SPREAD, not "immediate": a bare `now` clamp here is the re-anchor
+      // bug (see catchUpOffsetMs doc comment) — every overdue cron across
+      // every agent would land on the identical restart instant. The
+      // deterministic per-cron offset keeps this prompt (bounded by
+      // CATCHUP_SPREAD_MS, five minutes) while breaking the collision.
       if (nextFireAt <= now) {
+        const offset = catchUpOffsetMs(this.agentName, def.name);
         this.logger(
-          `[cron-scheduler] catch-up: cron "${def.name}" missed fire at ${new Date(nextFireAt).toISOString()} — scheduling immediate fire`
+          `[cron-scheduler] catch-up: cron "${def.name}" missed fire at ${new Date(nextFireAt).toISOString()} — scheduling spread fire at +${offset}ms`
         );
-        nextFireAt = now; // fire on the very next tick
+        nextFireAt = now + offset;
       }
 
       nextScheduled.set(def.name, { definition: def, nextFireAt, changeKey: key });
