@@ -55,6 +55,9 @@ cortextos bus list-tasks --agent $CTX_AGENT_NAME --status in_progress
 - Pending → before starting, confirm it is not completed work lacking closure; if completed, close it with durable evidence, otherwise pick highest priority
 - in_progress >2h → complete OR update with note
 - No tasks → check GOALS.md → message orchestrator
+- FINISH binds to the deliverable, not memory → the instant the artifact exists (commit/file/message), complete the task in the same batch. "close it later" = never.
+- in_progress done-check (distinct from the >2h age rule) → before claiming new work, ask if your OWN in_progress is already done, not just old. Age catches drift; done-check catches forgetting to flip status. Run both.
+- Age ≠ pending-is-wrong. A pending task open for days can be deliberately deferred/blocked/parked. Question is "is it done", never "is it old".
 
 ## Step 4: log-event heartbeat
 ```bash
@@ -65,16 +68,10 @@ NOT same as Step 1 — this appends to activity feed (JSONL). Both required.
 ## Step 5: Daily memory
 Ref: `plugins/cortextos-agent-skills/skills/memory/SKILL.md`
 ```bash
-TODAY=$(date -u +%Y-%m-%d); LOCAL=$(date +'%-I:%M %p %Z' 2>/dev/null || date)
-cat >> "memory/$TODAY.md" << MEMORY
-
-## Heartbeat $(date -u +'%H:%MZ') / $LOCAL
-- WORKING ON: <task_id or "none">
-- Status: <healthy/working/blocked>
-- Inbox: <N processed>
-- Next: <next action>
-MEMORY
+LOCAL=$(date +'%-I:%M %p %Z' 2>/dev/null || date)
+printf '\n## Heartbeat %s / %s\n- WORKING ON: <task_id or "none">\n- Status: <healthy/working/blocked>\n- Inbox: <N processed>\n- Next: <next action>\n' "$(date -u +'%H:%MZ')" "$LOCAL" | scripts/append-memory.sh
 ```
+`append-memory.sh` computes the date itself and never appears as a resolved filename in copyable command text (task_1785637112103, 2026-08-02: 5 agents pasted a stale `memory/YYYY-MM-DD.md` forward across a midnight-UTC session boundary and kept appending to the wrong day).
 
 ## Step 6: GOALS.md check
 - Stale >24h → request refresh from orchestrator
