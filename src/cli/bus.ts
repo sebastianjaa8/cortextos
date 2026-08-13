@@ -130,6 +130,18 @@ busCommand
     }
 
     const env = resolveEnv();
+
+    // Reject an unknown recipient BEFORE any inbox write (task_1785720898226).
+    // ensureDir()/atomicWriteSync() inside sendMessage() would otherwise create
+    // inbox/<to> for whatever string it's handed — a typo's second attempt then
+    // finds that directory already present and is indistinguishable from a
+    // registered agent. Checking (and exiting) here, before sendMessage() runs,
+    // keeps that directory from ever coming into existence for a bad recipient.
+    if (!agentExistsInFramework(to, env.frameworkRoot)) {
+      console.error(`Error: agent '${to}' not found in framework. Check orgs/*/agents/ directory. Message will NOT be sent.`);
+      process.exit(1);
+    }
+
     const paths = resolvePaths(env.agentName, env.instanceId, env.org);
     const msgId = sendMessage(paths, env.agentName, to, priority as Priority, text, effectiveReplyTo);
     try {
@@ -162,29 +174,23 @@ busCommand
     }
 
     const env = resolveEnv();
+
+    // Reject an unknown recipient BEFORE any inbox write (task_1785720898226).
+    // Previously this only warned and proceeded: success and failure were
+    // byte-identical (exit 0, an id printed either way), and the warning went
+    // to stderr where the fleet's conventional `2>&1 | tail -1` invocation
+    // discards it. Worse, sendMessage()'s ensureDir() would create inbox/<to>
+    // for whatever string it's handed, so a typo's SECOND attempt found that
+    // directory already present and was indistinguishable from a real agent.
+    // Reference: send-telegram already fails loudly (exit 1) on an unknown
+    // chat id — this brings send-message in line with that house style
+    // instead of being the one bus command where a bad recipient is silent.
+    if (!agentExistsInFramework(to, env.frameworkRoot)) {
+      console.error(`Error: agent '${to}' not found in framework. Check orgs/*/agents/ directory. Message will NOT be sent.`);
+      process.exit(1);
+    }
+
     const paths = resolvePaths(env.agentName, env.instanceId, env.org);
-
-    // Warn if target agent doesn't exist (check project dir)
-    const { existsSync } = require('fs');
-    const { join } = require('path');
-    const projectRoot = env.projectRoot || env.frameworkRoot || process.cwd();
-    const orgsDir = join(projectRoot, 'orgs');
-    let agentExists = false;
-    if (existsSync(orgsDir)) {
-      const { readdirSync } = require('fs');
-      try {
-        for (const org of readdirSync(orgsDir)) {
-          if (existsSync(join(orgsDir, org, 'agents', to))) {
-            agentExists = true;
-            break;
-          }
-        }
-      } catch { /* skip */ }
-    }
-    if (!agentExists) {
-      console.error(`Warning: agent '${to}' not found in project. Message will be queued but may never be read.`);
-    }
-
     const msgId = sendMessage(paths, env.agentName, to, priority as Priority, text, effectiveReplyTo);
     try {
       logEvent(paths, env.agentName, env.org, 'message', 'agent_message_sent', 'info', JSON.stringify({ to, priority, msg_id: msgId, reply_to: effectiveReplyTo ?? null }));
