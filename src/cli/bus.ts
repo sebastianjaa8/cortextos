@@ -1436,7 +1436,7 @@ busCommand
   .option('--agent <name>', 'Agent name (for private scope)')
   .option('--scope <s>', 'Scope: shared, private, or all', 'all')
   .option('--top-k <n>', 'Number of results', '5')
-  .option('--threshold <f>', 'Minimum similarity score (0-1)', '0.5')
+  .option('--threshold <f>', 'Minimum similarity score (0-1) — defaults to config.json\'s similarity_threshold when unset')
   .option('--json', 'Output raw JSON')
   .action((question: string, opts: { org?: string; agent?: string; scope?: string; topK?: string; threshold?: string; json?: boolean }) => {
     const env = resolveEnv();
@@ -1454,7 +1454,7 @@ busCommand
         agent: opts.agent || env.agentName,
         scope: (opts.scope as 'shared' | 'private' | 'all') || 'all',
         topK: parseInt(opts.topK || '5', 10),
-        threshold: parseFloat(opts.threshold || '0.5'),
+        threshold: opts.threshold !== undefined ? parseFloat(opts.threshold) : undefined,
         frameworkRoot: env.frameworkRoot || process.cwd(),
         instanceId: env.instanceId,
       },

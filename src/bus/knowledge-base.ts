@@ -123,12 +123,20 @@ export function queryKnowledgeBase(
     agent?: string;
     scope?: 'shared' | 'private' | 'all';
     topK?: number;
+    // Undefined (not defaulted here) on purpose (task_1786672430694, 2026-08-14): a hardcoded
+    // JS-level default duplicated config.json's similarity_threshold and silently won every
+    // query, since it was always passed through as an explicit --threshold CLI flag to
+    // mmrag.py — which makes an explicit flag override config.json's own value unconditionally.
+    // Config.json's Gemini-era 0.5 default moved to 0.3 for the local embedding model (its score
+    // distribution runs lower), but every real query kept using the OLD 0.5 anyway because this
+    // default never stopped being sent. Leaving threshold undefined here when the caller didn't
+    // specify one lets mmrag.py's own config.json value be the single source of truth.
     threshold?: number;
     frameworkRoot: string;
     instanceId: string;
   },
 ): KBQueryResponse {
-  const { agent, scope = 'all', topK = 5, threshold = 0.5, frameworkRoot, instanceId } = options;
+  const { agent, scope = 'all', topK = 5, threshold, frameworkRoot, instanceId } = options;
   // Normalize once at the top so every downstream path join, env var, and
   // ChromaDB collection name uses the canonical filesystem casing. Without
   // this, `shared-acmecorp` and `shared-AcmeCorp` become two
@@ -172,13 +180,16 @@ export function queryKnowledgeBase(
 
   const runQuery = (col: string): string | null => {
     try {
-      return execFileSync(pythonPath, [
+      const args = [
         mmragPath, 'query', question,
         '--collection', col,
         '--top-k', String(topK),
-        '--threshold', String(threshold),
         '--json',
-      ], {
+      ];
+      // Only pass --threshold when the caller explicitly set one — an unset threshold lets
+      // mmrag.py fall through to config.json's similarity_threshold instead of a stale JS default.
+      if (threshold !== undefined) args.splice(-1, 0, '--threshold', String(threshold));
+      return execFileSync(pythonPath, args, {
         encoding: 'utf-8',
         timeout: 30000,
         env,
