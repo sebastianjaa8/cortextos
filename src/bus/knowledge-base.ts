@@ -314,11 +314,21 @@ export function ingestKnowledgeBase(
 
   // Multimodal PDF ingestion via Gemini Flash routinely takes 2–5 min for
   // documents over ~10 pages with images/tables. Two minutes was too low and
-  // produced ETIMEDOUT mid-Gemini-call. Default 10 min, override via env,
-  // floored at 60s so nobody accidentally sets it to 0 or a value smaller
-  // than a single Gemini call needs.
+  // produced ETIMEDOUT mid-Gemini-call. 10 min covered that.
+  //
+  // Raised to 30 min (task_1786672430694, 2026-08-14): the local ONNX MiniLM
+  // embedding model (dropped-Gemini text path) is CPU-bound and, under real
+  // ambient fleet load (measured live: 17 concurrent node.exe + 4 python.exe
+  // processes), profiled at ~4.4-5s per chunk vs. ~0.25s best-case idle.
+  // A 313-chunk file (builder_1's own MEMORY.md) hit the old 600_000ms
+  // ceiling and was SIGTERM'd mid-ingest with ETIMEDOUT. This isn't a code
+  // defect to fix — CPU contention across ~20 live agent processes is a real
+  // constraint on this box — so the timeout needs to cover the worst real
+  // case, not the isolated best case. Floored at 60s so nobody accidentally
+  // sets it below a single embed call needs, override via env for either
+  // direction.
   const KB_INGEST_TIMEOUT_FLOOR_MS = 60_000;
-  const KB_INGEST_TIMEOUT_DEFAULT_MS = 600_000;
+  const KB_INGEST_TIMEOUT_DEFAULT_MS = 1_800_000;
   const requestedTimeout = Number(process.env.KB_INGEST_TIMEOUT_MS);
   const ingestTimeoutMs = Math.max(
     KB_INGEST_TIMEOUT_FLOOR_MS,
