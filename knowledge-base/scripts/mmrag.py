@@ -168,11 +168,20 @@ def load_config():
 
 
 def get_api_key(config):
-    key = os.environ.get("GEMINI_API_KEY") or config.get("gemini_api_key")
-    if not key:
-        print("ERROR: No Gemini API key. Set GEMINI_API_KEY or run setup.")
-        sys.exit(1)
-    return key
+    """Return the Gemini API key, or None if not configured.
+
+    task_1786672430694 (2026-08-14): plain-text embedding no longer needs
+    Gemini at all (see embed_text_local / embed_content below) -- only
+    multimodal ingestion (image/video/audio/PDF, via describe_media +
+    embed_multimodal) still does. This used to sys.exit(1) here, which meant
+    EVERY run -- including a pure-text kb-ingest of a .md file -- refused to
+    start at all the moment GEMINI_API_KEY was missing or the key was
+    revoked, even though the actual embedding call for that run never
+    touched Gemini. Returning None instead lets text-only callers proceed;
+    embed_content raises a clear, LOCAL error only if a multimodal path is
+    actually reached with no key configured.
+    """
+    return os.environ.get("GEMINI_API_KEY") or config.get("gemini_api_key")
 
 # ---------------------------------------------------------------------------
 # Gemini clients
@@ -203,15 +212,23 @@ def _load_factory(dotted_path):
 
 
 def get_genai_client(api_key):
-    """Construct a Gemini client.
+    """Construct a Gemini client, or return None if no key is configured.
 
     Default returns google.genai.Client(api_key=api_key) — byte-identical to
-    the prior behavior. To inject a fake client (e.g. for testing the retry
-    loop in ingest_pdf), set the env-var MMRAG_GEMINI_CLIENT_FACTORY to a
-    dotted import path of a callable taking (api_key) and returning an object
-    with .models.generate_content / .models.embed_content compatible shape.
+    the prior behavior when a key IS present. To inject a fake client (e.g.
+    for testing the retry loop in ingest_pdf), set the env-var
+    MMRAG_GEMINI_CLIENT_FACTORY to a dotted import path of a callable taking
+    (api_key) and returning an object with .models.generate_content /
+    .models.embed_content compatible shape.
     See knowledge-base/scripts/_test_clients/fault_injection.py for a reference.
+
+    api_key may be None (get_api_key no longer hard-exits when the key is
+    missing, task_1786672430694) — a None client is only a problem for
+    callers that actually need Gemini (multimodal describe_media /
+    embed_multimodal); plain text embedding never calls this path at all.
     """
+    if api_key is None:
+        return None
     factory_path = os.environ.get("MMRAG_GEMINI_CLIENT_FACTORY")
     if factory_path:
         return _load_factory(factory_path)(api_key)
@@ -247,20 +264,76 @@ def _retry_generate_content(client, *, model, contents, backoffs=(5, 15, 45)):
     raise last_err if last_err else RuntimeError("retry loop completed without response or error")
 
 
+_local_embedder = None
+
+
+def _get_local_embedder():
+    """Lazily construct the local, zero-cost, zero-key text embedder.
+
+    task_1786672430694 (2026-08-14): Sebastian's GEMINI_API_KEY access broke
+    (403 PERMISSION_DENIED, no valid key exists in his AI Studio account),
+    blocking kb-ingest for 11+ agents since ~08-11. Sebastian approved
+    dropping Gemini for text embedding entirely rather than waiting on a key.
+
+    Uses chromadb's own bundled DefaultEmbeddingFunction — ONNX MiniLM-L6-v2
+    (384-dim), runs via onnxruntime, which was ALREADY an installed
+    dependency of chromadb before this change (verified: no new package
+    needed). The model weights download once to the local cache on first use
+    and run fully offline after that. Lower quality than Gemini Embedding 2
+    (a small local model vs. a hosted large one) — accepted explicitly by
+    Sebastian as the tradeoff for zero cost / zero API dependency.
+    """
+    global _local_embedder
+    if _local_embedder is None:
+        from chromadb.utils import embedding_functions
+        _local_embedder = embedding_functions.DefaultEmbeddingFunction()
+    return _local_embedder
+
+
+def embed_text_local(text):
+    """Embed a plain text string locally. No API key, no network call, no cost."""
+    embedder = _get_local_embedder()
+    # chromadb's embedder returns a numpy.ndarray of float32 per row; convert to
+    # plain Python floats so the return shape matches what every caller already
+    # expects from the old Gemini path (result.embeddings[0].values, a list of
+    # plain floats) — numpy float32 is not JSON-serializable and callers /
+    # tests may assume plain floats.
+    return [float(x) for x in embedder([text])[0]]
+
+
 def embed_content(client, config, content, task_type="RETRIEVAL_DOCUMENT"):
-    """Embed content using Gemini Embedding 2. Content can be text string or list of Parts."""
-    from google.genai import types
-    result = client.models.embed_content(
-        model=config.get("embedding_model", "gemini-embedding-2-preview"),
-        contents=content,
-        config=types.EmbedContentConfig(
-            output_dimensionality=config.get("embedding_dimensions", DEFAULT_EMBEDDING_DIMENSIONS),
-            task_type=task_type,
-        ),
-    )
+    """Embed content. Plain text (the common case: every .md/.txt/code file,
+    every query) is embedded LOCALLY — no Gemini, no API key, no cost.
+    Multimodal content (a list of Parts — text description + raw image/video/
+    audio bytes, built by embed_multimodal) still requires a real Gemini
+    client, since no local equivalent exists here. task_type is accepted for
+    interface compatibility with the old Gemini call but is not applicable to
+    the local model — MiniLM does not distinguish query vs. document
+    embeddings the way Gemini's task_type does; queries and documents share
+    one embedding space. Known, accepted quality tradeoff, not a bug.
+    """
+    if isinstance(content, str):
+        values = embed_text_local(content)
+    else:
+        from google.genai import types
+        if client is None:
+            raise RuntimeError(
+                "Multimodal embedding needs a Gemini client (GEMINI_API_KEY), but none is "
+                "configured. Plain text embedding no longer needs Gemini at all -- only "
+                "image/video/audio/PDF ingestion still does."
+            )
+        result = client.models.embed_content(
+            model=config.get("embedding_model", "gemini-embedding-2-preview"),
+            contents=content,
+            config=types.EmbedContentConfig(
+                output_dimensionality=config.get("embedding_dimensions", DEFAULT_EMBEDDING_DIMENSIONS),
+                task_type=task_type,
+            ),
+        )
+        values = result.embeddings[0].values
     if _tracker:
         _tracker.track_embedding(content)
-    return result.embeddings[0].values
+    return values
 
 
 def embed_multimodal(client, config, description_text, media_bytes, mime_type):
