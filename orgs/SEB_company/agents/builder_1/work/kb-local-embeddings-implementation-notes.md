@@ -82,3 +82,44 @@
   ../cortextos-worktrees/builder_1-kb-local-embeddings. Core fix + tests done and verified; three
   open decisions (similarity_threshold recalibration, ingest throughput at scale, live-collection
   migration coordination) reported to seb_boss before proceeding further.
+
+## Follow-up 2026-08-14 — throughput profiled properly, threshold set (seb_boss direction)
+
+- THRESHOLD: seb_boss set 0.3 as the starting point (real top score for the vague-query test was
+  0.295). Not applying to the LIVE config.json yet -- it ships together with the dimension change
+  and collection reset (item 3, still held). Migration snippet prepared below.
+- THROUGHPUT, profiled in three isolated stages, not guessed:
+  1. Stage-by-stage timing on a real 184-chunk file (seb_boss's MEMORY.md): chunk_text is
+     instant, `already_exists()` .get() check is 0.4ms/call, `collection.upsert()` is 104ms/call.
+     `embed_content()` averaged 4420ms/call in that same run -- overwhelmingly the bottleneck.
+     **The per-chunk insert loop is NOT the problem** -- ruled out cleanly by isolating it from
+     the embed call.
+  2. Ran a controlled repeated-call test: first ~8 calls fast (0.2-0.3s each, matches an isolated
+     cold-start benchmark), then a sharp, sustained jump to 4-5s/call for the rest -- NOT random
+     jitter, a real step change.
+  3. Distinguished "my code" from "the box" directly: created a completely FRESH embedder
+     instance immediately after the slowdown started and ran 6 more calls on it -- still
+     3.6-5.2s/call. A fresh, uncached instance being equally slow RULES OUT a caching/session-
+     reuse bug in my singleton pattern. The slowness is external to the code.
+  4. Correlated with the box: 17 live node.exe processes + 4 python.exe processes running
+     concurrently at the time, RAM ~77-85% used (consistent with readings all session). This is
+     ambient fleet CPU contention, not a defect in this change -- matches seb_boss's own
+     hypothesis #2a exactly.
+- OPERATIONAL IMPLICATION for the eventual reset+re-ingest: at ~4-5s/chunk under current ambient
+  load (vs ~0.25s/chunk best-case when the box is quiet), a full re-ingest of a large file
+  (MEMORY.md-sized, 180-300+ chunks) could take 15-25 minutes per agent under load. Worth
+  scheduling the actual migration during a quieter window if one exists, or just accepting the
+  cost -- Sebastian's call, not mine, noted for the heads-up conversation.
+- MIGRATION SNIPPET, prepared not applied -- the config.json diff that ships together with the
+  reset, when Sebastian's heads-up is done:
+  ```
+  - "embedding_dimensions": 3072,
+  + "embedding_dimensions": 384,
+  - "similarity_threshold": 0.5,
+  + "similarity_threshold": 0.3,
+  ```
+  Plus: `mmrag.py reset --confirm` (existing command, already built) per agent/collection, then a
+  full re-ingest from each agent's real source files (MEMORY.md + daily memory) -- nothing is
+  destroyed, only the derived vector index rebuilds from files already on disk.
+- Items 1 and 2 (seb_boss's list) now resolved. Item 3 (live reset) still held pending
+  Sebastian's heads-up, per seb_boss's explicit instruction.
