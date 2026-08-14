@@ -53,6 +53,18 @@ export function parseEmbeddingTokens(stdout) {
 }
 
 /**
+ * Pull the per-file error count out of a kb-ingest run.
+ *
+ * UNLIKE parseEmbeddingTokens, absence genuinely means zero here — mmrag.py's own source
+ * (`if errors: print(f"  Errors: {errors}")`) only prints the line when the count is nonzero, so
+ * "no Errors line" and "Errors: 0" are the same fact, not a null-vs-zero ambiguity to preserve.
+ */
+export function parseErrorCount(stdout) {
+  const m = /Errors:\s*(\d+)/i.exec(stdout || '');
+  return m ? Number(m[1]) : 0;
+}
+
+/**
  * A fingerprint of the inputs as they are RIGHT NOW: path and content hash for each.
  *
  * A CONTENT HASH, NOT mtime+size. I proposed mtime+size (two stats, cheaper); seb_boss overrode it
@@ -139,7 +151,7 @@ export function partitionChanged(prev, now) {
  * Pure verdict logic so --self-test can drive it without touching the CLI.
  * @returns {{code:0|2|3, status:string, detail:string}}
  */
-export function verdict({ missingPaths, tokens, ingestFailed, skippedOptional = [], unchanged = false, unchangedPaths = [] }) {
+export function verdict({ missingPaths, tokens, ingestFailed, skippedOptional = [], unchanged = false, unchangedPaths = [], errors = 0 }) {
   // AN ABSENT OPTIONAL PATH IS NOT A FINDING, AND IT IS NOT SILENT EITHER.
   // seb_boss caught this before it did damage: `./memory/<today>.md` does not
   // exist until something writes memory that day, so treating every path as
@@ -193,6 +205,19 @@ export function verdict({ missingPaths, tokens, ingestFailed, skippedOptional = 
       detail: 'kb-ingest produced no "Tokens:" line. It was almost certainly cut off mid-run — the ' +
         'caller timeout is the first thing to check (the harness default is 120s; a 350KB ingest takes ~204s).' };
   }
+  // A NONZERO TOKEN COUNT IS NOT PROOF OF A LANDED CHUNK. Found live 2026-08-14 (finance_tracker,
+  // local-embeddings rollout): mmrag.py prints "Errors: N" for the files whose embedding call raised
+  // (here, an embedding-dimension mismatch) and STILL prints a nonzero Tokens line, because tokens
+  // are spent on the failed calls too — VERDICT: INGESTED (370 embedding tokens) while Errors: 2 and
+  // 0 chunks actually landed. Checked BEFORE the zero/positive token branches below, because a
+  // per-file error can coexist with either: tokens could be 0 (every file failed) or positive (only
+  // some did), and both must read as a finding, not as ZERO-TOKENS or INGESTED respectively.
+  if (errors > 0) {
+    return { code: 2, status: 'INGEST-ERRORS',
+      detail: `kb-ingest reported ${errors} per-file error(s). A nonzero Tokens count does not mean ` +
+        `those chunks landed — tokens are spent on a failed embedding call too, so check which ` +
+        `input(s) failed (dimension mismatch is the known cause) rather than trusting the token count.${skipNote}` };
+  }
   // WHAT ZERO-TOKENS ACTUALLY MEANS, EXERCISED IN PRODUCTION 2026-08-03T17:4xZ RATHER THAN REASONED.
   // task_1785723004813_36146080 said the route was "a file whose bytes change but whose chunks are
   // already fully indexed", citing kb-ingest's no---force behaviour. THAT ROUTE IS UNREACHABLE HERE:
@@ -227,6 +252,8 @@ function selfTest() {
   const cases = [
     ['parses a thousands-separated count', () => parseEmbeddingTokens('  Tokens: 94,500 embedding, 0 gen-input') === 94500],
     ['parses a bare count', () => parseEmbeddingTokens('Tokens: 12 embedding') === 12],
+    ['parses an error count', () => parseErrorCount('  Errors: 2') === 2],
+    ['no Errors line is 0, not null — absence IS zero here', () => parseErrorCount('Done! Ingested 3 new chunk(s)') === 0],
     // THE DISTINCTION THIS FILE TURNS ON. "printed zero" and "never printed" are
     // different facts; if these two ever return the same thing, the killed-run
     // case becomes invisible again and this whole wrapper is decorative.
@@ -244,6 +271,27 @@ function selfTest() {
     ['missing path outranks zero tokens, by STATUS not just code', () =>
       verdict({ missingPaths: ['./gone.md'], tokens: 0, ingestFailed: false }).status === 'PATH-MISSING'],
     ['broken call is 3, not 2', () => verdict({ missingPaths: [], tokens: null, ingestFailed: 'spawn EINVAL' }).code === 3],
+
+    // --- INGEST-ERRORS: the 2026-08-14 finance_tracker incident (nonzero tokens, 0 chunks landed) ---
+    ['THE INCIDENT ITSELF: nonzero tokens + errors is a finding, not INGESTED', () =>
+      verdict({ missingPaths: [], tokens: 370, ingestFailed: null, errors: 2 }).code === 2],
+    ['THE INCIDENT ITSELF, by status not just code', () =>
+      verdict({ missingPaths: [], tokens: 370, ingestFailed: null, errors: 2 }).status === 'INGEST-ERRORS'],
+    ['errors survive into the detail', () =>
+      verdict({ missingPaths: [], tokens: 370, ingestFailed: null, errors: 2 }).detail.includes('2 per-file error')],
+    // errors can coexist with tokens:0 too (every file in the batch failed) — must still be
+    // INGEST-ERRORS, not ZERO-TOKENS, because the remedy (check which file failed) differs.
+    ['zero tokens WITH errors is INGEST-ERRORS, not ZERO-TOKENS', () =>
+      verdict({ missingPaths: [], tokens: 0, ingestFailed: null, errors: 1 }).status === 'INGEST-ERRORS'],
+    // CONTROL: without this, a verdict() that always returns INGEST-ERRORS would pass every case
+    // above. errors defaults to 0, so an ordinary run must be unaffected.
+    ['CONTROL: errors:0 still reaches INGESTED for a real ingest', () =>
+      verdict({ missingPaths: [], tokens: 370, ingestFailed: false, errors: 0 }).status === 'INGESTED'],
+    // PRECEDENCE: a cut-off run (no Tokens line at all) outranks a same-run Errors line — the
+    // mid-run kill is the more urgent unknown, and mmrag.py prints Errors: before the Tokens summary,
+    // so tokens:null + errors>0 is a real reachable combination, not a hypothetical.
+    ['NO-TOKEN-LINE outranks INGEST-ERRORS', () =>
+      verdict({ missingPaths: [], tokens: null, ingestFailed: null, errors: 2 }).status === 'NO-TOKEN-LINE'],
 
     // --- the UNCHANGED skip (analyst 2026-08-01: --force re-embedded everything every fire) ---
     // --- UTC ROLLOVER: the fingerprint must stay PER-INPUT (task_1785622930763_68411636) ---
@@ -523,7 +571,8 @@ if (!missingPaths.length && !unchanged) {
 }
 
 const tokens = parseEmbeddingTokens(stdout);
-const { code, status, detail } = verdict({ missingPaths, tokens, ingestFailed, skippedOptional, unchanged, unchangedPaths: part.unchangedPaths });
+const errors = parseErrorCount(stdout);
+const { code, status, detail } = verdict({ missingPaths, tokens, ingestFailed, skippedOptional, unchanged, unchangedPaths: part.unchangedPaths, errors });
 
 // THE RECEIPT IS WRITTEN ON EVERY OUTCOME, INCLUDING THE BAD ONES. A receipt
 // that only appears on success cannot distinguish "failed" from "never ran",
@@ -540,7 +589,7 @@ try {
     ts: new Date().toISOString(),
     startedAt,
     durationMs: Date.now() - Date.parse(startedAt),
-    agent, status, tokens,
+    agent, status, tokens, errors,
     // Sizes travel with the receipt so the growth curve is readable from the
     // receipts alone, without re-stat'ing files that have since changed.
     bytes: ingestPaths.reduce((n, p) => n + (existsSync(p) ? statSync(p).size : 0), 0),
