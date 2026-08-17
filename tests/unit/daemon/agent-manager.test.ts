@@ -470,3 +470,57 @@ describe('AgentManager.reloadCrons - silent-success bug fix (iter 7)', () => {
     expect((am as any).cronSchedulers.has('ghost')).toBe(false);
   });
 });
+
+describe('AgentManager.injectAgentQueued — cronMeta pass-through (task_1786971045376, 2026-08-17)', () => {
+  // Gap named by adversarial review (Codex): the drainTick/cronMeta unit tests all supply
+  // metadata directly to AgentProcess, never exercising the PRODUCTION path where
+  // agent-manager.ts's onFire builds { cron, firedAt } and this method forwards it through.
+  // This is the seam that actually matters in production — if it silently dropped the 3rd
+  // arg, every cron delivery record would go missing with no test catching it.
+  let testDir: string;
+  let ctxRoot: string;
+  let frameworkRoot: string;
+
+  beforeEach(() => {
+    testDir = mkdtempSync(join(tmpdir(), 'cortextos-am-injectqueued-'));
+    ctxRoot = join(testDir, 'instance');
+    frameworkRoot = join(testDir, 'framework');
+    mkdirSync(join(ctxRoot, 'config'), { recursive: true });
+    mkdirSync(join(frameworkRoot, 'orgs', 'acme', 'agents', 'alice'), { recursive: true });
+  });
+
+  afterEach(() => {
+    rmSync(testDir, { recursive: true, force: true });
+  });
+
+  it('forwards cronMeta unchanged to AgentProcess.injectMessageQueued', () => {
+    const am = new AgentManager('test-instance', ctxRoot, frameworkRoot, 'acme');
+    const injectSpy = vi.fn().mockReturnValue({ ok: true, queued: true });
+    const fakeProcess = { injectMessageQueued: injectSpy } as any;
+    (am as any).agents.set('alice', { process: fakeProcess, checker: {} });
+
+    const meta = { cron: 'autoresearch-pulse', firedAt: '2026-08-17T12:00:00.000Z' };
+    const result = am.injectAgentQueued('alice', '[CRON FIRED ...] pulse: do the thing', meta);
+
+    expect(result).toEqual({ ok: true, queued: true });
+    expect(injectSpy).toHaveBeenCalledTimes(1);
+    expect(injectSpy).toHaveBeenCalledWith('[CRON FIRED ...] pulse: do the thing', meta);
+  });
+
+  it('forwards undefined cronMeta as undefined, not a default object (interactive/Telegram callers omit it)', () => {
+    const am = new AgentManager('test-instance', ctxRoot, frameworkRoot, 'acme');
+    const injectSpy = vi.fn().mockReturnValue({ ok: true, queued: true });
+    const fakeProcess = { injectMessageQueued: injectSpy } as any;
+    (am as any).agents.set('alice', { process: fakeProcess, checker: {} });
+
+    am.injectAgentQueued('alice', 'interactive steering');
+
+    expect(injectSpy).toHaveBeenCalledWith('interactive steering', undefined);
+  });
+
+  it('returns NOT_FOUND without touching injectMessageQueued when the agent is not registered', () => {
+    const am = new AgentManager('test-instance', ctxRoot, frameworkRoot, 'acme');
+    const result = am.injectAgentQueued('ghost', 'text', { cron: 'x', firedAt: 'y' });
+    expect(result).toEqual({ ok: false, code: 'NOT_FOUND', message: expect.stringContaining('ghost') });
+  });
+});

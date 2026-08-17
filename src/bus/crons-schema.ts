@@ -91,6 +91,14 @@ export const CRON_DELIVERY_LOG_FILENAME = 'cron-delivery.log';
  * `ts`/`fired_at` values are close but not byte-identical, captured a few ms apart at two different
  * points) is the signal this file exists to make visible: enqueued but never actually reached the PTY.
  *
+ * LIMIT, stated next to the claim per this file's own convention (adversarial review, Codex,
+ * task_1786971045376): the writer (`appendDeliveryLog`) swallows its own I/O errors, same as
+ * cron-execution.log's writer. A disk-full or permission failure on THIS file produces the exact
+ * same absence as a genuine non-delivery — an unwritable delivery log cannot be told apart from a
+ * dropped prompt by this file alone. Both writers share the design tradeoff (never crash the drain
+ * loop over an observational log), so this is not a defect specific to this file, but the
+ * inference "absent = never delivered" is not airtight and a reader relying on it should know that.
+ *
  * @param agentName - The agent's directory name (e.g. "boris", "paul").
  * @returns Relative path string:
  *   `.cortextOS/state/agents/{agentName}/cron-delivery.log`

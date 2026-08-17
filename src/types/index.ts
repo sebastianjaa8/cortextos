@@ -497,9 +497,24 @@ export interface CronDeliveryLogEntry {
    * cron-scheduler.ts. Join on cron name + nearest timestamp, not exact string equality.
    */
   fired_at: string;
-  /** Milliseconds between enqueue and this successful delivery (drain-queue wait time). */
+  /**
+   * TOTAL milliseconds from enqueue to CONFIRMED delivery — includes the async submit-verify
+   * window (inject.ts's Enter-retry delay), not just the drain loop's own quiet-window wait.
+   * Caught by adversarial review (Codex, task_1786971045376): the field is written inside the
+   * onDeliveryAccepted callback, which fires after verification settles, not at drain time.
+   */
   waited_ms: number;
-  /** How the delivery valve fired: waited for a real quiet-PTY turn boundary, or the 15min safety valve forced it mid-turn. */
+  /**
+   * How the delivery valve fired. Currently ALWAYS 'quiet-boundary' — 'max-wait-valve' is
+   * reserved, never written today (task_1786971045376, post-review). The 15min safety valve
+   * injects mid-turn on an already-noisy PTY, where the same output-growth verifier that
+   * confirms delivery can false-accept on unrelated ongoing output (documented ceiling,
+   * agent-process.ts's own "ponytail: known ceiling" comment on the drain design). Recording a
+   * durable "confirmed" entry through that weak signal would be worse than recording nothing —
+   * a future implementation that adds max-wait-valve logging needs a STRONGER verification
+   * mechanism first (e.g. content-specific matching against the conversation JSONL), not just
+   * flipping this back on.
+   */
   trigger: 'quiet-boundary' | 'max-wait-valve';
 }
 

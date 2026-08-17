@@ -744,7 +744,22 @@ export class AgentProcess {
 
     this.pendingInjections.shift();
     const waitedS = Math.round((Date.now() - head.enqueuedAt) / 1000);
-    const onDeliveryAccepted = head.cronMeta
+    const meta = head.cronMeta;
+    // NOT WIRED FOR THE MAX-WAIT-VALVE PATH — found by adversarial review (Codex,
+    // task_1786971045376), and the finding is real, not paranoid. The overdue branch fires
+    // BECAUSE the PTY has been busy (that is the only way a queued item survives 15 minutes
+    // without a quiet window). The verify-retry that acceptDelivery/onAccepted depends on
+    // treats ANY output growth as evidence the Enter landed (inject.ts) — on an already-noisy
+    // PTY, unrelated ongoing turn output can satisfy that check even when this specific
+    // prompt was swallowed. The file header's own "ponytail: known ceiling" comment already
+    // names this exact false-accept class for mid-turn injection; wiring a durable, trusted
+    // "CONFIRMED delivery" record through that same weak signal would launder a known-shaky
+    // heuristic into evidence a future reader has no way to discount. Better to have NO
+    // delivery record for the rare 15-minute-valve case than a WRONG one that reads as ground
+    // truth — same "a false confirm is worse than a gap" principle this whole file's failure
+    // path already lives by. Quiet-boundary delivery has no such ambiguity: the verifier
+    // requires a genuinely quiet PTY, so growth immediately after injection is real signal.
+    const onDeliveryAccepted = meta && !overdue
       ? () => {
           // CONFIRMED delivery, not just "submit accepted" — this callback only fires once
           // injectMessageDetailed's own async verify-retry has actually seen the Enter land
@@ -753,13 +768,16 @@ export class AgentProcess {
           // is provisional (queuing succeeded, verification still pending), so recording delivery
           // there instead of here would have logged optimistically, not confirmed — the same
           // asymmetry class this file exists to close, just moved one line over.
-          const meta = head.cronMeta!;
           appendDeliveryLog(this.name, {
             ts: new Date().toISOString(),
             cron: meta.cron,
             fired_at: meta.firedAt,
+            // TOTAL elapsed time from enqueue to CONFIRMED delivery — includes the async
+            // submit-verification window (inject.ts's Enter-retry delay), not just the drain
+            // loop's own quiet-window wait. Named accurately after adversarial review caught
+            // the original doc claiming "drain-queue wait time," which undercounted it.
             waited_ms: Date.now() - head.enqueuedAt,
-            trigger: overdue ? 'max-wait-valve' : 'quiet-boundary',
+            trigger: 'quiet-boundary',
           });
         }
       : undefined;

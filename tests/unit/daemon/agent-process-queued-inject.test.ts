@@ -249,7 +249,7 @@ describe('AgentProcess.injectMessageQueued — turn-boundary drain', () => {
   });
 
   describe('cron delivery record (task_1786971045376, 2026-08-17: drainTick success had no observable record)', () => {
-    it('logs a delivery record ONLY once the async verify confirms acceptance, not at drain time', () => {
+    it('logs a delivery record ONLY once the async verify confirms acceptance, not at drain time; waited_ms counts the FULL elapsed time including verify latency', () => {
       const { proc, state } = makeRunningProcess();
       state.bytes = 10_000;
       proc.injectMessageQueued('[CRON FIRED 2026-08-17T12:00:00.000Z] pulse: do the thing', {
@@ -264,6 +264,12 @@ describe('AgentProcess.injectMessageQueued — turn-boundary drain', () => {
       // confirmation would have logged an optimistic delivery, not a real one.
       expect(mockAppendDeliveryLog).not.toHaveBeenCalled();
 
+      // Real async gap between drain and confirmation (inject.ts's Enter-verify window) —
+      // adversarial review (Codex) found waited_ms was documented as "drain-queue wait time"
+      // while actually including this gap too. Advancing time here before onAccepted() proves
+      // the number reflects the FULL elapsed span, not just the pre-confirmation portion.
+      const VERIFY_GAP_MS = 4_000;
+      vi.advanceTimersByTime(VERIFY_GAP_MS);
       // Verify object is the 4th positional arg to injectMessage (see inject.ts call shape).
       const verify = mockInjectMessage.mock.calls[0][3];
       verify.onAccepted();
@@ -273,7 +279,9 @@ describe('AgentProcess.injectMessageQueued — turn-boundary drain', () => {
       expect(agentName).toBe('alice');
       expect(entry).toMatchObject({ cron: 'pulse', fired_at: '2026-08-17T12:00:00.000Z', trigger: 'quiet-boundary' });
       expect(typeof entry.ts).toBe('string');
-      expect(typeof entry.waited_ms).toBe('number');
+      // Total elapsed = 2 drain ticks (baseline + quiet) + the verify gap. Must be AT LEAST the
+      // verify gap alone — a waited_ms that stopped counting at drain time would be smaller.
+      expect(entry.waited_ms).toBeGreaterThanOrEqual(VERIFY_GAP_MS);
     });
 
     it('does NOT log a delivery record for an inject with no cron identity (interactive/Telegram path)', () => {
@@ -292,7 +300,13 @@ describe('AgentProcess.injectMessageQueued — turn-boundary drain', () => {
       expect(mockAppendDeliveryLog).not.toHaveBeenCalled();
     });
 
-    it('marks the max-wait valve trigger distinctly from a quiet-boundary delivery', () => {
+    it('BLOCKER FIX (Codex adversarial review): does NOT log a delivery record for the max-wait-valve path, even on confirmed acceptance', () => {
+      // The overdue/max-wait branch fires precisely because the PTY has been busy — the same
+      // output-growth verifier that confirms delivery can false-accept on UNRELATED ongoing
+      // turn output in that state (documented ceiling, this file's own "ponytail: known
+      // ceiling" comment). A durable "CONFIRMED delivery" record built on that weak signal
+      // would be worse than no record at all. This is the regression guard for that fix —
+      // sabotage it and this must go red.
       const { proc, state } = makeRunningProcess();
       proc.injectMessageQueued('starving prompt', { cron: 'starver', firedAt: '2026-08-17T00:00:00.000Z' });
 
@@ -303,10 +317,10 @@ describe('AgentProcess.injectMessageQueued — turn-boundary drain', () => {
         if (mockInjectMessage.mock.calls.length > 0) break;
       }
       expect(mockInjectMessage).toHaveBeenCalledTimes(1);
+      // Even a CONFIRMED accept on this path must not produce a delivery record.
       mockInjectMessage.mock.calls[0][3].onAccepted();
 
-      expect(mockAppendDeliveryLog).toHaveBeenCalledTimes(1);
-      expect(mockAppendDeliveryLog.mock.calls[0][1]).toMatchObject({ trigger: 'max-wait-valve' });
+      expect(mockAppendDeliveryLog).not.toHaveBeenCalled();
     });
 
     it('does not log a delivery record if the drained inject fails instead of succeeding', () => {
@@ -320,6 +334,32 @@ describe('AgentProcess.injectMessageQueued — turn-boundary drain', () => {
       mockInjectMessage.mock.calls[0][3].onFailed();
 
       expect(mockAppendDeliveryLog).not.toHaveBeenCalled();
+    });
+
+    it('retains cron identity through a failed-then-retried-then-accepted cycle, and records exactly once', () => {
+      // Codex gap: the failure test previously stopped after the first onFailed() and never
+      // proved cronMeta survives the requeue (handleQueuedDeliveryFailure's `{ ...item }`
+      // spread) into a SUBSEQUENT successful delivery, or that it records exactly once (not
+      // once per attempt).
+      const { proc, state } = makeRunningProcess();
+      state.bytes = 10_000;
+      proc.injectMessageQueued('retry then succeed', { cron: 'flaky-then-fine', firedAt: '2026-08-17T00:00:00.000Z' });
+
+      vi.advanceTimersByTime(TICK * 2);
+      expect(mockInjectMessage).toHaveBeenCalledTimes(1);
+      mockInjectMessage.mock.calls[0][3].onFailed(); // attempt 1 fails, re-queued at front
+      expect(mockAppendDeliveryLog).not.toHaveBeenCalled();
+
+      state.bytes += 5_000; // force a fresh quiet baseline before the retry can redeliver
+      vi.advanceTimersByTime(TICK * 2);
+      expect(mockInjectMessage).toHaveBeenCalledTimes(2);
+      mockInjectMessage.mock.calls[1][3].onAccepted(); // attempt 2 succeeds
+
+      expect(mockAppendDeliveryLog).toHaveBeenCalledTimes(1);
+      expect(mockAppendDeliveryLog.mock.calls[0][1]).toMatchObject({
+        cron: 'flaky-then-fine',
+        fired_at: '2026-08-17T00:00:00.000Z',
+      });
     });
   });
 });

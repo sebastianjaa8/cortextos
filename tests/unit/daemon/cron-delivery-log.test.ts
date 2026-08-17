@@ -138,10 +138,15 @@ describe('log rotation — mirrors cron-execution-log.ts, same threshold/behavio
 
     appendDeliveryLog('boris', makeEntry({ cron: 'trigger-rotation' }));
 
+    // TIGHTENED after adversarial review (Codex): the original assertions permitted anywhere
+    // from 1 to MAX_LOG_LINES entries and conditionally skipped the oldest-entry check when the
+    // result was empty — a rotation that over-pruned to zero, or under-pruned to 999, would have
+    // passed silently. EXACT count: file had 1101 lines pre-append + 1 appended = 1102 total,
+    // pruned to precisely MAX_LOG_LINES, keeping the newest.
     const entries = readLogFile();
-    expect(entries.length).toBeLessThanOrEqual(MAX_LOG_LINES);
-    if (entries.length > 0) expect(entries[0].cron).not.toBe('c-0000');
-    expect(entries.some(e => e.cron === 'trigger-rotation')).toBe(true);
+    expect(entries).toHaveLength(MAX_LOG_LINES);
+    expect(entries[0].cron).not.toBe('c-0000');
+    expect(entries[entries.length - 1].cron).toBe('trigger-rotation');
   });
 
   it('CONTROL: a small file well under the threshold is never rotated', async () => {
