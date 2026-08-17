@@ -1,7 +1,7 @@
 import { readdirSync, readFileSync, existsSync, mkdirSync, writeFileSync, unlinkSync } from 'fs';
 import { join, relative } from 'path';
 import type { AgentConfig, AgentStatus, CtxEnv, BusPaths, WorkerStatus, TelegramMessage } from '../types/index.js';
-import { AgentProcess } from './agent-process.js';
+import { AgentProcess, type CronInjectMeta } from './agent-process.js';
 import { WorkerProcess } from './worker-process.js';
 import { FastChecker } from './fast-checker.js';
 import { CronScheduler } from './cron-scheduler.js';
@@ -1248,12 +1248,12 @@ export class AgentManager {
    * AgentProcess and drained one-at-a-time when PTY output goes quiet.
    * Interactive paths (Telegram, bus notify) intentionally keep injectAgent().
    */
-  injectAgentQueued(agentName: string, text: string): { ok: true; queued: true } | { ok: false; code: 'NOT_FOUND' | 'NOT_RUNNING'; message: string } {
+  injectAgentQueued(agentName: string, text: string, cronMeta?: CronInjectMeta): { ok: true; queued: true } | { ok: false; code: 'NOT_FOUND' | 'NOT_RUNNING'; message: string } {
     const entry = this.agents.get(agentName);
     if (!entry) {
       return { ok: false, code: 'NOT_FOUND', message: `agent "${agentName}" not in registry` };
     }
-    return entry.process.injectMessageQueued(text);
+    return entry.process.injectMessageQueued(text, cronMeta);
   }
 
   /**
@@ -1385,7 +1385,17 @@ export class AgentManager {
       // mid-turn PTY (2026-07-06 theta-wave-pulse silent-drop root fix).
       // NOTE: status=fired in cron-execution.log now means "accepted for
       // delivery" — actual PTY injection happens at the next quiet window.
-      const injected = this.injectAgentQueued(agentName, injection);
+      // cronMeta carries identity through the queue so a CONFIRMED drainTick
+      // delivery can be logged against this specific fire (task_1786971045376,
+      // 2026-08-17 — cron-delivery.log, see cron-delivery-log.ts).
+      //
+      // firedAt is CLOSE to, but not byte-identical with, cron-execution.log's
+      // "fired" entry ts below — that one is a SEPARATE `new Date()` call made
+      // in cron-scheduler.ts's fireWithRetry AFTER onFire() resolves, a few ms
+      // later. A reader joining the two files should match on cron name +
+      // nearest timestamp (seconds-level), not exact string equality — stated
+      // here rather than left to be discovered by whoever writes that reader.
+      const injected = this.injectAgentQueued(agentName, injection, { cron: cron.name, firedAt });
       if (!injected.ok) {
         throw new Error(`injectAgentQueued failed for agent "${agentName}" (${injected.code}) — agent may not be running`);
       }

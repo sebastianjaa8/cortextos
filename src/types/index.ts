@@ -479,6 +479,30 @@ export interface CronExecutionLogEntry {
   error: string | null;
 }
 
+/**
+ * One confirmed successful `drainTick()` PTY delivery (task_1786971045376, 2026-08-17).
+ * Written ONLY on success — there is no "delivery failed" entry here, because that already has a
+ * home (a `cron_inject_dropped` bus event via `emitDroppedInjectEvent`). This file exists purely
+ * to give SUCCESS an equivalent observable record, matching failure's.
+ */
+export interface CronDeliveryLogEntry {
+  /** ISO 8601 UTC timestamp this entry was written (delivery completion time). */
+  ts: string;
+  /** Cron name (matches CronDefinition.name and the `cron` field in cron-execution.log). */
+  cron: string;
+  /**
+   * The fire timestamp this delivery corresponds to, captured in agent-manager.ts's onFire before
+   * queuing. CLOSE TO but not byte-identical with cron-execution.log's `ts` for the matching
+   * "fired" entry — that one is a separate `new Date()` call made a few ms later in
+   * cron-scheduler.ts. Join on cron name + nearest timestamp, not exact string equality.
+   */
+  fired_at: string;
+  /** Milliseconds between enqueue and this successful delivery (drain-queue wait time). */
+  waited_ms: number;
+  /** How the delivery valve fired: waited for a real quiet-PTY turn boundary, or the 15min safety valve forced it mid-turn. */
+  trigger: 'quiet-boundary' | 'max-wait-valve';
+}
+
 export interface OrgContext {
   name?: string;
   description?: string;

@@ -65,3 +65,40 @@ export const CRON_EXECUTION_LOG_FILENAME = 'cron-execution.log';
 export function cronExecutionLogPathFor(agentName: string): string {
   return join(CRONS_DIRECTORY, agentName, CRON_EXECUTION_LOG_FILENAME);
 }
+
+/**
+ * File name for the per-agent cron DELIVERY log (JSONL format).
+ *
+ * SEPARATE FROM cron-execution.log ON PURPOSE (task_1786971045376, 2026-08-17). The execution log
+ * records ENQUEUE success (`injectAgentQueued` returning ok / `fireWithRetry` completing) — it has
+ * no path back to whether `AgentProcess.drainTick()` actually delivered the prompt into the PTY.
+ * A new, additive-only file rather than a new status value on the existing one: cron-execution.log
+ * already has several readers (cron-evidence-check-v2.sh, cron-effectiveness-audit.py, hold-verify.mjs)
+ * that parse its current shape — changing that format risks all of them, where a new file risks none.
+ * A reader that wants delivery confirmation cross-references cron name + fired_at across both files;
+ * one that doesn't is unaffected.
+ *
+ * @example "cron-delivery.log"
+ */
+export const CRON_DELIVERY_LOG_FILENAME = 'cron-delivery.log';
+
+/**
+ * Return the path to an agent's cron delivery log relative to CTX_ROOT.
+ *
+ * JSONL, append-only, one CronDeliveryLogEntry per line — written ONLY on a confirmed successful
+ * `drainTick()` delivery (see agent-process.ts). Absence of a delivery line for a `cron` that DOES
+ * have a "fired" line in cron-execution.log (matched by cron name + nearest timestamp — the two
+ * `ts`/`fired_at` values are close but not byte-identical, captured a few ms apart at two different
+ * points) is the signal this file exists to make visible: enqueued but never actually reached the PTY.
+ *
+ * @param agentName - The agent's directory name (e.g. "boris", "paul").
+ * @returns Relative path string:
+ *   `.cortextOS/state/agents/{agentName}/cron-delivery.log`
+ *
+ * @example
+ * cronDeliveryLogPathFor("boris")
+ * // => ".cortextOS/state/agents/boris/cron-delivery.log"
+ */
+export function cronDeliveryLogPathFor(agentName: string): string {
+  return join(CRONS_DIRECTORY, agentName, CRON_DELIVERY_LOG_FILENAME);
+}

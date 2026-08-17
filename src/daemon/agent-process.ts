@@ -14,6 +14,7 @@ import { writeCortextosEnv } from '../utils/env.js';
 import { getOverdueReminders } from '../bus/reminders.js';
 import { resolvePaths } from '../utils/paths.js';
 import { logEvent } from '../bus/event.js';
+import { appendDeliveryLog } from './cron-delivery-log.js';
 import {
   removeRuntimeProcessRecord,
   terminateProcessTree,
@@ -22,6 +23,20 @@ import {
 } from '../utils/process-ownership.js';
 
 type LogFn = (msg: string) => void;
+
+/**
+ * Optional cron identity carried alongside a queued injection, so a CONFIRMED successful
+ * drainTick() delivery can be recorded against the specific cron that produced it
+ * (task_1786971045376, 2026-08-17 — see cron-delivery-log.ts).
+ *
+ * Optional, not required: only the cron-dispatch path (agent-manager.ts's onFire) passes this.
+ * Interactive injects (Telegram, bus notify) have no cron to attribute to and correctly omit it —
+ * their delivery is not what this record exists to make visible.
+ */
+export interface CronInjectMeta {
+  cron: string;
+  firedAt: string;
+}
 
 /**
  * Manages a single agent's lifecycle.
@@ -629,7 +644,7 @@ export class AgentProcess {
   // fix is end-to-end delivery verification against the conversation JSONL;
   // upgrade to that if drops recur despite this queue.
 
-  private pendingInjections: Array<{ content: string; enqueuedAt: number; attempts: number }> = [];
+  private pendingInjections: Array<{ content: string; enqueuedAt: number; attempts: number; cronMeta?: CronInjectMeta }> = [];
   private drainTimer: ReturnType<typeof setInterval> | null = null;
   /** getTotalBytes() sample from the previous drain tick; -1 = no baseline. */
   private drainLastBytes = -1;
@@ -663,11 +678,11 @@ export class AgentProcess {
    * survives stop()/start() — a cron prompt queued during a restart window is
    * delivered into the fresh session (its salt carries the original fire time).
    */
-  injectMessageQueued(content: string): { ok: true; queued: true } | { ok: false; code: 'NOT_RUNNING'; message: string } {
+  injectMessageQueued(content: string, cronMeta?: CronInjectMeta): { ok: true; queued: true } | { ok: false; code: 'NOT_RUNNING'; message: string } {
     if (!this.pty || this.status !== 'running') {
       return { ok: false, code: 'NOT_RUNNING', message: `agent "${this.name}" is registered but not running (status: ${this.status})` };
     }
-    this.pendingInjections.push({ content, enqueuedAt: Date.now(), attempts: 0 });
+    this.pendingInjections.push({ content, enqueuedAt: Date.now(), attempts: 0, cronMeta });
     if (this.pendingInjections.length > AgentProcess.DRAIN_MAX_QUEUE) {
       const dropped = this.pendingInjections.shift();
       if (dropped) {
@@ -729,7 +744,26 @@ export class AgentProcess {
 
     this.pendingInjections.shift();
     const waitedS = Math.round((Date.now() - head.enqueuedAt) / 1000);
-    const res = this.injectMessageDetailed(head.content, () => this.handleQueuedDeliveryFailure(head));
+    const onDeliveryAccepted = head.cronMeta
+      ? () => {
+          // CONFIRMED delivery, not just "submit accepted" — this callback only fires once
+          // injectMessageDetailed's own async verify-retry has actually seen the Enter land
+          // (acceptDelivery/onAccepted in injectMessageDetailed), same confirmation strength
+          // as the existing FAILURE path already had. That distinction matters: `res.ok` below
+          // is provisional (queuing succeeded, verification still pending), so recording delivery
+          // there instead of here would have logged optimistically, not confirmed — the same
+          // asymmetry class this file exists to close, just moved one line over.
+          const meta = head.cronMeta!;
+          appendDeliveryLog(this.name, {
+            ts: new Date().toISOString(),
+            cron: meta.cron,
+            fired_at: meta.firedAt,
+            waited_ms: Date.now() - head.enqueuedAt,
+            trigger: overdue ? 'max-wait-valve' : 'quiet-boundary',
+          });
+        }
+      : undefined;
+    const res = this.injectMessageDetailed(head.content, () => this.handleQueuedDeliveryFailure(head), onDeliveryAccepted);
     if (res.ok) {
       this.log(
         `Drained queued inject after ${waitedS}s ` +
@@ -758,7 +792,7 @@ export class AgentProcess {
    * tooling (analyst / seb_boss) can see the loss — instead of the daemon log
    * being the only trace, which is what made every past incidence silent.
    */
-  private handleQueuedDeliveryFailure(item: { content: string; enqueuedAt: number; attempts: number }): void {
+  private handleQueuedDeliveryFailure(item: { content: string; enqueuedAt: number; attempts: number; cronMeta?: CronInjectMeta }): void {
     const attempts = item.attempts + 1;
     if (attempts < AgentProcess.DRAIN_MAX_DELIVERY_ATTEMPTS) {
       this.log(

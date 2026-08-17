@@ -23,6 +23,11 @@ vi.mock('../../../src/bus/event.js', () => ({
   logEvent: mockLogEvent,
 }));
 
+const { mockAppendDeliveryLog } = vi.hoisted(() => ({ mockAppendDeliveryLog: vi.fn() }));
+vi.mock('../../../src/daemon/cron-delivery-log.js', () => ({
+  appendDeliveryLog: mockAppendDeliveryLog,
+}));
+
 vi.mock('../../../src/utils/paths.js', () => ({
   resolvePaths: vi.fn().mockReturnValue({ stateDir: '/tmp/test-ctx/state/alice', analyticsDir: '/tmp/test-ctx/analytics' }),
 }));
@@ -69,6 +74,7 @@ describe('AgentProcess.injectMessageQueued — turn-boundary drain', () => {
     vi.useFakeTimers();
     mockInjectMessage.mockClear();
     mockLogEvent.mockClear();
+    mockAppendDeliveryLog.mockClear();
   });
 
   afterEach(() => {
@@ -239,6 +245,81 @@ describe('AgentProcess.injectMessageQueued — turn-boundary drain', () => {
       expect(eventName).toBe('cron_inject_dropped');
       expect(severity).toBe('critical');
       expect(metadata).toMatchObject({ attempts: 3 });
+    });
+  });
+
+  describe('cron delivery record (task_1786971045376, 2026-08-17: drainTick success had no observable record)', () => {
+    it('logs a delivery record ONLY once the async verify confirms acceptance, not at drain time', () => {
+      const { proc, state } = makeRunningProcess();
+      state.bytes = 10_000;
+      proc.injectMessageQueued('[CRON FIRED 2026-08-17T12:00:00.000Z] pulse: do the thing', {
+        cron: 'pulse',
+        firedAt: '2026-08-17T12:00:00.000Z',
+      });
+
+      vi.advanceTimersByTime(TICK * 2);
+      expect(mockInjectMessage).toHaveBeenCalledTimes(1);
+      // The delivery is still UNCONFIRMED at this point — drainTick has only initiated the
+      // submit, not verified it landed. THE INCIDENT ITSELF: recording here instead of on
+      // confirmation would have logged an optimistic delivery, not a real one.
+      expect(mockAppendDeliveryLog).not.toHaveBeenCalled();
+
+      // Verify object is the 4th positional arg to injectMessage (see inject.ts call shape).
+      const verify = mockInjectMessage.mock.calls[0][3];
+      verify.onAccepted();
+
+      expect(mockAppendDeliveryLog).toHaveBeenCalledTimes(1);
+      const [agentName, entry] = mockAppendDeliveryLog.mock.calls[0];
+      expect(agentName).toBe('alice');
+      expect(entry).toMatchObject({ cron: 'pulse', fired_at: '2026-08-17T12:00:00.000Z', trigger: 'quiet-boundary' });
+      expect(typeof entry.ts).toBe('string');
+      expect(typeof entry.waited_ms).toBe('number');
+    });
+
+    it('does NOT log a delivery record for an inject with no cron identity (interactive/Telegram path)', () => {
+      const { proc, state } = makeRunningProcess();
+      state.bytes = 10_000;
+      // No cronMeta — same call shape as a non-cron caller.
+      proc.injectMessageQueued('interactive steering, no cron attached');
+
+      vi.advanceTimersByTime(TICK * 2);
+      expect(mockInjectMessage).toHaveBeenCalledTimes(1);
+      const verify = mockInjectMessage.mock.calls[0][3];
+      verify.onAccepted();
+
+      // CONTROL for the case above: proves the delivery log is gated on cronMeta actually being
+      // present, not on every successful delivery unconditionally.
+      expect(mockAppendDeliveryLog).not.toHaveBeenCalled();
+    });
+
+    it('marks the max-wait valve trigger distinctly from a quiet-boundary delivery', () => {
+      const { proc, state } = makeRunningProcess();
+      proc.injectMessageQueued('starving prompt', { cron: 'starver', firedAt: '2026-08-17T00:00:00.000Z' });
+
+      const ticks = Math.ceil((15 * 60_000) / TICK) + 1;
+      for (let i = 0; i < ticks; i++) {
+        state.bytes += 5_000;
+        vi.advanceTimersByTime(TICK);
+        if (mockInjectMessage.mock.calls.length > 0) break;
+      }
+      expect(mockInjectMessage).toHaveBeenCalledTimes(1);
+      mockInjectMessage.mock.calls[0][3].onAccepted();
+
+      expect(mockAppendDeliveryLog).toHaveBeenCalledTimes(1);
+      expect(mockAppendDeliveryLog.mock.calls[0][1]).toMatchObject({ trigger: 'max-wait-valve' });
+    });
+
+    it('does not log a delivery record if the drained inject fails instead of succeeding', () => {
+      const { proc, state } = makeRunningProcess();
+      state.bytes = 10_000;
+      proc.injectMessageQueued('will fail', { cron: 'flaky', firedAt: '2026-08-17T00:00:00.000Z' });
+
+      vi.advanceTimersByTime(TICK * 2);
+      expect(mockInjectMessage).toHaveBeenCalledTimes(1);
+      // Fail instead of accept.
+      mockInjectMessage.mock.calls[0][3].onFailed();
+
+      expect(mockAppendDeliveryLog).not.toHaveBeenCalled();
     });
   });
 });
