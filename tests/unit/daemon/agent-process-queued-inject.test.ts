@@ -279,9 +279,12 @@ describe('AgentProcess.injectMessageQueued — turn-boundary drain', () => {
       expect(agentName).toBe('alice');
       expect(entry).toMatchObject({ cron: 'pulse', fired_at: '2026-08-17T12:00:00.000Z', trigger: 'quiet-boundary' });
       expect(typeof entry.ts).toBe('string');
-      // Total elapsed = 2 drain ticks (baseline + quiet) + the verify gap. Must be AT LEAST the
-      // verify gap alone — a waited_ms that stopped counting at drain time would be smaller.
-      expect(entry.waited_ms).toBeGreaterThanOrEqual(VERIFY_GAP_MS);
+      // TIGHTENED after the second Codex pass: asserting only `>= VERIFY_GAP_MS` (4000) was
+      // vacuous — the pre-confirmation drain alone already consumes TICK*2 (10000ms), so that
+      // bound would pass even if waited_ms had stopped counting at drain time and never
+      // included the verify gap at all. Asserting the FULL expected total (drain + gap) is the
+      // only bound that can actually distinguish "includes verify latency" from "does not."
+      expect(entry.waited_ms).toBeGreaterThanOrEqual(TICK * 2 + VERIFY_GAP_MS);
     });
 
     it('does NOT log a delivery record for an inject with no cron identity (interactive/Telegram path)', () => {
