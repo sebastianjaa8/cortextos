@@ -364,6 +364,7 @@ busCommand
   // across three JSON files, and the orchestrator could not reassign a task at all.
   .option('--title <text>', 'Correct the title — audited, and the superseded title is preserved into the description')
   .option('--desc <text>', 'Change the description')
+  .option('--force-empty', 'Confirm an intentional empty --desc (otherwise refused)')
   .option('--project <name>', 'Change the project')
   // CANONICAL FLAG, matching the stored field name (task_1785781068786_36016190) — same rename/
   // alias pattern as create-task, merged explicitly below rather than via a multi-flag Commander
@@ -372,7 +373,7 @@ busCommand
   .option('--assignee <agent>', 'Alias for --assigned-to')
   .option('--due <iso>', 'Set the due date (ISO 8601) — until now unreachable from any CLI path')
   .option('--evidence <text>', 'Where the result lives: commit, path, vault heading, or a written negative result')
-  .action((id: string, status: string, opts: { priority?: string; title?: string; desc?: string; project?: string; assignee?: string; assignedTo?: string; due?: string; evidence?: string }) => {
+  .action((id: string, status: string, opts: { priority?: string; title?: string; desc?: string; forceEmpty?: boolean; project?: string; assignee?: string; assignedTo?: string; due?: string; evidence?: string }) => {
     const assignee = opts.assignedTo ?? opts.assignee;
     const validStatuses: TaskStatus[] = ['pending', 'in_progress', 'completed', 'blocked', 'cancelled'];
     if (!validStatuses.includes(status as TaskStatus)) {
@@ -384,6 +385,14 @@ busCommand
     const validPriorities: Priority[] = ['urgent', 'high', 'normal', 'low'];
     if (opts.priority !== undefined && !validPriorities.includes(opts.priority as Priority)) {
       console.error(`Invalid priority '${opts.priority}'. Must be one of: ${validPriorities.join(', ')}`);
+      process.exit(1);
+    }
+    // task_1785629698092: a $(...) substitution that resolved to an empty string, passed straight
+    // through as --desc, blanked a real description at exit 0 with no history and no undo. An
+    // EMPTY description is never a deliberate edit — nobody types --desc "" on purpose — so refuse
+    // it unless --force-empty proves the caller actually means it.
+    if (opts.desc === '' && !opts.forceEmpty) {
+      console.error(`Refusing empty --desc on ${id} — this is almost always an accidental $(...) substitution, not a deliberate edit. Pass --force-empty to confirm you mean it.`);
       process.exit(1);
     }
     const env = resolveEnv();
