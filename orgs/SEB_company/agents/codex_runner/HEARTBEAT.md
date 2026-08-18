@@ -2,7 +2,7 @@
 
 ## Night Mode
 
-If local time is 00:00-08:00 America/New_York, use a silent heartbeat: touch file, no Telegram, no active execution unless seb_boss explicitly overrides.
+If local time is 00:00-08:00 America/New_York, use a silent heartbeat: no Telegram or other outbound user-facing communication. Continue required local background steps, including Step 10 KB ingestion, and record their normal receipts. Night mode does not exempt a heartbeat step unless that step says so.
 
 ## Cap Discipline
 
