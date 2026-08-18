@@ -364,6 +364,7 @@ busCommand
   // across three JSON files, and the orchestrator could not reassign a task at all.
   .option('--title <text>', 'Correct the title — audited, and the superseded title is preserved into the description')
   .option('--desc <text>', 'Change the description')
+  .option('--desc-file <path>', 'Read the new description from a file instead of argv. Use this for large descriptions -- task_1785687530533: a 33,994-char --desc argv failed SILENTLY on Windows (CreateProcess argv ceiling, ~32k), printing "No error" and leaving the description unchanged. That failure happens before this process even starts, so it cannot be caught or reported from inside this command -- --desc-file sidesteps it entirely by not putting the text on the command line at all.')
   .option('--force-empty', 'Confirm an intentional empty --desc (otherwise refused)')
   .option('--project <name>', 'Change the project')
   // CANONICAL FLAG, matching the stored field name (task_1785781068786_36016190) — same rename/
@@ -373,7 +374,7 @@ busCommand
   .option('--assignee <agent>', 'Alias for --assigned-to')
   .option('--due <iso>', 'Set the due date (ISO 8601) — until now unreachable from any CLI path')
   .option('--evidence <text>', 'Where the result lives: commit, path, vault heading, or a written negative result')
-  .action((id: string, status: string, opts: { priority?: string; title?: string; desc?: string; forceEmpty?: boolean; project?: string; assignee?: string; assignedTo?: string; due?: string; evidence?: string }) => {
+  .action((id: string, status: string, opts: { priority?: string; title?: string; desc?: string; descFile?: string; forceEmpty?: boolean; project?: string; assignee?: string; assignedTo?: string; due?: string; evidence?: string }) => {
     const assignee = opts.assignedTo ?? opts.assignee;
     const validStatuses: TaskStatus[] = ['pending', 'in_progress', 'completed', 'blocked', 'cancelled'];
     if (!validStatuses.includes(status as TaskStatus)) {
@@ -387,11 +388,24 @@ busCommand
       console.error(`Invalid priority '${opts.priority}'. Must be one of: ${validPriorities.join(', ')}`);
       process.exit(1);
     }
+    if (opts.desc !== undefined && opts.descFile !== undefined) {
+      console.error('Pass only one of --desc or --desc-file, not both.');
+      process.exit(1);
+    }
+    let desc = opts.desc;
+    if (opts.descFile !== undefined) {
+      if (!existsSync(opts.descFile)) {
+        console.error(`--desc-file path not found: ${opts.descFile}`);
+        process.exit(1);
+      }
+      desc = stripBom(readFileSync(opts.descFile, 'utf-8'));
+    }
     // task_1785629698092: a $(...) substitution that resolved to an empty string, passed straight
     // through as --desc, blanked a real description at exit 0 with no history and no undo. An
     // EMPTY description is never a deliberate edit — nobody types --desc "" on purpose — so refuse
-    // it unless --force-empty proves the caller actually means it.
-    if (opts.desc === '' && !opts.forceEmpty) {
+    // it unless --force-empty proves the caller actually means it. Applies to --desc-file too: an
+    // empty or all-whitespace file is exactly as likely to be a mistake as an empty argv string.
+    if (desc === '' && !opts.forceEmpty) {
       console.error(`Refusing empty --desc on ${id} — this is almost always an accidental $(...) substitution, not a deliberate edit. Pass --force-empty to confirm you mean it.`);
       process.exit(1);
     }
@@ -412,7 +426,7 @@ busCommand
       const result = updateTask(paths, id, status as TaskStatus, {
         priority: opts.priority as Priority | undefined,
         title: opts.title,
-        description: opts.desc,
+        description: desc,
         project: opts.project,
         assignee,
         dueDate: opts.due,
