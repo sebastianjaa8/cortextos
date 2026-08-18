@@ -50,6 +50,15 @@ export interface OutboundDeliveryRecord {
    * the answer rather than leave it to be inferred from message text.
    */
   source?: string;
+  /**
+   * Which logical thing triggered this send, e.g. 'morning-brief'. Distinct from
+   * `source`: source names the TRANSPORT (cli:send-telegram, hook:planmode) and is
+   * present on nearly every row, which makes it useless for asking "did the
+   * 7am brief go out" -- title-matching text is the only fallback, and titles
+   * vary run to run. Optional and unset by default: only call sites that know
+   * their own logical purpose (cron prompts) pass it. task_1785722971327.
+   */
+  producer?: string;
   /** Telegram's own description, or the transport error, on a non-accepted state. */
   error?: string;
   /**
