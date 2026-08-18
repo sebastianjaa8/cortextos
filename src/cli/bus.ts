@@ -1241,7 +1241,8 @@ busCommand
   .option('--image <path>', 'Send a photo with caption')
   .option('--file <path>', 'Send a document/file with caption (any file type)')
   .option('--plain-text', 'Skip Telegram Markdown parsing entirely. Use this when the message contains unescaped _, *, backtick, or [ that would otherwise trip the Markdown parser. Without this flag, sendMessage still retries once with parse_mode disabled on a parse-entity error — so it is purely an opt-in to save the retry roundtrip.', false)
-  .action(async (chatId: string, message: string, opts: { image?: string; file?: string; plainText?: boolean }) => {
+  .option('--producer <name>', 'Logical thing triggering this send, e.g. morning-brief. Recorded on the delivery journal so a downstream reader can confirm a specific recurring send actually went out, distinct from the generic cli:send-telegram source. Unset by default.')
+  .action(async (chatId: string, message: string, opts: { image?: string; file?: string; plainText?: boolean; producer?: string }) => {
     // Codex agents emit literal '\n'/'\t' inside single-quoted bash where bash
     // does not expand escapes, so they arrive at argv as 2-char literals and
     // Telegram renders them as visible text. Normalize before send + log.
@@ -1294,6 +1295,7 @@ busCommand
           preview,
         bytes: message.length,
         source: 'cli:send-telegram',
+        producer: opts.producer,
           ...extra,
         });
       }

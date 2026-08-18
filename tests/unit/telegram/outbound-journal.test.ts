@@ -78,6 +78,28 @@ describe('recordOutboundDelivery', () => {
     expect(new Set(rows.map((r) => r.delivery_id)).size).toBe(1);
   });
 
+  it('carries an optional producer field distinct from source', () => {
+    // source names the TRANSPORT (cli:send-telegram); producer names the LOGICAL send
+    // (morning-brief). A reader asking "did the 7am brief go out" needs the latter --
+    // task_1785722971327.
+    recordOutboundDelivery(root, 'a1', {
+      delivery_id: 'x', agent: 'a1', chat_id: '42', state: 'accepted',
+      attempts: 1, kind: 'message', preview: 'hi', source: 'cli:send-telegram', producer: 'morning-brief',
+    });
+    const [row] = read();
+    expect(row.producer).toBe('morning-brief');
+    expect(row.source).toBe('cli:send-telegram');
+  });
+
+  it('omits producer entirely when the caller does not pass one, so old readers see no new key', () => {
+    recordOutboundDelivery(root, 'a1', {
+      delivery_id: 'x', agent: 'a1', chat_id: '42', state: 'accepted',
+      attempts: 1, kind: 'message', preview: 'hi',
+    });
+    const [row] = read();
+    expect('producer' in row).toBe(false);
+  });
+
   it('never throws, so journalling cannot break the send it observes', () => {
     expect(() =>
       recordOutboundDelivery('\0://not-a-path', 'a1', {
