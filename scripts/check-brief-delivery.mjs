@@ -22,6 +22,14 @@
 // collapsing "we know it failed" into "we don't know if it ran" throws away the one signal a
 // failed send actually left behind.
 //
+// STATED LIMITATION (Codex review, 2026-08-18): the UNKNOWN check is "does ANY row this date
+// carry a producer field", not "does any row for THIS producer". A day that mixes an untagged
+// pre-rollout send with a tagged send from a different producer will read ABSENT rather than
+// UNKNOWN for a producer that was simply never live that day. This is the task's own originally
+// specified heuristic (day-wide, not producer-specific) -- narrower detection would need a
+// per-producer rollout watermark, not built here. Rare in practice (rollout is a one-time event
+// per producer, not a recurring ambiguity) but real; noted rather than silently left.
+//
 //   node scripts/check-brief-delivery.mjs <producer> [--date YYYY-MM-DD] [--agent seb_boss]
 //   node scripts/check-brief-delivery.mjs --self-test
 //
@@ -46,14 +54,30 @@ export function verdict(rows, producer) {
         `for this date, not evidence that '${producer}' failed to send.`,
     };
   }
-  const match = rows.find((r) => r.producer === producer);
-  if (!match) {
+  const matches = rows.filter((r) => r.producer === producer);
+  if (matches.length === 0) {
     return {
       code: 1, status: 'ABSENT',
       detail: `producer field is live this date (other rows carry it) but no row names ` +
         `'${producer}' -- it genuinely did not send.`,
     };
   }
+  // Every attempt writes 'delivering' FIRST and its terminal outcome (accepted/retryable/
+  // dead-letter) SECOND (src/cli/bus.ts's journal() closure) -- both rows share the same
+  // producer. `.find()`-first would return the 'delivering' row and never see the outcome that
+  // follows it, misreporting every successful send as a failure. Prefer the terminal row.
+  const terminal = matches.filter((r) => r.state !== 'delivering');
+  if (terminal.length === 0) {
+    // Every matching row is still 'delivering' -- the send is in progress, or the process died
+    // between the 'delivering' write and the terminal write. Not a failure (nothing failed yet)
+    // and not confirmed success either -- a third, honest "don't know yet" reading.
+    return {
+      code: 2, status: 'IN-FLIGHT',
+      detail: `'${producer}' row(s) exist but never reached a terminal state (still ` +
+        `'delivering') -- the send may be in progress, or the process died mid-send.`,
+    };
+  }
+  const match = terminal[terminal.length - 1]; // most recent terminal outcome for this producer
   if (match.state === 'accepted') {
     return {
       code: 0, status: 'CONFIRMED',
@@ -61,9 +85,9 @@ export function verdict(rows, producer) {
         (match.message_id ? `, message_id=${match.message_id}.` : ' (no message_id recorded).'),
     };
   }
-  // state is delivering / retryable / dead-letter: the row exists, so this is NOT absence --
-  // it is a confirmed, named failure. Reporting this as ABSENT would discard the one thing the
-  // failed send actually told us.
+  // state is retryable / dead-letter: the row exists, so this is NOT absence -- it is a
+  // confirmed, named failure. Reporting this as ABSENT would discard the one thing the failed
+  // send actually told us.
   return {
     code: 1, status: 'CONFIRMED-FAILED',
     detail: `'${producer}' row exists at ${match.timestamp} but state='${match.state}'` +
@@ -77,6 +101,10 @@ function selfTest() {
   const briefAccepted = { ...base, timestamp: '2026-08-18T11:03:19Z', producer: 'morning-brief', state: 'accepted', message_id: 9820 };
   const briefDeadLetter = { ...base, timestamp: '2026-08-18T11:03:19Z', producer: 'morning-brief', state: 'dead-letter', error: 'Bad Request: chat not found' };
   const noProducerRow = { ...base, timestamp: '2026-08-18T09:00:00Z', state: 'accepted' }; // pre-rollout row, no producer key at all
+  // THE REAL LIFECYCLE: every attempt writes 'delivering' first, terminal state second, same
+  // producer on both rows (this is what src/cli/bus.ts's journal() closure actually emits).
+  const briefDelivering = { ...base, timestamp: '2026-08-18T11:03:18Z', producer: 'morning-brief', state: 'delivering' };
+  const briefDeadLetterAfterDelivering = { ...base, timestamp: '2026-08-18T11:03:20Z', producer: 'morning-brief', state: 'dead-letter', error: 'Bad Request: chat not found' };
 
   const cases = [
     // --- THE THIRD STATE: no producer field anywhere this date reads as UNKNOWN, not ABSENT ---
@@ -112,6 +140,26 @@ function selfTest() {
     // --- realistic mixed day: other producers' rows present alongside the brief ---
     ['a real day with other producers plus an accepted brief row still reads CONFIRMED', () =>
       verdict([otherRow, briefAccepted], 'morning-brief').status === 'CONFIRMED'],
+
+    // --- REGRESSION (Codex review, 2026-08-18): the REAL two-row lifecycle, not just an
+    // isolated terminal row. `delivering` is always written before the terminal state and
+    // shares the same producer -- a naive .find() returns `delivering` first and misreports
+    // a real success as a failure. ---
+    ['a successful send is [delivering, accepted] in that order -- still CONFIRMED, not CONFIRMED-FAILED', () =>
+      verdict([briefDelivering, briefAccepted], 'morning-brief').status === 'CONFIRMED'],
+    ['a failed send is [delivering, dead-letter] in that order -- still CONFIRMED-FAILED, error preserved', () => {
+      const v = verdict([briefDelivering, briefDeadLetterAfterDelivering], 'morning-brief');
+      return v.status === 'CONFIRMED-FAILED' && v.detail.includes('chat not found');
+    }],
+    ['row order in the file should not matter -- terminal state found even if delivering appears after it in the array', () =>
+      verdict([briefAccepted, briefDelivering], 'morning-brief').status === 'CONFIRMED'],
+
+    // --- IN-FLIGHT: only a 'delivering' row exists for this producer (send in progress, or the
+    // process died before writing a terminal outcome) -- neither a failure nor a confirmed send. ---
+    ['only a delivering row for this producer is IN-FLIGHT, not CONFIRMED-FAILED', () =>
+      verdict([briefDelivering], 'morning-brief').status === 'IN-FLIGHT'],
+    ['IN-FLIGHT is uncertain (code 2), same class as UNKNOWN, distinct from a real failure', () =>
+      verdict([briefDelivering], 'morning-brief').code === 2],
   ];
 
   let failed = 0;
@@ -132,26 +180,38 @@ function fail(msg) {
   process.exit(3);
 }
 
+// Flag-aware positional parsing: `args.find(a => !a.startsWith('--'))` alone would pick up a
+// flag's OWN value (e.g. `--date 2026-08-18 morning-brief` selects '2026-08-18' as the
+// producer) whenever a flag preceded the positional arg. Mark each flag's value index consumed
+// before searching for the positional.
 const args = process.argv.slice(2);
-const producer = args.find((a) => !a.startsWith('--'));
+const consumed = new Set();
+function flagValue(name) {
+  const i = args.indexOf(name);
+  if (i === -1) return undefined;
+  consumed.add(i);
+  consumed.add(i + 1);
+  return args[i + 1];
+}
+const date = flagValue('--date') || new Date().toISOString().slice(0, 10);
+const agent = flagValue('--agent') || (process.env.CTX_AGENT_NAME || 'seb_boss');
+const producer = args.find((a, idx) => !consumed.has(idx) && !a.startsWith('--'));
 if (!producer) fail('usage: check-brief-delivery.mjs <producer> [--date YYYY-MM-DD] [--agent name]');
-
-const dateFlagIdx = args.indexOf('--date');
-const date = dateFlagIdx !== -1 ? args[dateFlagIdx + 1] : new Date().toISOString().slice(0, 10);
-const agentFlagIdx = args.indexOf('--agent');
-const agent = agentFlagIdx !== -1 ? args[agentFlagIdx + 1] : (process.env.CTX_AGENT_NAME || 'seb_boss');
 
 const journalPath = `${CTX_ROOT}/logs/${agent}/outbound-deliveries.jsonl`;
 if (!existsSync(journalPath)) fail(`no journal at ${journalPath} -- ${agent} has never sent a Telegram message`);
 
+// Skip malformed/partial lines rather than aborting the whole read on one bad row -- a torn
+// write to an unrelated date must not block a verdict for today (same convention as
+// check-brief-health.mjs's reader).
 let rows;
 try {
   rows = readFileSync(journalPath, 'utf8')
     .trim().split('\n').filter(Boolean)
-    .map((l) => JSON.parse(l))
-    .filter((r) => r.timestamp && r.timestamp.slice(0, 10) === date);
+    .map((l) => { try { return JSON.parse(l); } catch { return null; } })
+    .filter((r) => r && r.timestamp && r.timestamp.slice(0, 10) === date);
 } catch (err) {
-  fail(`could not parse ${journalPath}: ${err.message}`);
+  fail(`could not read ${journalPath}: ${err.message}`);
 }
 if (rows.length === 0) fail(`no delivery rows at all for ${agent} on ${date} -- cannot distinguish UNKNOWN from ABSENT with zero rows to read`);
 
