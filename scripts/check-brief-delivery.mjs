@@ -33,7 +33,8 @@
 //   node scripts/check-brief-delivery.mjs <producer> [--date YYYY-MM-DD] [--agent seb_boss]
 //   node scripts/check-brief-delivery.mjs --self-test
 //
-// exit 0 CONFIRMED-accepted · 1 ABSENT or CONFIRMED-failed · 2 UNKNOWN (feature not live that day) · 3 could not run
+// exit 0 CONFIRMED-accepted · 1 ABSENT or CONFIRMED-failed · 2 UNKNOWN (feature not live that day)
+// or IN-FLIGHT (send in progress / died mid-send, still uncertain) · 3 could not run
 import { existsSync, readFileSync } from 'node:fs';
 
 const CTX_ROOT = (process.env.CTX_ROOT || `${process.env.HOME}/.cortextos/default`).replace(/\\/g, '/');
@@ -184,14 +185,24 @@ function fail(msg) {
 // flag's OWN value (e.g. `--date 2026-08-18 morning-brief` selects '2026-08-18' as the
 // producer) whenever a flag preceded the positional arg. Mark each flag's value index consumed
 // before searching for the positional.
+//
+// A flag given with no value, or immediately followed by another flag (`morning-brief --date`,
+// `--date --agent seb_boss`), FAILS LOUDLY rather than silently defaulting -- a silent default
+// to "today" or "seb_boss" would run against the wrong date/agent and print a confident but
+// wrong verdict, exactly the "silent wrong answer over honest failure" trap this whole family
+// of scripts exists to avoid (2nd Codex review pass, 2026-08-18).
 const args = process.argv.slice(2);
 const consumed = new Set();
 function flagValue(name) {
   const i = args.indexOf(name);
   if (i === -1) return undefined;
+  const v = args[i + 1];
+  if (v === undefined || v.startsWith('--')) {
+    fail(`${name} requires a value (got '${v ?? '<nothing>'}')`);
+  }
   consumed.add(i);
   consumed.add(i + 1);
-  return args[i + 1];
+  return v;
 }
 const date = flagValue('--date') || new Date().toISOString().slice(0, 10);
 const agent = flagValue('--agent') || (process.env.CTX_AGENT_NAME || 'seb_boss');
@@ -203,17 +214,27 @@ if (!existsSync(journalPath)) fail(`no journal at ${journalPath} -- ${agent} has
 
 // Skip malformed/partial lines rather than aborting the whole read on one bad row -- a torn
 // write to an unrelated date must not block a verdict for today (same convention as
-// check-brief-health.mjs's reader).
+// check-brief-health.mjs's reader). BUT skipping silently can flip a verdict without saying so
+// (a malformed row that would have been the terminal outcome for TODAY's target producer just
+// vanishes) -- so a nonzero skip count is printed alongside the verdict rather than swallowed.
+// This is a visible caveat on stdout, not a blocking failure: the verdict below is still the
+// best answer from the rows that DID parse.
+let malformedCount = 0;
 let rows;
 try {
   rows = readFileSync(journalPath, 'utf8')
     .trim().split('\n').filter(Boolean)
-    .map((l) => { try { return JSON.parse(l); } catch { return null; } })
+    .map((l) => { try { return JSON.parse(l); } catch { malformedCount++; return null; } })
     .filter((r) => r && r.timestamp && r.timestamp.slice(0, 10) === date);
 } catch (err) {
   fail(`could not read ${journalPath}: ${err.message}`);
 }
 if (rows.length === 0) fail(`no delivery rows at all for ${agent} on ${date} -- cannot distinguish UNKNOWN from ABSENT with zero rows to read`);
+if (malformedCount > 0) {
+  console.log(`NOTE: ${malformedCount} malformed line(s) in ${journalPath} were skipped -- the ` +
+    `verdict below reflects only the rows that parsed and may be wrong if a skipped line was ` +
+    `today's target-producer row.`);
+}
 
 const v = verdict(rows, producer);
 console.log(`VERDICT: ${v.status} — ${v.detail}`);
