@@ -311,6 +311,25 @@ export class FastChecker {
     // unretried until the next restart — reproducing the exact bug this fix exists
     // to close (Codex review, 2026-08-18). Reminders therefore wait for the real
     // accept/fail callback instead of copying inbox's ack-on-return timing.
+    //
+    // TWO STATED LIMITATIONS (Codex review round 2, 2026-08-18/19), both inherited
+    // from injectMessageDetailed itself rather than new here -- every other caller
+    // (inbox above, Telegram, cron delivery) has the same exposure, and fixing the
+    // shared primitive is out of scope for this change:
+    // 1. The default verify-retry accepts ANY output growth >= a byte threshold
+    //    (pty/inject.ts) as proof of delivery -- during a busy PTY turn, unrelated
+    //    agent output can satisfy that check even if THIS reminder's Enter was
+    //    swallowed, false-accepting and marking it notified. The boot-prompt
+    //    backstop (getOverdueReminders ignoring notified_at) is the safety net for
+    //    exactly this case too: a falsely-accepted-but-never-actually-acted-on
+    //    reminder still surfaces on the agent's next restart, same as any other
+    //    notified-but-never-acked reminder.
+    // 2. This call and the inbox call above are not mutually exclusive through
+    //    full delivery completion (the underlying verify/retry schedule can run
+    //    several seconds past the initial dispatch) -- an in-flight retry Enter
+    //    from one could in principle overlap the other's paste/Enter. No path was
+    //    found where either call is silently skipped; worst case is the same
+    //    false-accept exposure as #1, not a lost message.
     const overdueReminders = getUnnotifiedOverdueReminders(this.paths);
     if (overdueReminders.length > 0) {
       const reminderIds = overdueReminders.map(r => r.id);
@@ -329,17 +348,31 @@ export class FastChecker {
             for (const id of reminderIds) markReminderNotified(this.paths, id);
             this.log(`${reminderIds.length} reminder(s) verified-delivered and marked notified`);
           },
+          // Explicit dedupKey with a per-attempt nonce (Codex review round 2,
+          // 2026-08-18/19): MessageDedup's default dedupKey is the content itself,
+          // and its eviction is COUNT-based, not time-based (pty/inject.ts). Since
+          // an unacked reminder's text is IDENTICAL on every retry, a failed attempt
+          // (especially a synchronous write throw, which never reaches the
+          // onDeliveryFailed callback that would forget the hash) would otherwise
+          // poison every subsequent retry as DEDUPED until ~100 unrelated
+          // injections evict it or the process restarts — defeating the whole
+          // point of polling. getUnnotifiedOverdueReminders() is already this
+          // call's own "should this be resent" gate; MessageDedup's protection is
+          // redundant here and actively harmful, so each attempt gets its own key.
+          `${reminderIds.join(',')}-${Date.now()}`,
         );
         if (result.ok) {
           injectedAnything = true;
-          await sleep(5000);
         } else if (result.code === 'NOT_RUNNING') {
           this.log(`Reminder injection skipped (${result.message}); ${reminderIds.length} reminder(s) recover next cycle`);
         } else {
-          // DEDUPED: the in-process dedup hash is recorded before the PTY write even
-          // starts (agent-process.ts:539's own comment), so DEDUPED can mean "this
-          // content already landed" OR "an earlier attempt hashed it and then failed
-          // before completing" — genuinely ambiguous. Unlike inbox (which acks on
+          // DEDUPED should be rare now that the dedupKey above carries a per-attempt
+          // nonce (a genuine hit means something ELSE landed with the exact same
+          // synthesized key, vanishingly unlikely) -- kept as a defensive fallback,
+          // not the expected path. The in-process dedup hash is recorded before the
+          // PTY write even starts (agent-process.ts:539's own comment), so a hit
+          // could still mean "already landed" OR "attempted and failed before
+          // completing" -- genuinely ambiguous. Unlike inbox (which acks on
           // DEDUPED), reminders default to the safer read: leave unnotified and let
           // the next poll cycle retry. An occasional duplicate reminder costs
           // nothing; a silently lost one reproduces the bug this fix exists to close.

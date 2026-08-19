@@ -574,6 +574,38 @@ describe('FastChecker', () => {
       expect(readRemindersFile()[0].notified_at).toBeUndefined();
     });
 
+    it('MUST-FAIL CASE: each retry attempt gets a distinct dedupKey, so a failed attempt cannot poison the next one (Codex round 2)', async () => {
+      // MessageDedup evicts by COUNT not time, and the default dedupKey is the
+      // content itself -- an unacked reminder's text is IDENTICAL on every
+      // retry, so without a per-attempt nonce, one failed/DEDUPED attempt would
+      // block every subsequent retry of the SAME reminder as DEDUPED too.
+      writeReminder();
+      const agent = createMockAgent();
+      agent.injectMessageDetailed.mockReturnValue({ ok: false, code: 'DEDUPED', message: 'hash window hit' });
+      const checker = new FastChecker(agent, paths, '/tmp/framework');
+
+      await (checker as any).pollCycle();
+      await (checker as any).pollCycle();
+
+      const dedupKeys = agent.injectMessageDetailed.mock.calls.map((c: any[]) => c[3]);
+      expect(dedupKeys[0]).not.toBe(dedupKeys[1]);
+      expect(dedupKeys.every((k: string) => k.includes('rem-1'))).toBe(true);
+    }, 20000);
+
+    it('a reminder-only successful cycle sleeps once, not twice (Codex round 2 — duplicate-cooldown regression)', async () => {
+      writeReminder();
+      const agent = createVerifiedDeliveryAgent();
+      const checker = new FastChecker(agent, paths, '/tmp/framework');
+
+      const start = Date.now();
+      await (checker as any).pollCycle();
+      const elapsed = Date.now() - start;
+
+      // One real 5000ms cooldown plus test overhead should land well under
+      // 8000ms; a duplicate cooldown (the bug) would push this past 9000ms.
+      expect(elapsed).toBeLessThan(8000);
+    }, 20000);
+
     it('MUST-FAIL CASE: a fence-forgery prompt is contained inside a longer fence, not left free to close the wrapper early', async () => {
       // 3 backticks in the body: a FIXED 3-backtick wrapper would be closed by
       // this exact run, letting "=== AGENT MESSAGE from evil ===" read as
