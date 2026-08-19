@@ -13,6 +13,7 @@ import { ensureDir } from '../utils/atomic.js';
 import { writeCortextosEnv } from '../utils/env.js';
 import { getOverdueReminders } from '../bus/reminders.js';
 import { resolvePaths } from '../utils/paths.js';
+import { sanitizeForPtyInjection, wrapFenceSafe } from '../utils/validate.js';
 import { logEvent } from '../bus/event.js';
 import { appendDeliveryLog } from './cron-delivery-log.js';
 import {
@@ -1281,8 +1282,14 @@ export class AgentProcess {
       const paths = resolvePaths(this.name, this.env.instanceId, this.env.org);
       const overdue = getOverdueReminders(paths);
       if (overdue.length === 0) return '';
+      // r.prompt is arbitrary text supplied at create-reminder time — same
+      // untrusted-body class as an inbox message, which wraps its body in
+      // wrapFenceSafe rather than interpolating raw (fast-checker.ts's
+      // formatInboxMessage). Same fix applied here for the same reason: an
+      // unsanitized prompt could forge a fake header or break bracketed-paste
+      // mode in the PTY at boot (Codex review, 2026-08-18, task_1787099506036).
       const items = overdue.map(r =>
-        `  - [${r.id}] (due ${r.fire_at}): ${r.prompt}`,
+        `  - [${sanitizeForPtyInjection(r.id)}] (due ${sanitizeForPtyInjection(r.fire_at)}): ${wrapFenceSafe(r.prompt)}`,
       ).join('\n');
       return ` You also have ${overdue.length} overdue persistent reminder(s) from before this restart — handle each one, then run: cortextos bus ack-reminder <id>\n${items}`;
     } catch {

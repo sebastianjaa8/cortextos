@@ -5,6 +5,7 @@ import { createHash } from 'crypto';
 import { hardRestart } from '../bus/system.js';
 import type { InboxMessage, BusPaths, TelegramMessage, TelegramCallbackQuery } from '../types/index.js';
 import { checkInbox, ackInbox } from '../bus/message.js';
+import { getUnnotifiedOverdueReminders, markReminderNotified, type Reminder } from '../bus/reminders.js';
 import { updateApproval } from '../bus/approval.js';
 import { AgentProcess } from './agent-process.js';
 import type { TelegramAPI } from '../telegram/api.js';
@@ -270,7 +271,7 @@ export class FastChecker {
       ackIds.push(msg.id);
     }
 
-    // Inject if there's anything
+    // Inject inbox if there's anything
     if (messageBlock) {
       const result = this.agent.injectMessageDetailed(messageBlock);
       if (result.ok) {
@@ -298,6 +299,90 @@ export class FastChecker {
       }
     }
 
+    // Check overdue reminders (#1787099506036): getOverdueReminders() only fires at
+    // agent boot/restart, so a reminder created for a session that stays alive past
+    // fire_at — the normal case — sat pending indefinitely with nothing checking it.
+    // A SEPARATE injectMessageDetailed call from the inbox block above, on purpose:
+    // `injectMessageDetailed`'s synchronous `{ok:true}` only means the delayed Enter
+    // was SCHEDULED, not that it landed (agent-process.ts:529's own doc comment) —
+    // verified acceptance arrives later via onDeliveryAccepted. Marking a reminder
+    // notified on the synchronous return, as the inbox path above does for acking,
+    // would let a later async delivery FAILURE leave the reminder silently
+    // unretried until the next restart — reproducing the exact bug this fix exists
+    // to close (Codex review, 2026-08-18). Reminders therefore wait for the real
+    // accept/fail callback instead of copying inbox's ack-on-return timing.
+    //
+    // TWO STATED LIMITATIONS (Codex review round 2, 2026-08-18/19), both inherited
+    // from injectMessageDetailed itself rather than new here -- every other caller
+    // (inbox above, Telegram, cron delivery) has the same exposure, and fixing the
+    // shared primitive is out of scope for this change:
+    // 1. The default verify-retry accepts ANY output growth >= a byte threshold
+    //    (pty/inject.ts) as proof of delivery -- during a busy PTY turn, unrelated
+    //    agent output can satisfy that check even if THIS reminder's Enter was
+    //    swallowed, false-accepting and marking it notified. The boot-prompt
+    //    backstop (getOverdueReminders ignoring notified_at) is the safety net for
+    //    exactly this case too: a falsely-accepted-but-never-actually-acted-on
+    //    reminder still surfaces on the agent's next restart, same as any other
+    //    notified-but-never-acked reminder.
+    // 2. This call and the inbox call above are not mutually exclusive through
+    //    full delivery completion (the underlying verify/retry schedule can run
+    //    several seconds past the initial dispatch) -- an in-flight retry Enter
+    //    from one could in principle overlap the other's paste/Enter. No path was
+    //    found where either call is silently skipped; worst case is the same
+    //    false-accept exposure as #1, not a lost message.
+    const overdueReminders = getUnnotifiedOverdueReminders(this.paths);
+    if (overdueReminders.length > 0) {
+      const reminderIds = overdueReminders.map(r => r.id);
+      const reminderBlock = overdueReminders.map(r => this.formatReminderMessage(r)).join('');
+      try {
+        const result = this.agent.injectMessageDetailed(
+          reminderBlock,
+          (error) => {
+            // Verified-submit failed after the synchronous return — never marked
+            // notified, so the next poll tick's getUnnotifiedOverdueReminders()
+            // picks it right back up. No action needed here beyond logging.
+            this.log(`Reminder delivery failed for ${reminderIds.length} reminder(s) (${error?.message ?? 'unknown'}); will retry next poll cycle`);
+          },
+          () => {
+            // Verified accepted — only NOW is it safe to say the agent was shown this.
+            for (const id of reminderIds) markReminderNotified(this.paths, id);
+            this.log(`${reminderIds.length} reminder(s) verified-delivered and marked notified`);
+          },
+          // Explicit dedupKey with a per-attempt nonce (Codex review round 2,
+          // 2026-08-18/19): MessageDedup's default dedupKey is the content itself,
+          // and its eviction is COUNT-based, not time-based (pty/inject.ts). Since
+          // an unacked reminder's text is IDENTICAL on every retry, a failed attempt
+          // (especially a synchronous write throw, which never reaches the
+          // onDeliveryFailed callback that would forget the hash) would otherwise
+          // poison every subsequent retry as DEDUPED until ~100 unrelated
+          // injections evict it or the process restarts — defeating the whole
+          // point of polling. getUnnotifiedOverdueReminders() is already this
+          // call's own "should this be resent" gate; MessageDedup's protection is
+          // redundant here and actively harmful, so each attempt gets its own key.
+          `${reminderIds.join(',')}-${Date.now()}`,
+        );
+        if (result.ok) {
+          injectedAnything = true;
+        } else if (result.code === 'NOT_RUNNING') {
+          this.log(`Reminder injection skipped (${result.message}); ${reminderIds.length} reminder(s) recover next cycle`);
+        } else {
+          // DEDUPED should be rare now that the dedupKey above carries a per-attempt
+          // nonce (a genuine hit means something ELSE landed with the exact same
+          // synthesized key, vanishingly unlikely) -- kept as a defensive fallback,
+          // not the expected path. The in-process dedup hash is recorded before the
+          // PTY write even starts (agent-process.ts:539's own comment), so a hit
+          // could still mean "already landed" OR "attempted and failed before
+          // completing" -- genuinely ambiguous. Unlike inbox (which acks on
+          // DEDUPED), reminders default to the safer read: leave unnotified and let
+          // the next poll cycle retry. An occasional duplicate reminder costs
+          // nothing; a silently lost one reproduces the bug this fix exists to close.
+          this.log(`Reminder injection DEDUPED — ${reminderIds.length} reminder(s) left unnotified, will retry: ${result.message}`);
+        }
+      } catch (err) {
+        this.log(`Reminder injection threw: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+
     if (injectedAnything && !messageBlock) await sleep(5000);
 
     // Typing indicator: send while Claude is actively working
@@ -307,6 +392,30 @@ export class FastChecker {
 
     // Context monitor: check usage thresholds and fire warnings/handoffs
     await this.checkContextStatus();
+  }
+
+  /**
+   * Format an overdue reminder for live injection. Mirrors the boot-prompt wording
+   * in agent-process.ts's buildReminderBlock() so a reminder reads the same way
+   * whichever path delivered it.
+   */
+  private formatReminderMessage(reminder: Reminder): string {
+    // reminder.prompt is arbitrary text supplied at `create-reminder` time — the
+    // same untrusted-body class as an inbox message body, which formatInboxMessage
+    // below already protects with wrapFenceSafe (an unescapable dynamically-sized
+    // fence) rather than interpolating raw. Without it, a prompt containing its own
+    // `=== ` header, a fence, or raw control/escape bytes could forge a fake
+    // AGENT MESSAGE block or break bracketed-paste mode in the PTY (Codex review,
+    // 2026-08-18). `id`/`fire_at` are system-generated (Date.now()-based id,
+    // ISO-parsed timestamp) but sanitized anyway since sanitizeForPtyInjection is
+    // cheap and "system-generated today" is not a guarantee against a future caller.
+    const safeId = sanitizeForPtyInjection(reminder.id);
+    const safeFireAt = sanitizeForPtyInjection(reminder.fire_at);
+    return `=== OVERDUE REMINDER [${safeId}] (due ${safeFireAt}) ===
+${wrapFenceSafe(reminder.prompt)}
+Handle this, then run: cortextos bus ack-reminder ${safeId}
+
+`;
   }
 
   /**

@@ -12,10 +12,11 @@
  *   3. Agent processes the reminder, calls `cortextos bus ack-reminder <id>`
  */
 
-import { existsSync, readFileSync, writeFileSync } from 'fs';
+import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { randomBytes } from 'crypto';
-import { ensureDir } from '../utils/atomic.js';
+import { atomicWriteSync, ensureDir } from '../utils/atomic.js';
+import { withFileLockSync } from '../utils/lock.js';
 import type { BusPaths } from '../types/index.js';
 
 export interface Reminder {
@@ -25,6 +26,17 @@ export interface Reminder {
   prompt: string;       // The text to inject into the boot prompt when overdue
   status: 'pending' | 'acked';
   acked_at?: string;
+  /**
+   * Set the first time an overdue reminder is live-injected into a running session
+   * (fast-checker.ts's pollCycle, not a restart). Distinct from `status`/`acked_at`:
+   * notification means "the agent was shown this", acking means "the agent handled
+   * it" — a session that gets notified but is mid-tool-call when it happens should
+   * not be re-shown the same reminder every poll tick until it gets around to
+   * ack-reminder. getOverdueReminders() (the boot-prompt path) ignores this field on
+   * purpose: it is the backstop for anything notified-but-never-acked, and a restart
+   * should still surface it.
+   */
+  notified_at?: string;
 }
 
 function remindersPath(paths: BusPaths): string {
@@ -44,8 +56,30 @@ function readReminders(paths: BusPaths): Reminder[] {
 }
 
 function writeReminders(paths: BusPaths, reminders: Reminder[]): void {
+  // atomicWriteSync creates paths.stateDir if needed and writes via a temp-file +
+  // rename, so a concurrent reader never observes a truncated/torn file — it sees
+  // either the old complete state or the new one, never garbage.
+  atomicWriteSync(remindersPath(paths), JSON.stringify(reminders, null, 2));
+}
+
+/**
+ * Read-modify-write under paths.stateDir's mutex (same convention as crons.ts's
+ * lockDirFor — lock on the directory containing the target file). Without this,
+ * two concurrent mutators (e.g. a live pollCycle marking a reminder notified while
+ * `cortextos bus ack-reminder` runs from a CLI) can each read the same stale
+ * snapshot and the second writer's save silently reverts the first writer's
+ * change — a real, reproducible lost-update race, not a hypothetical one (Codex
+ * review, 2026-08-18, task_1787099506036).
+ */
+function withReminders<T>(paths: BusPaths, fn: (reminders: Reminder[]) => T): T {
+  // acquireLock (utils/lock.ts) mkdirs a `.lock.d` subdirectory INSIDE paths.stateDir
+  // and treats a missing parent as ENOENT -> "could not acquire", not "create it for
+  // me" -- it retries silently for the full timeout window (5000ms default) rather
+  // than failing fast, since a torn-mkdir mid-race looks identical from the inside.
+  // The old code created stateDir lazily on first write; locking happens BEFORE any
+  // write now, so the directory must exist before the lock attempt, not after it.
   ensureDir(paths.stateDir);
-  writeFileSync(remindersPath(paths), JSON.stringify(reminders, null, 2) + '\n', 'utf-8');
+  return withFileLockSync(paths.stateDir, () => fn(readReminders(paths)));
 }
 
 /**
@@ -69,10 +103,11 @@ export function createReminder(paths: BusPaths, fireAt: string, prompt: string):
     status: 'pending',
   };
 
-  const reminders = readReminders(paths);
-  reminders.push(reminder);
-  writeReminders(paths, reminders);
-  return reminder;
+  return withReminders(paths, reminders => {
+    reminders.push(reminder);
+    writeReminders(paths, reminders);
+    return reminder;
+  });
 }
 
 /**
@@ -86,7 +121,9 @@ export function listReminders(paths: BusPaths, opts: { all?: boolean } = {}): Re
 
 /**
  * Return pending reminders whose fire_at is in the past (overdue).
- * Used by agent-process.ts to inject into the boot prompt.
+ * Used by agent-process.ts to inject into the boot prompt. Deliberately ignores
+ * notified_at — a restart is the backstop for anything the live-injection path
+ * (fast-checker.ts) already showed the agent but that never got ack-reminder'd.
  */
 export function getOverdueReminders(paths: BusPaths): Reminder[] {
   const now = Date.now();
@@ -96,20 +133,53 @@ export function getOverdueReminders(paths: BusPaths): Reminder[] {
 }
 
 /**
+ * Return pending, overdue reminders that have NOT yet been live-injected into a
+ * running session. Used by fast-checker.ts's pollCycle (#1787099506036) — the case
+ * getOverdueReminders()/the boot prompt never covers: a session that stays alive
+ * past fire_at without ever restarting, which is the NORMAL case for a reminder.
+ */
+export function getUnnotifiedOverdueReminders(paths: BusPaths): Reminder[] {
+  const now = Date.now();
+  return readReminders(paths).filter(
+    r => r.status === 'pending' && !r.notified_at && Date.parse(r.fire_at) <= now,
+  );
+}
+
+/**
+ * Mark a reminder as having been shown to the agent via live injection.
+ * Does NOT change status — the agent still owes an explicit ack-reminder call.
+ * Never throws: a failed notification-stamp must not crash the poll loop that
+ * calls it, same discipline as recordOutboundDelivery.
+ */
+export function markReminderNotified(paths: BusPaths, id: string): void {
+  try {
+    withReminders(paths, reminders => {
+      const idx = reminders.findIndex(r => r.id === id);
+      if (idx === -1) return;
+      reminders[idx] = { ...reminders[idx], notified_at: new Date().toISOString() };
+      writeReminders(paths, reminders);
+    });
+  } catch {
+    /* best-effort: worst case this reminder gets re-injected next poll tick */
+  }
+}
+
+/**
  * Acknowledge a reminder by ID — marks it as handled.
  */
 export function ackReminder(paths: BusPaths, id: string): void {
-  const reminders = readReminders(paths);
-  const idx = reminders.findIndex(r => r.id === id);
-  if (idx === -1) {
-    throw new Error(`Reminder ${id} not found`);
-  }
-  reminders[idx] = {
-    ...reminders[idx],
-    status: 'acked',
-    acked_at: new Date().toISOString(),
-  };
-  writeReminders(paths, reminders);
+  withReminders(paths, reminders => {
+    const idx = reminders.findIndex(r => r.id === id);
+    if (idx === -1) {
+      throw new Error(`Reminder ${id} not found`);
+    }
+    reminders[idx] = {
+      ...reminders[idx],
+      status: 'acked',
+      acked_at: new Date().toISOString(),
+    };
+    writeReminders(paths, reminders);
+  });
 }
 
 /**
@@ -118,13 +188,14 @@ export function ackReminder(paths: BusPaths, id: string): void {
  */
 export function pruneReminders(paths: BusPaths, retainDays: number = 7): number {
   const cutoff = Date.now() - retainDays * 24 * 60 * 60 * 1000;
-  const reminders = readReminders(paths);
-  const kept = reminders.filter(r => {
-    if (r.status !== 'acked') return true;
-    const ackedAt = r.acked_at ? Date.parse(r.acked_at) : 0;
-    return ackedAt > cutoff;
+  return withReminders(paths, reminders => {
+    const kept = reminders.filter(r => {
+      if (r.status !== 'acked') return true;
+      const ackedAt = r.acked_at ? Date.parse(r.acked_at) : 0;
+      return ackedAt > cutoff;
+    });
+    const pruned = reminders.length - kept.length;
+    if (pruned > 0) writeReminders(paths, kept);
+    return pruned;
   });
-  const pruned = reminders.length - kept.length;
-  if (pruned > 0) writeReminders(paths, kept);
-  return pruned;
 }
