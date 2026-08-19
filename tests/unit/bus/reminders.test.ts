@@ -8,6 +8,8 @@ import {
   ackReminder,
   pruneReminders,
   getOverdueReminders,
+  getUnnotifiedOverdueReminders,
+  markReminderNotified,
 } from '../../../src/bus/reminders';
 import type { BusPaths } from '../../../src/types/index';
 
@@ -116,6 +118,67 @@ describe('reminders', () => {
       const r = createReminder(paths, past, 'already handled');
       ackReminder(paths, r.id);
       expect(getOverdueReminders(paths)).toHaveLength(0);
+    });
+  });
+
+  describe('getUnnotifiedOverdueReminders / markReminderNotified (#1787099506036)', () => {
+    // ROOT CAUSE this pair fixes: getOverdueReminders() (boot-prompt path) is only
+    // ever read at agent boot/restart. A reminder set for a session that stays
+    // alive past fire_at -- the normal case, not the exceptional one -- sat pending
+    // with nothing checking it until the next restart, however long that took.
+    // getUnnotifiedOverdueReminders() is the periodic-poll counterpart.
+
+    it('MUST-FAIL CASE: an overdue reminder is returned before notification', () => {
+      const past = new Date(Date.now() - 1000).toISOString();
+      const r = createReminder(paths, past, 'overdue task');
+      expect(getUnnotifiedOverdueReminders(paths).map(x => x.id)).toContain(r.id);
+    });
+
+    it('markReminderNotified removes it from the unnotified set', () => {
+      const past = new Date(Date.now() - 1000).toISOString();
+      const r = createReminder(paths, past, 'overdue task');
+      markReminderNotified(paths, r.id);
+      expect(getUnnotifiedOverdueReminders(paths)).toHaveLength(0);
+    });
+
+    it('PAIRED NEGATIVE: notified but NOT acked still appears in getOverdueReminders (boot-prompt backstop)', () => {
+      // This is the property the two functions exist to preserve together: a
+      // session that got the live-injection but never ran ack-reminder (crashed
+      // mid-handling, ignored it, whatever) must still be reminded on its next
+      // restart. If notified_at silently satisfied the boot-prompt check too, a
+      // reminder shown once and never acted on would vanish forever.
+      const past = new Date(Date.now() - 1000).toISOString();
+      const r = createReminder(paths, past, 'shown but not handled');
+      markReminderNotified(paths, r.id);
+
+      expect(getUnnotifiedOverdueReminders(paths)).toHaveLength(0);
+      expect(getOverdueReminders(paths).map(x => x.id)).toContain(r.id);
+    });
+
+    it('notified_at does not change status -- ack-reminder is still required', () => {
+      const past = new Date(Date.now() - 1000).toISOString();
+      const r = createReminder(paths, past, 'test');
+      markReminderNotified(paths, r.id);
+      const all = listReminders(paths, { all: true });
+      expect(all[0].status).toBe('pending');
+      expect(all[0].notified_at).toBeTruthy();
+    });
+
+    it('acking a reminder removes it from getUnnotifiedOverdueReminders too', () => {
+      const past = new Date(Date.now() - 1000).toISOString();
+      const r = createReminder(paths, past, 'handled immediately');
+      ackReminder(paths, r.id);
+      expect(getUnnotifiedOverdueReminders(paths)).toHaveLength(0);
+    });
+
+    it('a future reminder is not in the unnotified-overdue set', () => {
+      const future = new Date(Date.now() + 3600_000).toISOString();
+      createReminder(paths, future, 'not yet');
+      expect(getUnnotifiedOverdueReminders(paths)).toHaveLength(0);
+    });
+
+    it('marking a nonexistent id notified does not throw (best-effort, mirrors recordOutboundDelivery)', () => {
+      expect(() => markReminderNotified(paths, 'does-not-exist')).not.toThrow();
     });
   });
 

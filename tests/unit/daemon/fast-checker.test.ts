@@ -405,6 +405,95 @@ describe('FastChecker', () => {
     });
   });
 
+  describe('pollCycle overdue reminders (#1787099506036)', () => {
+    // ROOT CAUSE: reminders were only checked at agent boot/restart
+    // (buildReminderBlock() in agent-process.ts). A reminder set for a session
+    // that stays alive past fire_at -- the normal case -- sat pending with
+    // nothing checking it until the next actual restart. pollCycle already runs
+    // every ~1s and already live-injects inbox messages the same way; this wires
+    // overdue reminders into that same path.
+
+    function writeReminder(overrides: Partial<Record<string, unknown>> = {}) {
+      const reminder = {
+        id: 'rem-1', created_at: new Date(Date.now() - 5000).toISOString(),
+        fire_at: new Date(Date.now() - 1000).toISOString(),
+        prompt: 'do the thing', status: 'pending',
+        ...overrides,
+      };
+      writeFileSync(join(paths.stateDir, 'pending-reminders.json'), JSON.stringify([reminder], null, 2));
+      return reminder;
+    }
+
+    it('MUST-FAIL CASE: an overdue reminder is live-injected into the running session', async () => {
+      writeReminder();
+      const agent = createMockAgent();
+      const checker = new FastChecker(agent, paths, '/tmp/framework');
+
+      await (checker as any).pollCycle();
+
+      const delivered = agent.injectMessageDetailed.mock.calls.map((c: any[]) => c[0]).join('\n');
+      expect(delivered).toContain('rem-1');
+      expect(delivered).toContain('do the thing');
+      expect(delivered).toContain('ack-reminder rem-1');
+    });
+
+    it('marks the reminder notified_at on successful injection, not acked', async () => {
+      writeReminder();
+      const agent = createMockAgent();
+      const checker = new FastChecker(agent, paths, '/tmp/framework');
+
+      await (checker as any).pollCycle();
+
+      const onDisk = JSON.parse(readFileSync(join(paths.stateDir, 'pending-reminders.json'), 'utf-8'));
+      expect(onDisk[0].status).toBe('pending');
+      expect(onDisk[0].notified_at).toBeTruthy();
+    });
+
+    it('does NOT re-inject an already-notified reminder on the next poll cycle', async () => {
+      writeReminder();
+      const agent = createMockAgent();
+      const checker = new FastChecker(agent, paths, '/tmp/framework');
+
+      await (checker as any).pollCycle();
+      const callsAfterFirst = agent.injectMessageDetailed.mock.calls.length;
+      await (checker as any).pollCycle();
+
+      expect(agent.injectMessageDetailed.mock.calls.length).toBe(callsAfterFirst);
+    });
+
+    it('a future (not-yet-due) reminder is not injected', async () => {
+      writeReminder({ fire_at: new Date(Date.now() + 3600_000).toISOString() });
+      const agent = createMockAgent();
+      const checker = new FastChecker(agent, paths, '/tmp/framework');
+
+      await (checker as any).pollCycle();
+
+      expect(agent.injectMessageDetailed).not.toHaveBeenCalled();
+    });
+
+    it('an already-acked reminder is not injected', async () => {
+      writeReminder({ status: 'acked', acked_at: new Date().toISOString() });
+      const agent = createMockAgent();
+      const checker = new FastChecker(agent, paths, '/tmp/framework');
+
+      await (checker as any).pollCycle();
+
+      expect(agent.injectMessageDetailed).not.toHaveBeenCalled();
+    });
+
+    it('PAIRED NEGATIVE: NOT_RUNNING leaves the reminder unnotified so the next poll cycle retries it', async () => {
+      writeReminder();
+      const agent = createMockAgent();
+      agent.injectMessageDetailed.mockReturnValue({ ok: false, code: 'NOT_RUNNING', message: 'agent restarting' });
+      const checker = new FastChecker(agent, paths, '/tmp/framework');
+
+      await (checker as any).pollCycle();
+
+      const onDisk = JSON.parse(readFileSync(join(paths.stateDir, 'pending-reminders.json'), 'utf-8'));
+      expect(onDisk[0].notified_at).toBeUndefined();
+    });
+  });
+
   describe('sendTyping (via pollCycle)', () => {
     it('is rate-limited to 4 second intervals', async () => {
       const agent = createMockAgent();

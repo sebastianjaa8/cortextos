@@ -5,6 +5,7 @@ import { createHash } from 'crypto';
 import { hardRestart } from '../bus/system.js';
 import type { InboxMessage, BusPaths, TelegramMessage, TelegramCallbackQuery } from '../types/index.js';
 import { checkInbox, ackInbox } from '../bus/message.js';
+import { getUnnotifiedOverdueReminders, markReminderNotified, type Reminder } from '../bus/reminders.js';
 import { updateApproval } from '../bus/approval.js';
 import { AgentProcess } from './agent-process.js';
 import type { TelegramAPI } from '../telegram/api.js';
@@ -270,6 +271,18 @@ export class FastChecker {
       ackIds.push(msg.id);
     }
 
+    // Check overdue reminders (#1787099506036): getOverdueReminders() only fires at
+    // agent boot/restart, so a reminder created for a session that stays alive past
+    // fire_at — the normal case — sat pending indefinitely with nothing checking it.
+    // Same live-injection path as inbox messages above, just a distinct source list
+    // so a partial-batch failure never marks a reminder notified without it actually
+    // having been shown.
+    const reminderIds: string[] = [];
+    for (const reminder of getUnnotifiedOverdueReminders(this.paths)) {
+      messageBlock += this.formatReminderMessage(reminder);
+      reminderIds.push(reminder.id);
+    }
+
     // Inject if there's anything
     if (messageBlock) {
       const result = this.agent.injectMessageDetailed(messageBlock);
@@ -279,6 +292,12 @@ export class FastChecker {
         for (const id of ackIds) {
           ackInbox(this.paths, id);
         }
+        // Reminders are NOTIFIED, not acked — the agent still owes an explicit
+        // ack-reminder call; this only stops the same reminder re-injecting every
+        // poll tick.
+        for (const id of reminderIds) {
+          markReminderNotified(this.paths, id);
+        }
         this.log(`Injected ${messageBlock.length} bytes`);
         // Only update typing timestamp for Telegram messages, not inbox/cron.
         // Inbox messages (agent-to-agent, session continuations) must not
@@ -286,15 +305,22 @@ export class FastChecker {
         // Cooldown after injection
         await sleep(5000);
       } else if (result.code === 'NOT_RUNNING') {
-        // Inbox messages recover through the inflight sweep. Journaled
-        // Telegram deliveries were handled independently above.
-        this.log(`Inbox injection skipped (${result.message}); ${ackIds.length} message(s) recover via inflight sweep`);
+        // Inbox messages recover through the inflight sweep. Reminders recover
+        // because notified_at was never set — next poll tick retries them.
+        // Journaled Telegram deliveries were handled independently above.
+        this.log(`Inbox/reminder injection skipped (${result.message}); ${ackIds.length} inbox + ${reminderIds.length} reminder message(s) recover next cycle`);
       } else {
         // ACK deduped inbox ids so they do not bounce through inflight forever.
         for (const id of ackIds) {
           ackInbox(this.paths, id);
         }
-        this.log(`Inbox injection DEDUPED — ${ackIds.length} message(s) acked: ${result.message}`);
+        // Same treatment for reminders — a DEDUPED result means this exact content
+        // already landed, so marking notified here (not retrying) matches the inbox
+        // behavior rather than leaving a phantom retry loop.
+        for (const id of reminderIds) {
+          markReminderNotified(this.paths, id);
+        }
+        this.log(`Inbox/reminder injection DEDUPED — ${ackIds.length} inbox + ${reminderIds.length} reminder message(s) acked/notified: ${result.message}`);
       }
     }
 
@@ -307,6 +333,19 @@ export class FastChecker {
 
     // Context monitor: check usage thresholds and fire warnings/handoffs
     await this.checkContextStatus();
+  }
+
+  /**
+   * Format an overdue reminder for live injection. Mirrors the boot-prompt wording
+   * in agent-process.ts's buildReminderBlock() so a reminder reads the same way
+   * whichever path delivered it.
+   */
+  private formatReminderMessage(reminder: Reminder): string {
+    return `=== OVERDUE REMINDER [${reminder.id}] (due ${reminder.fire_at}) ===
+${reminder.prompt}
+Handle this, then run: cortextos bus ack-reminder ${reminder.id}
+
+`;
   }
 
   /**

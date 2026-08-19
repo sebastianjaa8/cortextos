@@ -25,6 +25,17 @@ export interface Reminder {
   prompt: string;       // The text to inject into the boot prompt when overdue
   status: 'pending' | 'acked';
   acked_at?: string;
+  /**
+   * Set the first time an overdue reminder is live-injected into a running session
+   * (fast-checker.ts's pollCycle, not a restart). Distinct from `status`/`acked_at`:
+   * notification means "the agent was shown this", acking means "the agent handled
+   * it" — a session that gets notified but is mid-tool-call when it happens should
+   * not be re-shown the same reminder every poll tick until it gets around to
+   * ack-reminder. getOverdueReminders() (the boot-prompt path) ignores this field on
+   * purpose: it is the backstop for anything notified-but-never-acked, and a restart
+   * should still surface it.
+   */
+  notified_at?: string;
 }
 
 function remindersPath(paths: BusPaths): string {
@@ -86,13 +97,46 @@ export function listReminders(paths: BusPaths, opts: { all?: boolean } = {}): Re
 
 /**
  * Return pending reminders whose fire_at is in the past (overdue).
- * Used by agent-process.ts to inject into the boot prompt.
+ * Used by agent-process.ts to inject into the boot prompt. Deliberately ignores
+ * notified_at — a restart is the backstop for anything the live-injection path
+ * (fast-checker.ts) already showed the agent but that never got ack-reminder'd.
  */
 export function getOverdueReminders(paths: BusPaths): Reminder[] {
   const now = Date.now();
   return readReminders(paths).filter(
     r => r.status === 'pending' && Date.parse(r.fire_at) <= now,
   );
+}
+
+/**
+ * Return pending, overdue reminders that have NOT yet been live-injected into a
+ * running session. Used by fast-checker.ts's pollCycle (#1787099506036) — the case
+ * getOverdueReminders()/the boot prompt never covers: a session that stays alive
+ * past fire_at without ever restarting, which is the NORMAL case for a reminder.
+ */
+export function getUnnotifiedOverdueReminders(paths: BusPaths): Reminder[] {
+  const now = Date.now();
+  return readReminders(paths).filter(
+    r => r.status === 'pending' && !r.notified_at && Date.parse(r.fire_at) <= now,
+  );
+}
+
+/**
+ * Mark a reminder as having been shown to the agent via live injection.
+ * Does NOT change status — the agent still owes an explicit ack-reminder call.
+ * Never throws: a failed notification-stamp must not crash the poll loop that
+ * calls it, same discipline as recordOutboundDelivery.
+ */
+export function markReminderNotified(paths: BusPaths, id: string): void {
+  try {
+    const reminders = readReminders(paths);
+    const idx = reminders.findIndex(r => r.id === id);
+    if (idx === -1) return;
+    reminders[idx] = { ...reminders[idx], notified_at: new Date().toISOString() };
+    writeReminders(paths, reminders);
+  } catch {
+    /* best-effort: worst case this reminder gets re-injected next poll tick */
+  }
 }
 
 /**
