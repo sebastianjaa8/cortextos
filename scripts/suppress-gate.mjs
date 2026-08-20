@@ -49,7 +49,7 @@ export function findTask(id, tasksDir) {
 // THE VERDICT IS A PURE FUNCTION SO THE SELF-TEST CAN DRIVE EVERY BRANCH. Ordering matters:
 // a MISSING blocker must report rather than suppress — an id that does not resolve is the
 // symptom-back-reference failure, and suppressing on it would hide a check behind a phantom.
-export function decide({ task, ageDays, maxDays, ageKnown = true }) {
+export function decide({ task, ageDays, maxDays, ageKnown = true, alreadyReportedClear = false }) {
   if (!task) {
     return { code: 2, state: 'REPORT', reason: 'blocker id does not resolve to any task — a suppression pointing at a phantom is worse than none' };
   }
@@ -63,6 +63,15 @@ export function decide({ task, ageDays, maxDays, ageKnown = true }) {
     return { code: 2, state: 'REPORT-AGE-UNKNOWN', reason: 'blocker has no parseable date, so the time bound can never fire — suppressing on an unmeasurable age is silence with no expiry' };
   }
   if (!OPEN.has(String(task.status))) {
+    // A completed/archived blocker stays completed forever, so this branch fires on EVERY
+    // subsequent call with no state of its own — found 2026-08-13 via guard-arm-check reporting
+    // "first fire after it cleared" three times, 6h apart, for the same already-cleared blocker.
+    // Report ONCE per clearing event, then go quiet: the fact does not change on later fires, so
+    // repeating it is the exact noise this gate exists to stop, just on the clear side instead of
+    // the still-blocked side.
+    if (alreadyReportedClear) {
+      return { code: 0, state: 'SUPPRESS-ALREADY-REPORTED', reason: `blocker is ${task.status} — already reported as cleared, not re-reporting the same fact` };
+    }
     return { code: 2, state: 'REPORT', reason: `blocker is ${task.status} — first fire after it cleared` };
   }
   if (ageDays >= maxDays) {
@@ -76,6 +85,19 @@ if (process.argv.includes('--self-test') && IS_MAIN) {
   const cases = [
     ['open blocker inside the bound SUPPRESSES', () => decide({ task: T('blocked'), ageDays: 3, maxDays: 14 }).code === 0],
     ['a COMPLETED blocker reports', () => decide({ task: T('completed'), ageDays: 3, maxDays: 14 }).code === 2],
+    // MUST-FAIL CASE (task_1786624343102): found live 2026-08-13, guard-arm-check reported "first
+    // fire after it cleared" three consecutive fires, 6h apart, for the SAME already-cleared
+    // blocker — the branch has no memory of its own, so it re-fires every time. The second
+    // consecutive REPORT against an already-completed blocker must NOT repeat the first-fire
+    // reason string, and must suppress rather than report the same already-acknowledged fact again.
+    ['a SECOND fire against an already-reported cleared blocker suppresses, does not repeat "first fire"', () => {
+      const v = decide({ task: T('completed'), ageDays: 3, maxDays: 14, alreadyReportedClear: true });
+      return v.code === 0 && v.state === 'SUPPRESS-ALREADY-REPORTED' && !v.reason.includes('first fire');
+    }],
+    // PAIRED NEGATIVE: alreadyReportedClear must only change the completed/archived branch. An
+    // OPEN blocker ignores the flag entirely — it was never eligible for a "cleared" report.
+    ['alreadyReportedClear has no effect on an open blocker', () =>
+      decide({ task: T('blocked'), ageDays: 3, maxDays: 14, alreadyReportedClear: true }).code === 0],
     ['past the bound reports even though the blocker is open', () => {
       const v = decide({ task: T('blocked'), ageDays: 14.2, maxDays: 14 });
       return v.code === 2 && v.state === 'REPORT-BOUND-EXCEEDED';
@@ -133,13 +155,38 @@ if (IS_MAIN && !process.argv.includes('--self-test')) {
   const since = task ? Date.parse(task.updated_at || task.created_at || '') : NaN;
   const ageKnown = Number.isFinite(since);
   const ageDays = ageKnown ? (Date.now() - since) / 86400000 : 0;
-  const v = decide({ task, ageDays, maxDays, ageKnown });
 
   // THE LOG LINE IS WRITTEN BY THE SAME CALL THAT PRODUCES THE VERDICT. That coupling is the entire
   // design: a caller cannot obtain a SUPPRESS without also leaving the record of it, so a suppressed
   // fire and a fire that never happened stop being indistinguishable.
   const logPath = (process.argv.find((a) => a.startsWith('--log=')) || '').split('=')[1]
     || join(ROOT, 'state', process.env.CTX_AGENT_NAME || 'builder_1', '.suppression-log.jsonl');
+
+  // HAS THIS SPECIFIC CLEARING ALREADY BEEN REPORTED? The log itself is the state store — no new
+  // file needed. Scan prior lines (written by earlier runs, before this one appends its own) for a
+  // REPORT against this same blocker id while its status was already non-open. If one exists, the
+  // "first fire after it cleared" fact has already reached a reader; reporting it again is the
+  // repeat-noise bug this fix closes.
+  let alreadyReportedClear = false;
+  if (existsSync(logPath)) {
+    try {
+      for (const line of readFileSync(logPath, 'utf8').split('\n')) {
+        if (!line.trim()) continue;
+        const entry = JSON.parse(line);
+        if (entry.blocker === id && entry.state === 'REPORT' && !OPEN.has(String(entry.blocker_status))) {
+          alreadyReportedClear = true;
+          break;
+        }
+      }
+    } catch {
+      // A CORRUPT OR UNREADABLE LOG MUST NOT SUPPRESS AN EXISTING REPORT. Falling back to false
+      // (never reported) at worst re-reports once — the safe side, matching every other refusal in
+      // this file — rather than risk swallowing a report the caller never actually saw.
+    }
+  }
+
+  const v = decide({ task, ageDays, maxDays, ageKnown, alreadyReportedClear });
+
   try {
     mkdirSync(dirname(logPath), { recursive: true });
     appendFileSync(logPath, JSON.stringify({
