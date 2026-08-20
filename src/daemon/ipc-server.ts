@@ -1,6 +1,6 @@
 import { createServer, Server, Socket } from 'net';
 import { existsSync, unlinkSync, chmodSync, readFileSync, writeFileSync, mkdirSync, renameSync } from 'fs';
-import { join, resolve as pathResolve } from 'path';
+import { join, dirname, resolve as pathResolve } from 'path';
 import { homedir } from 'os';
 import { randomBytes, timingSafeEqual } from 'crypto';
 import { StringDecoder } from 'string_decoder';
@@ -538,6 +538,21 @@ export class IPCServer {
    */
   async start(): Promise<void> {
     this.authToken = loadOrCreateServerToken(this.tokenPath);
+    // FIX (2026-08-20, task_1787187446702): getIpcPath() resolves under the REAL
+    // homedir() (~/.cortextos/<instanceId>/daemon.sock), independent of the ctxRoot
+    // this server was constructed with -- loadOrCreateServerToken above creates ITS
+    // OWN parent dir (tokenPath, which honors ctxRoot), but nothing ever created the
+    // socket's own parent directory. Every test instance uses a brand-new instanceId
+    // (pid+timestamp+random), so that directory never pre-exists. net.Server.listen()
+    // binding a Unix socket whose containing directory does not exist surfaced as
+    // EACCES rather than ENOENT on GitHub Actions' Ubuntu runners (a known
+    // libuv/AF_UNIX-bind quirk under some CI filesystem/security-module configs) --
+    // never reproduced locally on Windows since named pipes there have no directory
+    // requirement at all. Create it explicitly rather than depending on some other
+    // code path having already done so as a side effect.
+    if (process.platform !== 'win32') {
+      mkdirSync(dirname(this.socketPath), { recursive: true });
+    }
     // Clean up stale socket
     if (process.platform !== 'win32' && existsSync(this.socketPath)) {
       try {

@@ -16,6 +16,16 @@ import { atomicWriteDurableSync } from './atomic.js';
 export const AGENT_PROCESS_RECORD = 'agent-process.json';
 export const AGENT_PROCESS_RECORDS_DIR = 'agent-processes';
 
+// Synchronous sleep for the post-SIGKILL confirmation poll below. Same pattern
+// as lock.ts's own Atomics.wait-based backoff — this file's callers
+// (reconcileRuntimeProcesses) are synchronous, so an async setTimeout sleep is
+// not usable here.
+const SLEEP_SAB = new SharedArrayBuffer(4);
+const SLEEP_VIEW = new Int32Array(SLEEP_SAB);
+function sleepSync(ms: number): void {
+  Atomics.wait(SLEEP_VIEW, 0, 0, ms);
+}
+
 export interface ProcessIdentity {
   pid: number;
   startIdentity: string;
@@ -273,6 +283,21 @@ export function terminateProcessTree(
     try { process.kill(-pid, 'SIGKILL'); } catch {
       try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
     }
+  }
+  // FIX (2026-08-20, task_1787187446702): SIGKILL delivery is asynchronous at
+  // the OS level -- the kernel schedules termination, it does not guarantee
+  // the process has been reaped and vanished from /proc by the time kill()
+  // returns. A single immediate probe right after sending the signal is a
+  // real race, not just a test artifact: on a loaded/throttled CI runner the
+  // reap can take longer than on an idle dev machine, producing a false
+  // "survived forced termination" verdict for a kill that in fact succeeded a
+  // few milliseconds later. taskkill.exe above already blocks synchronously
+  // until Windows confirms termination (or its own 15s timeout), so this gap
+  // was Linux/macOS-SIGKILL-specific. Poll briefly instead of a single check.
+  const deadlineMs = Date.now() + 2_000;
+  while (Date.now() < deadlineMs) {
+    if (probeProcessIdentity(pid).status === 'absent') return true;
+    sleepSync(50);
   }
   return probeProcessIdentity(pid).status === 'absent';
 }
