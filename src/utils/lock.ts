@@ -71,7 +71,22 @@ function readProcessStartIdentity(pid: number): string | undefined {
     const commandEnd = stat.lastIndexOf(')');
     if (commandEnd < 0) return undefined;
     // Fields after the command begin at field 3; starttime is field 22.
-    return stat.slice(commandEnd + 2).trim().split(/\s+/)[19] || undefined;
+    const startTicks = stat.slice(commandEnd + 2).trim().split(/\s+/)[19];
+    if (!startTicks) return undefined;
+    // FIX (Codex review, 2026-08-20, task_1787187446702): this used to return
+    // the bare ticks value, but process-ownership.ts's probeProcessIdentity()
+    // (the CANONICAL identity source, used everywhere this value is later
+    // compared against) formats a Linux identity as `${bootId}:${startTicks}`.
+    // The two callers of this function both compare its result against a
+    // probeProcessIdentity-produced identity string -- a format mismatch here
+    // is a REAL correctness bug, not a cosmetic one: if this bare-ticks
+    // fallback fires once (e.g. a transient primary-probe failure at module
+    // load), a LATER successful probeProcessIdentity() call for the same
+    // still-live process produces a differently-formatted string, the
+    // comparison spuriously reads "identity changed" (PID reused / process
+    // dead), and a live process's lock becomes stealable. Matching the exact
+    // canonical format here closes that gap.
+    return `${BOOT_ID ?? 'unknown-boot'}:${startTicks}`;
   } catch {
     return undefined;
   }
@@ -293,10 +308,27 @@ function processStatus(
       return probe.identity.startIdentity === metadata.processStartIdentity ? 'live' : 'dead';
     }
     if (probe.status === 'absent') return 'dead';
-    const currentIdentity = readProcessStartIdentity(metadata.pid);
-    if (currentIdentity) return currentIdentity === metadata.processStartIdentity ? 'live' : 'dead';
-    // The PID liveness check above succeeded. An unavailable identity probe is
-    // not permission to steal a live daemon lock, regardless of heartbeat age.
+    // probe.status === 'unknown': the PID liveness check above already
+    // succeeded, so an inconclusive identity probe is not permission to steal
+    // a live daemon lock, regardless of heartbeat age.
+    //
+    // FIX (2026-08-20, CI-only failure investigation): this used to fall back
+    // to a second, independent identity read (readProcessStartIdentity,
+    // Linux-only /proc/pid/stat) and trust IT if it happened to succeed. In
+    // real production that fallback is effectively vestigial: on real Linux,
+    // probeProcessIdentity() ALREADY reads /proc directly and returns
+    // 'present' for any live PID -- 'unknown' only occurs on rare parse
+    // failures -- so the fallback almost never fires there; on Windows,
+    // readProcessStartIdentity() is a guaranteed no-op (platform-gated). The
+    // ONLY place it reliably fired was a test that mocks probeProcessIdentity
+    // to 'unknown' while running on a real Linux CI box, where the private
+    // fallback function still read the test's OWN real process directly,
+    // producing a definitive but WRONG verdict against the test's
+    // intentionally-fake processStartIdentity fixture -- exactly the
+    // "listen EACCES"-class of platform-specific CI-only failure this
+    // investigation was chasing (task_1787187446702), not a Windows-only
+    // path either: any legitimate probe failure now safely resolves to
+    // 'live' with one identity check, not two disagreeing ones.
     return 'live';
   }
   if (metadata.pid === process.pid

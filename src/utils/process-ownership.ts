@@ -16,6 +16,55 @@ import { atomicWriteDurableSync } from './atomic.js';
 export const AGENT_PROCESS_RECORD = 'agent-process.json';
 export const AGENT_PROCESS_RECORDS_DIR = 'agent-processes';
 
+// Synchronous sleep for the post-SIGKILL confirmation poll below. Same pattern
+// as lock.ts's own Atomics.wait-based backoff — this file's callers
+// (reconcileRuntimeProcesses) are synchronous, so an async setTimeout sleep is
+// not usable here.
+const SLEEP_SAB = new SharedArrayBuffer(4);
+const SLEEP_VIEW = new Int32Array(SLEEP_SAB);
+function sleepSync(ms: number): void {
+  Atomics.wait(SLEEP_VIEW, 0, 0, ms);
+}
+
+/**
+ * Linux-only: is this PID gone from the process table, OR a zombie (exited,
+ * awaiting reap by its parent)? Used ONLY to confirm a SIGKILL took effect —
+ * NOT a general identity check (probeProcessIdentity remains that, unchanged,
+ * and correctly still reports a zombie as 'present' for callers that
+ * genuinely need to know the PID slot has not been recycled yet).
+ *
+ * FIX (Codex review, 2026-08-20, task_1787187446702): the original retry poll
+ * called probeProcessIdentity() in a loop, but that function ignores procfs'
+ * own STATE field (field 3 of /proc/pid/stat) -- a killed-but-not-yet-reaped
+ * zombie still reads 'present' there, so the poll could spin for its entire
+ * budget even though the kill demonstrably succeeded. Worse, when the target
+ * was a child THIS process spawned (as in the regression test), the
+ * synchronous Atomics.wait-based poll blocks the JS event loop, which is
+ * EXACTLY what Node needs to run to process the child's exit and reap it --
+ * a self-inflicted deadlock where our own wait prevents the very reap we are
+ * waiting for. Reading the zombie state directly sidesteps both problems: we
+ * do not need the process reaped at all to know the kill worked.
+ */
+function isPidGoneOrZombie(pid: number): boolean {
+  // /proc is Linux-only. On macOS (the only other non-Windows platform this
+  // file supports) there is no procfs to read at all -- readFileSync would
+  // ALWAYS throw ENOENT there regardless of whether the PID is actually
+  // still alive, which would make this function report "gone" immediately
+  // on the very first poll, defeating the retry entirely. Fall back to the
+  // ordinary identity probe there, same as before this fix.
+  if (platform() !== 'linux') return probeProcessIdentity(pid).status === 'absent';
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+    const commandEnd = stat.lastIndexOf(')');
+    if (commandEnd < 0) return false;
+    const state = stat.slice(commandEnd + 2).trim().split(/\s+/)[0];
+    return state === 'Z';
+  } catch (err) {
+    // ENOENT: the PID is fully gone (reaped, or never existed here).
+    return (err as NodeJS.ErrnoException).code === 'ENOENT';
+  }
+}
+
 export interface ProcessIdentity {
   pid: number;
   startIdentity: string;
@@ -269,12 +318,37 @@ export function terminateProcessTree(
     } catch {
       // taskkill returns non-zero when the process exited between inspection and termination.
     }
-  } else {
-    try { process.kill(-pid, 'SIGKILL'); } catch {
-      try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
-    }
+    return probeProcessIdentity(pid).status === 'absent';
   }
-  return probeProcessIdentity(pid).status === 'absent';
+  // Non-Windows only below this point. taskkill.exe above already blocks
+  // synchronously until Windows confirms termination (or its own 15s
+  // timeout), so a retry poll there would only add cost (each probe spawns a
+  // PowerShell subprocess, per Codex review) with no correctness benefit --
+  // gated out entirely, matching the original single-check behavior there.
+  try { process.kill(-pid, 'SIGKILL'); } catch {
+    try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
+  }
+  // FIX (2026-08-20, task_1787187446702): SIGKILL delivery is asynchronous at
+  // the OS level -- the kernel schedules termination, it does not guarantee
+  // the process has been reaped by the time kill() returns. A single
+  // immediate check right after sending the signal is a real race: on a
+  // loaded/throttled CI runner the reap can take longer than on an idle dev
+  // machine, producing a false "survived forced termination" verdict for a
+  // kill that in fact succeeded a few milliseconds later. Poll briefly
+  // instead, using isPidGoneOrZombie() rather than probeProcessIdentity() --
+  // the latter ignores procfs' own zombie state and would keep reporting
+  // 'present' for a process the kernel has already killed but not yet
+  // reaped, which (per Codex review) can never resolve here: this
+  // synchronous Atomics.wait poll blocks the event loop, which is exactly
+  // what Node needs free to run in order to reap a child THIS process
+  // spawned -- a self-inflicted deadlock. A zombie is "as dead as we need to
+  // know" for this function's purpose regardless of who eventually reaps it.
+  const deadlineNs = process.hrtime.bigint() + 2_000_000_000n; // monotonic, not wall-clock
+  while (process.hrtime.bigint() < deadlineNs) {
+    if (isPidGoneOrZombie(pid)) return true;
+    sleepSync(50);
+  }
+  return isPidGoneOrZombie(pid);
 }
 
 /**
