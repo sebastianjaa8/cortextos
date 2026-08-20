@@ -1,6 +1,6 @@
 import { Command } from 'commander';
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
-import { dirname, join, normalize } from 'path';
+import { dirname, join, normalize, win32 as winPath } from 'path';
 import { homedir, platform } from 'os';
 import { spawn, spawnSync } from 'child_process';
 import { IPCClient } from '../daemon/ipc-server.js';
@@ -25,7 +25,12 @@ function commandExists(cmd: string): boolean {
 }
 
 export function pm2NodeCliFromWrapper(wrapperPath: string): string {
-  return join(dirname(wrapperPath), 'node_modules', 'pm2', 'bin', 'pm2');
+  // wrapperPath always comes from `where.exe pm2.cmd` output (only called from
+  // the IS_WINDOWS branch of resolvePm2Invocation), so it's always
+  // backslash-separated regardless of which OS is running this code (e.g. this
+  // function under unit test on Linux CI). Use path.win32 explicitly rather
+  // than the ambient path module, whose separator flips with the host OS.
+  return winPath.join(winPath.dirname(wrapperPath), 'node_modules', 'pm2', 'bin', 'pm2');
 }
 
 function resolvePm2Invocation(args: string[]): Pm2Invocation {

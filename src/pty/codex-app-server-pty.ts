@@ -1080,8 +1080,7 @@ export class CodexAppServerPTY {
       updatedAt: new Date().toISOString(),
     };
     try {
-      ensureDir(this._stateDir);
-      writeFileSync(this._socketPointerPath, `${JSON.stringify(pointer, null, 2)}\n`, 'utf-8');
+      atomicWriteSync(this._socketPointerPath, `${JSON.stringify(pointer, null, 2)}\n`);
     } catch {
       // Non-fatal; spawn will still use fallback path.
     }
