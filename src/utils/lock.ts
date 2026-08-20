@@ -71,7 +71,22 @@ function readProcessStartIdentity(pid: number): string | undefined {
     const commandEnd = stat.lastIndexOf(')');
     if (commandEnd < 0) return undefined;
     // Fields after the command begin at field 3; starttime is field 22.
-    return stat.slice(commandEnd + 2).trim().split(/\s+/)[19] || undefined;
+    const startTicks = stat.slice(commandEnd + 2).trim().split(/\s+/)[19];
+    if (!startTicks) return undefined;
+    // FIX (Codex review, 2026-08-20, task_1787187446702): this used to return
+    // the bare ticks value, but process-ownership.ts's probeProcessIdentity()
+    // (the CANONICAL identity source, used everywhere this value is later
+    // compared against) formats a Linux identity as `${bootId}:${startTicks}`.
+    // The two callers of this function both compare its result against a
+    // probeProcessIdentity-produced identity string -- a format mismatch here
+    // is a REAL correctness bug, not a cosmetic one: if this bare-ticks
+    // fallback fires once (e.g. a transient primary-probe failure at module
+    // load), a LATER successful probeProcessIdentity() call for the same
+    // still-live process produces a differently-formatted string, the
+    // comparison spuriously reads "identity changed" (PID reused / process
+    // dead), and a live process's lock becomes stealable. Matching the exact
+    // canonical format here closes that gap.
+    return `${BOOT_ID ?? 'unknown-boot'}:${startTicks}`;
   } catch {
     return undefined;
   }

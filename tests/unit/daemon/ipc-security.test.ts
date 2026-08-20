@@ -1,6 +1,6 @@
-import { mkdtempSync, rmSync, readFileSync } from 'fs';
-import { tmpdir } from 'os';
-import { join } from 'path';
+import { mkdtempSync, mkdirSync, rmSync, readFileSync } from 'fs';
+import { tmpdir, homedir } from 'os';
+import { join, dirname } from 'path';
 import { createConnection, createServer } from 'net';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { IPCClient, IPCServer } from '../../../src/daemon/ipc-server.js';
@@ -8,9 +8,17 @@ import { getIpcPath } from '../../../src/utils/paths.js';
 
 const servers: IPCServer[] = [];
 const roots: string[] = [];
+const instances: string[] = [];
 
 function uniqueInstance(): string {
-  return `ipc-test-${process.pid}-${Date.now()}-${Math.floor(Math.random() * 1_000_000)}`;
+  const id = `ipc-test-${process.pid}-${Date.now()}-${Math.floor(Math.random() * 1_000_000)}`;
+  // getIpcPath() resolves the socket under the REAL homedir(), independent of
+  // `roots` (this file's own tmpdir-based ctxRoot) -- track every instance id
+  // so afterEach can clean up ~/.cortextos/<id>/ too. Without this, every test
+  // run leaks a fresh directory into the real user home dir (Codex review,
+  // 2026-08-20, task_1787187446702).
+  instances.push(id);
+  return id;
 }
 
 function fakeManager(overrides: Record<string, unknown> = {}): Record<string, unknown> {
@@ -49,6 +57,9 @@ async function rawRequest(instanceId: string, payload: string): Promise<Record<s
 afterEach(() => {
   for (const server of servers.splice(0)) server.stop();
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+  for (const id of instances.splice(0)) {
+    try { rmSync(join(homedir(), '.cortextos', id), { recursive: true, force: true }); } catch { /* best effort */ }
+  }
 });
 
 describe('IPC control-plane security', () => {
@@ -139,6 +150,10 @@ describe('IPC control-plane security', () => {
     roots.push(root);
     const instance = uniqueInstance();
     const socketPath = getIpcPath(instance);
+    // This test binds a raw net.Server directly, bypassing IPCServer.start() --
+    // the mkdirSync fix there does not cover this path (Codex review, 2026-08-20,
+    // task_1787187446702). Same directory-creation-before-bind fix, applied here.
+    if (process.platform !== 'win32') mkdirSync(dirname(socketPath), { recursive: true });
     const rawServer = createServer((socket) => {
       let replied = false;
       socket.on('data', () => {
