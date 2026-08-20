@@ -33,6 +33,23 @@ async function waitForIdentity(pid: number): Promise<NonNullable<ReturnType<type
   throw new Error(`Process identity never became observable for PID ${pid}`);
 }
 
+// terminateProcessTree() is synchronous (its callers are synchronous) and its
+// retry loop uses Atomics.wait, which blocks this process's event loop entirely
+// -- so it can only wait for zombie state, not full OS reaping (reaping a
+// same-process child requires libuv's SIGCHLD handling, which needs the event
+// loop to run). For a self-spawned test child, that means the PID can still be
+// a zombie (present in /proc, not yet reaped) the instant terminateProcessTree
+// returns. Give the real event loop a turn here so Node can finish reaping
+// before asserting full absence -- this is a test-side reality, not something
+// production's synchronous kill path can or should guarantee itself.
+async function waitForAbsence(pid: number): Promise<void> {
+  for (let attempt = 0; attempt < 30; attempt++) {
+    if (!inspectProcessIdentity(pid)) return;
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+  throw new Error(`Process ${pid} was never reaped`);
+}
+
 afterEach(() => {
   for (const child of children.splice(0)) {
     try { child.kill('SIGKILL'); } catch { /* already gone */ }
@@ -142,7 +159,7 @@ describe('runtime process ownership', () => {
     const outcomes = reconcileRuntimeProcesses(ctxRoot, 'test');
 
     expect(outcomes).toEqual([expect.objectContaining({ status: 'killed-orphan', pid: child.pid })]);
-    expect(inspectProcessIdentity(child.pid)).toBeNull();
+    await waitForAbsence(child.pid);
   }, 20_000);
 
   it('preserves a child and blocks replacement while its owning daemon generation is live', async () => {
