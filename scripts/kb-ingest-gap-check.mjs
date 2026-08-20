@@ -31,16 +31,36 @@ const CTX_ROOT = (process.env.CTX_ROOT || `${process.env.HOME}/.cortextos/defaul
 const DEFAULT_CYCLES = 2;
 
 /**
- * Duration-form cron intervals only ("2h", "30m", "1d"). A cron-EXPRESSION heartbeat (5-field)
- * has no fixed cadence to multiply, so those agents are EXCLUDED and named, not silently skipped
- * or treated as a check failure — same "state what was narrowed" discipline as cron-drift's
- * utcOnlyExcluded/uncomparable lists.
+ * Duration-form cron intervals only ("2h", "30m", "1d").
  */
 export function parseDurationMs(raw) {
   const m = /^(\d+)\s*(h|m|d)$/i.exec((raw || '').trim());
   if (!m) return null;
   const mult = { h: 3_600_000, m: 60_000, d: 86_400_000 }[m[2].toLowerCase()];
   return Number(m[1]) * mult;
+}
+
+/**
+ * A NARROW subset of 5-field cron expressions that carry a real, computable fixed
+ * cadence: "minute, every-N-hours, star, star, star" (every N hours) and "minute, star,
+ * star, star, star" (every hour). These are the ONLY two shapes fleet-wide as of the
+ * 2026-08-20 heartbeat-stagger fix (task_1787184350671),
+ * which converted every live agent's heartbeat from a bare interval ("2h") to a fixed
+ * cron expression — coverage silently dropped from 4 checked to 0/14 the moment that
+ * landed, because this parser had no cron-expression branch at all until now.
+ *
+ * Anything outside these two shapes (day-of-week/month fields, comma-separated hour
+ * lists, etc.) returns null and stays EXCLUDED, same as before — a genuinely irregular
+ * schedule has no single cadence to multiply, and guessing one would be worse than
+ * naming it uncomputable.
+ */
+export function parseCronExpressionIntervalMs(raw) {
+  const expr = (raw || '').trim();
+  let m = /^\d{1,2}\s+\*\/(\d{1,2})\s+\*\s+\*\s+\*$/.exec(expr);
+  if (m) return Number(m[1]) * 3_600_000;
+  m = /^\d{1,2}\s+\*\s+\*\s+\*\s+\*$/.exec(expr);
+  if (m) return 3_600_000;
+  return null;
 }
 
 /** @returns {number|null} the heartbeat cron's interval in ms, or null if not interval-form / absent. */
@@ -55,7 +75,7 @@ export function heartbeatIntervalMs(cronsJson) {
   // wrong field name" class already logged fleet-wide (my-open-tasks.sh: assignee vs
   // assigned_to). --self-test alone did not catch it because its fabricated fixtures used the
   // field name I assumed, not the one actually on disk — a lesson for the next fixture too.
-  return parseDurationMs(hb.schedule);
+  return parseDurationMs(hb.schedule) ?? parseCronExpressionIntervalMs(hb.schedule);
 }
 
 /**
@@ -96,15 +116,35 @@ function selfTest() {
   const cases = [
     ['parses a plain interval', () => parseDurationMs('2h') === 2 * H],
     ['parses minutes and days too', () => parseDurationMs('30m') === 30 * 60_000 && parseDurationMs('1d') === 24 * H],
-    ['a cron expression is not a duration', () => parseDurationMs('0 */6 * * *') === null],
+    ['a cron expression is not a duration (parseDurationMs alone, not the combined resolver)', () =>
+      parseDurationMs('0 */6 * * *') === null],
     ['empty/absent is not a duration', () => parseDurationMs('') === null && parseDurationMs(undefined) === null],
     ['finds the enabled heartbeat cron', () =>
       heartbeatIntervalMs({ crons: [{ name: 'heartbeat', schedule: '4h', enabled: true }] }) === 4 * H],
     ['a DISABLED heartbeat cron does not count', () =>
       heartbeatIntervalMs({ crons: [{ name: 'heartbeat', schedule: '4h', enabled: false }] }) === null],
-    ['a cron-expression heartbeat yields null, not NaN or 0', () =>
-      heartbeatIntervalMs({ crons: [{ name: 'heartbeat', schedule: '0 */6 * * *' }] }) === null],
     ['no heartbeat cron at all yields null', () => heartbeatIntervalMs({ crons: [] }) === null],
+
+    // --- REGRESSION, 2026-08-20 (task_1787184350671 fallout): the heartbeat-stagger fix
+    // converted every live agent from a bare interval ("2h") to a fixed cron expression
+    // ("13 */2 * * *"). Coverage silently dropped from 4 checked to 0/14 the moment that
+    // landed, because heartbeatIntervalMs() had no cron-expression branch at all. ---
+    ['MUST-FAIL CASE: an "every N hours" cron expression (the fleet-wide shape after the stagger fix) now computes a real cadence', () =>
+      parseCronExpressionIntervalMs('0 */6 * * *') === 6 * H],
+    ['parseCronExpressionIntervalMs handles single AND double-digit minute/hour fields', () =>
+      parseCronExpressionIntervalMs('45 */4 * * *') === 4 * H &&
+      parseCronExpressionIntervalMs('6 */12 * * *') === 12 * H],
+    ['the hourly shape ("M * * * *") computes a 1h cadence', () =>
+      parseCronExpressionIntervalMs('6 * * * *') === H],
+    ['heartbeatIntervalMs resolves through to the cron-expression branch, not just parseDurationMs', () =>
+      heartbeatIntervalMs({ crons: [{ name: 'heartbeat', schedule: '13 */2 * * *', enabled: true }] }) === 2 * H],
+    ['PAIRED NEGATIVE: a genuinely irregular expression (day-of-week) still yields null, not a guessed cadence', () =>
+      parseCronExpressionIntervalMs('0 9 * * 1') === null &&
+      heartbeatIntervalMs({ crons: [{ name: 'heartbeat', schedule: '0 9 * * 1', enabled: true }] }) === null],
+    ['PAIRED NEGATIVE: a comma-separated hour list still yields null', () =>
+      parseCronExpressionIntervalMs('0 0,12 * * *') === null],
+    ['a disabled agent on a supported cron-expression shape still does not count (disabled check runs first)', () =>
+      heartbeatIntervalMs({ crons: [{ name: 'heartbeat', schedule: '0 */6 * * *', enabled: false }] }) === null],
 
     // --- THE MOTIVATING CASE: brand_writer, 104h / ~26 cycles at 4h cadence ---
     ['THE INCIDENT ITSELF: 104h gap at 4h cadence is a real finding', () => {
