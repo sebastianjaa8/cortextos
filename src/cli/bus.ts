@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { Command } from 'commander';
 import { spawnSync, execFileSync } from 'child_process';
-import { existsSync, readFileSync } from 'fs';
+import { existsSync, readFileSync, readdirSync } from 'fs';
 import { join } from 'path';
 import { sendMessage, checkInbox, ackInbox } from '../bus/message.js';
 import { validateAgentName, validateTaskId, validatePriority } from '../utils/validate.js';
@@ -1037,22 +1037,60 @@ busCommand
 
 busCommand
   .command('list-experiments')
-  .description('List experiments with optional filters')
-  .option('--agent <name>', 'Filter by agent')
+  .description('List experiments with optional filters. Omitting --agent scans every agent fleet-wide, not just the caller.')
+  .option('--agent <name>', 'Restrict to one agent (omit for fleet-wide)')
   .option('--status <s>', 'Filter by status')
   .option('--metric <m>', 'Filter by metric')
   .option('--json', 'Output as JSON')
   .action((opts: { agent?: string; status?: string; metric?: string; json?: boolean }) => {
     const env = resolveEnv();
-    const agentDir = opts.agent && env.frameworkRoot
-      ? join(env.frameworkRoot, 'orgs', env.org, 'agents', opts.agent)
-      : (env.agentDir || process.cwd());
-    const experiments = listExperiments(agentDir, {
-      agent: opts.agent,
-      status: opts.status,
-      metric: opts.metric,
-    });
-    console.log(JSON.stringify(experiments, null, 2));
+    if (opts.agent) {
+      const agentDir = env.frameworkRoot
+        ? join(env.frameworkRoot, 'orgs', env.org, 'agents', opts.agent)
+        : (env.agentDir || process.cwd());
+      const experiments = listExperiments(agentDir, {
+        agent: opts.agent,
+        status: opts.status,
+        metric: opts.metric,
+      });
+      console.log(JSON.stringify(experiments, null, 2));
+      return;
+    }
+    // FLEET-WIDE DEFAULT (task_1787184346930, recurring bug flagged 08-13 and
+    // 08-20): omitting --agent used to fall through to `env.agentDir ||
+    // process.cwd()` -- the CALLER's own directory only. That silently read as
+    // "5 experiments, 0 running" on a day the real fleet total was 24/5, because
+    // listExperiments() only ever reads the ONE directory it is given; there was
+    // never a fleet-scan branch at all. Same directory-enumeration pattern as
+    // this file's other fleet-wide scanners (list all agent dirs under
+    // orgs/<org>/agents/, aggregate, sort by created_at desc).
+    if (!env.frameworkRoot) {
+      // No framework root resolvable -- cannot enumerate other agents' dirs.
+      // Falls back to caller-only (previous behavior), same as when --agent is
+      // given without a resolvable frameworkRoot above.
+      const agentDir = env.agentDir || process.cwd();
+      const experiments = listExperiments(agentDir, { status: opts.status, metric: opts.metric });
+      console.log(JSON.stringify(experiments, null, 2));
+      return;
+    }
+    const orgsDir = join(env.frameworkRoot, 'orgs');
+    const all: ReturnType<typeof listExperiments> = [];
+    if (existsSync(orgsDir)) {
+      for (const orgEntry of readdirSync(orgsDir, { withFileTypes: true })) {
+        if (!orgEntry.isDirectory()) continue;
+        const agentsRoot = join(orgsDir, orgEntry.name, 'agents');
+        if (!existsSync(agentsRoot)) continue;
+        for (const agentEntry of readdirSync(agentsRoot, { withFileTypes: true })) {
+          if (!agentEntry.isDirectory() || agentEntry.name.startsWith('.')) continue;
+          all.push(...listExperiments(join(agentsRoot, agentEntry.name), {
+            status: opts.status,
+            metric: opts.metric,
+          }));
+        }
+      }
+    }
+    all.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+    console.log(JSON.stringify(all, null, 2));
   });
 
 busCommand
