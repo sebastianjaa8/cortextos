@@ -214,8 +214,16 @@ describe('AgentProcess.injectMessageQueued — turn-boundary drain', () => {
     for (let i = 0; i < 45; i++) {
       proc.injectMessageQueued(`prompt-${i}`);
     }
+    // ADVERSARIAL-REVIEW FIX (Codex, 2026-08-26): the original assertions only checked count,
+    // severity, attempts and reason — that would still pass if the events described the WRONG
+    // prompts, or if a delivery had actually been attempted despite attempts staying 0 in the
+    // metadata. Never advancing fake timers here means no drain tick has run, so nothing COULD
+    // have been delivered — assert that explicitly rather than relying on it implicitly.
+    expect(mockInjectMessage).not.toHaveBeenCalled();
     // 5 evictions (prompts 0-4), none of which were ever delivered.
     expect(mockLogEvent).toHaveBeenCalledTimes(5);
+    const previews = mockLogEvent.mock.calls.map((call) => call[6].content_preview);
+    expect(previews).toEqual(['prompt-0', 'prompt-1', 'prompt-2', 'prompt-3', 'prompt-4']);
     for (const call of mockLogEvent.mock.calls) {
       const [, , , category, eventName, severity, metadata] = call;
       expect(category).toBe('error');
@@ -252,7 +260,14 @@ describe('AgentProcess.injectMessageQueued — turn-boundary drain', () => {
     proc.injectMessageQueued('one-more-to-overflow');
     expect(mockLogEvent).toHaveBeenCalledTimes(1);
     const [, , , , , , metadata] = mockLogEvent.mock.calls[0];
-    expect(metadata).toMatchObject({ attempts: 1, reason: 'queue-overflow-eviction' });
+    // ADVERSARIAL-REVIEW FIX (Codex, 2026-08-26): assert content_preview too, not just
+    // attempts/reason — without it, an event describing the WRONG evicted item (e.g. a filler
+    // prompt instead of the retried one) would still satisfy this test.
+    expect(metadata).toMatchObject({
+      attempts: 1,
+      reason: 'queue-overflow-eviction',
+      content_preview: 'will-fail-then-get-evicted',
+    });
   });
 
   describe('dropped catch-up inject detection (root-cause fix 2026-07-23)', () => {
