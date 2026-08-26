@@ -19,9 +19,21 @@
 // side effect of being run. The caller cannot suppress without the evidence, because the same call
 // produces both.
 //
-//   node scripts/suppress-gate.mjs <task-id> [--max-days=14] [--check=<name>] [--log=<path>]
+//   node scripts/suppress-gate.mjs <task-id> [--max-days=14] [--check=<name>] [--log=<path>] [--fingerprint=<val>]
 //
 // EXIT 0 = SUPPRESS (blocker still open, inside the bound). EXIT 2 = REPORT. EXIT 3 = could not run.
+//
+// RE-ARM ON A CHANGED FINGERPRINT (task_1787207549324, 2026-08-26). A completed blocker suppresses
+// forever once its clearing has been reported once (SUPPRESS-ALREADY-REPORTED) — correct for the
+// blocker itself, wrong for a check whose underlying condition can RECUR after the blocker clears.
+// guard-arm-check's blocker was "npm build + pm2 restart" — completed once, permanently — but
+// STALE-DAEMON is structural: any future build without a matching restart reproduces it, and once
+// the old blocker is reported cleared there is no new task to key a new suppression window on. An
+// optional caller-supplied --fingerprint (e.g. the live daemon up_since) is carried in the log
+// alongside each REPORT. If the fingerprint at a later already-cleared fire differs from the one
+// recorded at the last REPORT, that is a NEW instance of the condition, not a repeat of the old
+// one, and the gate reports again (REPORT-NEW-FINGERPRINT) instead of suppressing. Omitting
+// --fingerprint reproduces the exact pre-existing behaviour — this is additive, not a replacement.
 import { readFileSync, existsSync, readdirSync, appendFileSync, mkdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
@@ -49,7 +61,7 @@ export function findTask(id, tasksDir) {
 // THE VERDICT IS A PURE FUNCTION SO THE SELF-TEST CAN DRIVE EVERY BRANCH. Ordering matters:
 // a MISSING blocker must report rather than suppress — an id that does not resolve is the
 // symptom-back-reference failure, and suppressing on it would hide a check behind a phantom.
-export function decide({ task, ageDays, maxDays, ageKnown = true, alreadyReportedClear = false }) {
+export function decide({ task, ageDays, maxDays, ageKnown = true, alreadyReportedClear = false, fingerprint, lastReportedFingerprint }) {
   if (!task) {
     return { code: 2, state: 'REPORT', reason: 'blocker id does not resolve to any task — a suppression pointing at a phantom is worse than none' };
   }
@@ -70,6 +82,17 @@ export function decide({ task, ageDays, maxDays, ageKnown = true, alreadyReporte
     // repeating it is the exact noise this gate exists to stop, just on the clear side instead of
     // the still-blocked side.
     if (alreadyReportedClear) {
+      // A CHANGED FINGERPRINT MEANS THIS IS NOT THE SAME FACT. Both sides must be present and
+      // differ — an undefined fingerprint on either side means the caller never opted into this
+      // (or no prior report carried one), and that must reproduce the pre-existing behaviour
+      // exactly: suppress, unconditionally, on the blocker's status alone.
+      if (fingerprint !== undefined && lastReportedFingerprint !== undefined && fingerprint !== lastReportedFingerprint) {
+        return {
+          code: 2,
+          state: 'REPORT-NEW-FINGERPRINT',
+          reason: `blocker is ${task.status} but the fingerprint changed since the last report (${lastReportedFingerprint} -> ${fingerprint}) — a new instance of the underlying condition, not a repeat of the one already reported`,
+        };
+      }
       return { code: 0, state: 'SUPPRESS-ALREADY-REPORTED', reason: `blocker is ${task.status} — already reported as cleared, not re-reporting the same fact` };
     }
     return { code: 2, state: 'REPORT', reason: `blocker is ${task.status} — first fire after it cleared` };
@@ -118,6 +141,37 @@ if (process.argv.includes('--self-test') && IS_MAIN) {
     // PAIRED NEGATIVE: a KNOWN age of zero — a blocker updated seconds ago — must still suppress.
     ['a KNOWN age of zero still suppresses', () =>
       decide({ task: T('blocked'), ageDays: 0, maxDays: 14, ageKnown: true }).code === 0],
+    // RE-ARM ON FINGERPRINT CHANGE (task_1787207549324): an already-cleared blocker whose caller
+    // supplies a fingerprint that DIFFERS from the one recorded at the last report is a NEW
+    // instance of the underlying condition (e.g. the daemon restarted, then went stale again) —
+    // this must REPORT, not repeat SUPPRESS-ALREADY-REPORTED forever on a permanently-completed
+    // blocker.
+    ['alreadyReportedClear + CHANGED fingerprint re-arms and reports', () => {
+      const v = decide({ task: T('completed'), ageDays: 20, maxDays: 14, alreadyReportedClear: true, fingerprint: 'F2', lastReportedFingerprint: 'F1' });
+      return v.code === 2 && v.state === 'REPORT-NEW-FINGERPRINT';
+    }],
+    // PAIRED NEGATIVE: the SAME fingerprint on both sides must still suppress — nothing new
+    // happened, so this is not a case for double-reporting.
+    ['alreadyReportedClear + UNCHANGED fingerprint still suppresses', () =>
+      decide({ task: T('completed'), ageDays: 20, maxDays: 14, alreadyReportedClear: true, fingerprint: 'F1', lastReportedFingerprint: 'F1' }).code === 0],
+    // BACKWARD COMPATIBILITY: a caller that never opts into fingerprints (both sides undefined)
+    // must reproduce the exact pre-existing behaviour — suppress on status alone. Without this,
+    // adding the feature would be a silent behaviour change for the one caller that does not pass
+    // --fingerprint yet.
+    ['no fingerprint supplied at all reproduces prior behaviour (suppresses)', () =>
+      decide({ task: T('completed'), ageDays: 3, maxDays: 14, alreadyReportedClear: true }).code === 0],
+    // PAIRED NEGATIVE: an OPEN blocker ignores fingerprint entirely, same as it ignores
+    // alreadyReportedClear — fingerprint comparison only applies inside the completed/archived
+    // branch, never to a still-open blocker.
+    ['fingerprint has no effect on an open blocker', () =>
+      decide({ task: T('blocked'), ageDays: 3, maxDays: 14, alreadyReportedClear: true, fingerprint: 'F2', lastReportedFingerprint: 'F1' }).code === 0],
+    // A first-fire-after-clear (alreadyReportedClear still false) is REPORT regardless of any
+    // fingerprint value — there is no "last reported" to differ from yet, so this must stay the
+    // plain first-fire state, not REPORT-NEW-FINGERPRINT.
+    ['first fire after clear stays plain REPORT even if a fingerprint is supplied', () => {
+      const v = decide({ task: T('completed'), ageDays: 3, maxDays: 14, alreadyReportedClear: false, fingerprint: 'F1' });
+      return v.code === 2 && v.state === 'REPORT';
+    }],
     // PAIRED NEGATIVE for the whole gate: without this, "always report" passes everything above.
     ['the ONLY suppressing case is open-and-inside-bound', () => {
       const all = [
@@ -148,6 +202,10 @@ if (IS_MAIN && !process.argv.includes('--self-test')) {
   if (!id) { console.log('VERDICT: COULD-NOT-RUN — no task id given'); process.exit(3); }
   const maxDays = Number((process.argv.find((a) => a.startsWith('--max-days=')) || '--max-days=14').split('=')[1]);
   const check = (process.argv.find((a) => a.startsWith('--check=')) || '--check=unnamed').split('=')[1];
+  // OPTIONAL. Absent entirely (not even the empty string) reproduces the exact pre-existing
+  // behaviour — see decide()'s backward-compatibility case.
+  const fingerprintArg = process.argv.find((a) => a.startsWith('--fingerprint='));
+  const fingerprint = fingerprintArg ? fingerprintArg.slice('--fingerprint='.length) : undefined;
   const tasksDir = join(ROOT, 'orgs', ORG, 'tasks');
   if (!existsSync(tasksDir)) { console.log(`VERDICT: COULD-NOT-RUN — no task store at ${tasksDir}`); process.exit(3); }
 
@@ -168,24 +226,36 @@ if (IS_MAIN && !process.argv.includes('--self-test')) {
   // "first fire after it cleared" fact has already reached a reader; reporting it again is the
   // repeat-noise bug this fix closes.
   let alreadyReportedClear = false;
+  // THE FINGERPRINT RECORDED AT THE LAST REPORT-WHILE-CLEARED FIRE, if any. Not break-on-first:
+  // the log is append-only chronological, so the LATEST matching line has to win, and only
+  // scanning to the end (not stopping at the first match) gets that — a re-armed REPORT-NEW-
+  // FINGERPRINT fire is itself a later match this loop must see, or the very next fire would
+  // re-arm again against the stale F1 instead of the F2 it just reported.
+  let lastReportedFingerprint;
   if (existsSync(logPath)) {
     try {
       for (const line of readFileSync(logPath, 'utf8').split('\n')) {
         if (!line.trim()) continue;
         const entry = JSON.parse(line);
-        if (entry.blocker === id && entry.state === 'REPORT' && !OPEN.has(String(entry.blocker_status))) {
+        // 'REPORT' (first fire after clearing) or 'REPORT-NEW-FINGERPRINT' (a re-arm) both count
+        // as "clearing has been reported" — deliberately NOT startsWith('REPORT'), which would
+        // also swallow 'REPORT-AGE-UNKNOWN' (a different fact: the age couldn't be measured, not
+        // that the blocker cleared) if it ever co-occurred with a non-open status.
+        if (entry.blocker === id && (entry.state === 'REPORT' || entry.state === 'REPORT-NEW-FINGERPRINT') && !OPEN.has(String(entry.blocker_status))) {
           alreadyReportedClear = true;
-          break;
+          lastReportedFingerprint = entry.fingerprint;
         }
       }
     } catch {
       // A CORRUPT OR UNREADABLE LOG MUST NOT SUPPRESS AN EXISTING REPORT. Falling back to false
       // (never reported) at worst re-reports once — the safe side, matching every other refusal in
       // this file — rather than risk swallowing a report the caller never actually saw.
+      alreadyReportedClear = false;
+      lastReportedFingerprint = undefined;
     }
   }
 
-  const v = decide({ task, ageDays, maxDays, ageKnown, alreadyReportedClear });
+  const v = decide({ task, ageDays, maxDays, ageKnown, alreadyReportedClear, fingerprint, lastReportedFingerprint });
 
   try {
     mkdirSync(dirname(logPath), { recursive: true });
@@ -193,6 +263,9 @@ if (IS_MAIN && !process.argv.includes('--self-test')) {
       ts: new Date().toISOString(), check, blocker: id,
       blocker_status: task ? task.status : 'NOT-FOUND',
       age_days: Number(ageDays.toFixed(2)), max_days: maxDays, state: v.state,
+      // Only present when the caller opts in — an absent key (not a null) keeps old log lines and
+      // non-fingerprint callers indistinguishable from "never supplied one" on the next scan.
+      ...(fingerprint !== undefined ? { fingerprint } : {}),
     }) + '\n', 'utf8');
   } catch (e) {
     // A LOG FAILURE MUST NOT PRODUCE A SILENT SUPPRESS. If the evidence cannot be written, the
