@@ -688,14 +688,22 @@ export class AgentProcess {
       const dropped = this.pendingInjections.shift();
       if (dropped) {
         this.log(`Inject queue overflow (>${AgentProcess.DRAIN_MAX_QUEUE}) — dropped oldest queued prompt: ${dropped.content.slice(0, 80)}`);
-        // A retry (attempts > 0) sits at the FRONT by design (see
-        // handleQueuedDeliveryFailure), so plain oldest-at-front eviction can
-        // silently re-lose an item that already survived one real delivery
-        // failure — with no attempts budget left to retry it further, this
-        // must escalate the same as delivery-exhaustion does, not just log.
-        if (dropped.attempts > 0) {
-          this.emitDroppedInjectEvent(dropped.content, dropped.attempts, dropped.enqueuedAt, 'queue-overflow-eviction');
-        }
+        // GUARD FOR ONE LEG SUPPRESSING ANOTHER (task_1785507729042, found 2026-08-26). This
+        // guard used to fire ONLY for attempts > 0 — correct about the case it was written
+        // for (a retry sits at the FRONT by design, so plain oldest-at-front eviction can
+        // silently re-lose an item that already survived a real delivery failure) but
+        // silently applied to a case it was never reasoning about: attempts === 0 means the
+        // prompt was NEVER delivered at all, which is not a lesser case than a re-lost retry
+        // — it produced no event, only a log line nothing reads, and every observable signal
+        // (execution log, cron fire record) still says "fired." Removed the guard entirely;
+        // both cases now escalate, distinguished only by reason string, since "never attempted"
+        // and "retry re-lost" are different facts a reader needs to tell apart.
+        this.emitDroppedInjectEvent(
+          dropped.content,
+          dropped.attempts,
+          dropped.enqueuedAt,
+          dropped.attempts > 0 ? 'queue-overflow-eviction' : 'queue-overflow-eviction-never-attempted',
+        );
       }
     }
     this.ensureDrainTimer();

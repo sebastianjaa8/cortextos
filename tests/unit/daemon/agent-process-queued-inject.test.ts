@@ -205,6 +205,56 @@ describe('AgentProcess.injectMessageQueued — turn-boundary drain', () => {
     expect(mockInjectMessage.mock.calls[0][1]).toBe('prompt-5');
   });
 
+  // GUARD FOR ONE LEG SUPPRESSING ANOTHER (task_1785507729042, found 2026-08-26). A prompt
+  // evicted on queue overflow with attempts===0 (never delivered at all, not a re-lost retry)
+  // used to produce NO event — only a log line nothing reads. This must go RED on the
+  // pre-fix guard (`if (dropped.attempts > 0)`) and GREEN once every eviction escalates.
+  it('escalates a queue-overflow eviction even when the dropped item was never attempted (attempts===0)', () => {
+    const { proc } = makeRunningProcess();
+    for (let i = 0; i < 45; i++) {
+      proc.injectMessageQueued(`prompt-${i}`);
+    }
+    // 5 evictions (prompts 0-4), none of which were ever delivered.
+    expect(mockLogEvent).toHaveBeenCalledTimes(5);
+    for (const call of mockLogEvent.mock.calls) {
+      const [, , , category, eventName, severity, metadata] = call;
+      expect(category).toBe('error');
+      expect(eventName).toBe('cron_inject_dropped');
+      expect(severity).toBe('critical');
+      expect(metadata).toMatchObject({ attempts: 0, reason: 'queue-overflow-eviction-never-attempted' });
+    }
+  });
+
+  // PAIRED NEGATIVE: a retry (attempts > 0) evicted on overflow must keep the ORIGINAL reason
+  // string, not collapse into the new never-attempted one — the two facts are different and a
+  // reader needs to tell a re-lost retry apart from a prompt that was never delivered at all.
+  it('keeps the original reason string when a queue-overflow eviction lands on a real retry', () => {
+    const { proc } = makeRunningProcess();
+    proc.injectMessageQueued('will-fail-then-get-evicted');
+
+    // Deliver it once, then fail it — re-queued at the front with attempts=1.
+    vi.advanceTimersByTime(TICK * 2);
+    expect(mockInjectMessage).toHaveBeenCalledTimes(1);
+    mockInjectMessage.mock.calls[0][3].onFailed();
+    mockLogEvent.mockClear();
+
+    // The retried item was re-queued at the FRONT (unshift), so it is the "oldest" for
+    // eviction purposes (shift() removes index 0) even though it is not chronologically
+    // oldest. Fill to EXACTLY the cap first (1 retried + 39 fillers = 40, no overflow yet),
+    // then one more push triggers the drop of the front — which by construction is the
+    // retried item, not any of the fresh fillers behind it.
+    const DRAIN_MAX_QUEUE = 40; // private static on AgentProcess; mirrored here, see class comment
+    for (let i = 0; i < DRAIN_MAX_QUEUE - 1; i++) {
+      proc.injectMessageQueued(`filler-${i}`);
+    }
+    expect(mockLogEvent).not.toHaveBeenCalled(); // exactly at cap, no overflow yet
+
+    proc.injectMessageQueued('one-more-to-overflow');
+    expect(mockLogEvent).toHaveBeenCalledTimes(1);
+    const [, , , , , , metadata] = mockLogEvent.mock.calls[0];
+    expect(metadata).toMatchObject({ attempts: 1, reason: 'queue-overflow-eviction' });
+  });
+
   describe('dropped catch-up inject detection (root-cause fix 2026-07-23)', () => {
     it('re-queues a verifiably-failed delivery ahead of newer queued items', () => {
       const { proc } = makeRunningProcess();
