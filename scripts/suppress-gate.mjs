@@ -85,13 +85,25 @@ export function decide({ task, ageDays, maxDays, ageKnown = true, alreadyReporte
       // A CHANGED FINGERPRINT MEANS THIS IS NOT THE SAME FACT. Both sides must be present and
       // differ — an undefined fingerprint on either side means the caller never opted into this
       // (or no prior report carried one), and that must reproduce the pre-existing behaviour
-      // exactly: suppress, unconditionally, on the blocker's status alone.
+      // exactly: suppress, unconditionally, on the blocker's status alone. Checked FIRST — the
+      // faster of the two triggers, since a fingerprint change is detectable the moment it happens
+      // rather than waiting on the age bound below.
       if (fingerprint !== undefined && lastReportedFingerprint !== undefined && fingerprint !== lastReportedFingerprint) {
         return {
           code: 2,
           state: 'REPORT-NEW-FINGERPRINT',
           reason: `blocker is ${task.status} but the fingerprint changed since the last report (${lastReportedFingerprint} -> ${fingerprint}) — a new instance of the underlying condition, not a repeat of the one already reported`,
         };
+      }
+      // AGE-BOUND BACKSTOP (found live 2026-08-27, TG9823 crossed 14.18d suppressed with no
+      // report). The bound below (for the still-OPEN branch) never reached a completed blocker —
+      // this branch returned SUPPRESS-ALREADY-REPORTED unconditionally, so a completed blocker
+      // with no fingerprint change could suppress FOREVER, exactly the "muted-until-someone-
+      // remembers" state the bound exists to make impossible. seb_boss's ruling: the bound is a
+      // universal backstop, not conditional on which branch — fingerprint is the earlier/faster
+      // trigger, the age bound is what fires regardless if fingerprint never does.
+      if (ageDays >= maxDays) {
+        return { code: 2, state: 'REPORT-BOUND-EXCEEDED', reason: `suppressed ${ageDays.toFixed(1)}d on a ${maxDays}d bound (blocker ${task.status}, already reported cleared) — verify the underlying condition is still worth muting rather than assumed` };
       }
       return { code: 0, state: 'SUPPRESS-ALREADY-REPORTED', reason: `blocker is ${task.status} — already reported as cleared, not re-reporting the same fact` };
     }
@@ -151,9 +163,33 @@ if (process.argv.includes('--self-test') && IS_MAIN) {
       return v.code === 2 && v.state === 'REPORT-NEW-FINGERPRINT';
     }],
     // PAIRED NEGATIVE: the SAME fingerprint on both sides must still suppress — nothing new
-    // happened, so this is not a case for double-reporting.
-    ['alreadyReportedClear + UNCHANGED fingerprint still suppresses', () =>
-      decide({ task: T('completed'), ageDays: 20, maxDays: 14, alreadyReportedClear: true, fingerprint: 'F1', lastReportedFingerprint: 'F1' }).code === 0],
+    // happened, so this is not a case for double-reporting. ageDays kept BELOW maxDays
+    // deliberately — this tests the fingerprint-unchanged path in isolation, not the age-bound
+    // backstop (that has its own cases below now that the backstop applies here too).
+    ['alreadyReportedClear + UNCHANGED fingerprint still suppresses (inside the age bound)', () =>
+      decide({ task: T('completed'), ageDays: 3, maxDays: 14, alreadyReportedClear: true, fingerprint: 'F1', lastReportedFingerprint: 'F1' }).code === 0],
+    // AGE-BOUND BACKSTOP APPLIES TO THE COMPLETED BRANCH TOO (found live 2026-08-27, TG9823
+    // crossed 14.18d suppressed with no report — the bound used to only live in the still-OPEN
+    // branch, so a completed blocker with no fingerprint change could suppress FOREVER). This is
+    // the must-fail case: past the bound, even with a fingerprint that never changed, must REPORT.
+    ['alreadyReportedClear + UNCHANGED fingerprint PAST the age bound still reports (backstop)', () => {
+      const v = decide({ task: T('completed'), ageDays: 14.5, maxDays: 14, alreadyReportedClear: true, fingerprint: 'F1', lastReportedFingerprint: 'F1' });
+      return v.code === 2 && v.state === 'REPORT-BOUND-EXCEEDED';
+    }],
+    // SAME BACKSTOP, NO FINGERPRINT AT ALL — this is the exact shape of the live bug: TG9823 was
+    // never passed a fingerprint until the day this fix landed, so every prior fire took this path.
+    ['alreadyReportedClear + NO fingerprint PAST the age bound still reports (backstop)', () => {
+      const v = decide({ task: T('completed'), ageDays: 14.5, maxDays: 14, alreadyReportedClear: true });
+      return v.code === 2 && v.state === 'REPORT-BOUND-EXCEEDED';
+    }],
+    // ORDERING: a CHANGED fingerprint past the bound reports as REPORT-NEW-FINGERPRINT, not
+    // REPORT-BOUND-EXCEEDED — the fingerprint is the faster/earlier trigger and must win when both
+    // conditions are true, since it carries more specific information (what changed, not just that
+    // time passed).
+    ['CHANGED fingerprint past the age bound reports as NEW-FINGERPRINT, not bound-exceeded', () => {
+      const v = decide({ task: T('completed'), ageDays: 14.5, maxDays: 14, alreadyReportedClear: true, fingerprint: 'F2', lastReportedFingerprint: 'F1' });
+      return v.code === 2 && v.state === 'REPORT-NEW-FINGERPRINT';
+    }],
     // BACKWARD COMPATIBILITY: a caller that never opts into fingerprints (both sides undefined)
     // must reproduce the exact pre-existing behaviour — suppress on status alone. Without this,
     // adding the feature would be a silent behaviour change for the one caller that does not pass
