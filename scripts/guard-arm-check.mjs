@@ -41,7 +41,8 @@
 // UNVERIFIABLE as 3, this file mapped the same verdict to 2, and both headers claimed 3 meant
 // could-not-run. The conflation this file's comments forbid was living in the gap between the two.
 import { execSync } from 'node:child_process';
-import { statSync, existsSync, readFileSync } from 'node:fs';
+import { statSync, existsSync, readFileSync, appendFileSync, mkdirSync } from 'node:fs';
+import { dirname } from 'node:path';
 // The provenance logic lives in scripts/, not here. NOT because this file is untracked — I wrote
 // that first and it was wrong: `git ls-files` shows THIS file is tracked, along with 11 other
 // orgs/ files, because .gitignore does not apply to paths already added. The reason is the other
@@ -51,6 +52,29 @@ import { verdict as stampVerdict, currentProvenance, readStamp } from './build-s
 
 const REPO = 'C:/Users/Sebas/cortextos';
 const BUNDLE = `${REPO}/dist/daemon.js`;
+const CTX_ROOT = (process.env.CTX_ROOT || `${process.env.HOME}/.cortextos/default`).replace(/\\/g, '/');
+
+// RECEIPT ON EVERY EXIT PATH, INCLUDING SILENT-CLEAN. This check was CENSORED by
+// cron-effectiveness-audit (2026-09-22, task_1790037134956) — silent-on-success by design, so
+// a silent-streak audit cannot tell "ran clean N times" from "never ran": there was no artifact
+// distinguishing the two. Same class as kb-ingest-gap-check.mjs's own receipt (that one already
+// had this, and its receipt is what proved IT wasn't censored — 8/8 real runs in 48h, varying
+// findings counts, not boilerplate). This does not violate "exit 0: exit silently, no bus
+// message, no memory write" — a local append-only receipt is neither.
+function writeReceipt(code, verdictLabel, detail) {
+  try {
+    const receiptPath = `${CTX_ROOT}/state/builder_1/.guard-arm-check-receipts.jsonl`;
+    mkdirSync(dirname(receiptPath), { recursive: true });
+    appendFileSync(
+      receiptPath,
+      JSON.stringify({ ts: new Date().toISOString(), cron: 'guard-arm-check', code, verdict: verdictLabel, detail }) + '\n',
+    );
+  } catch (err) {
+    // Receipt failure must never mask or replace the real verdict already printed to stdout —
+    // same discipline as kb-ingest-gap-check.mjs's own try/catch around its receipt write.
+    console.log(`NOTE: verdict stands but the receipt could not be written (${err.message}).`);
+  }
+}
 
 /**
  * Pure verdict logic, so --self-test can drive it with fabricated times.
@@ -176,6 +200,7 @@ if (process.argv.includes('--self-test')) selfTest();
 
 function fail(msg) {
   console.log(`VERDICT: COULD-NOT-RUN — ${msg}`);
+  writeReceipt(3, 'COULD-NOT-RUN', msg);
   // Distinct from 2 on purpose: "the check is broken" and "the check found something" were the
   // same exit code once, and that is what let a wrong invocation read as a real finding.
   process.exit(3);
@@ -248,4 +273,10 @@ console.log(`C daemon up_since   ${input.daemonUpSince.toISOString()} (pid ${pro
 
 const { code, lines } = verdict(input);
 lines.forEach((l) => console.log(l));
+// Multiple findings can co-occur (e.g. STALE-BUNDLE and STALE-DAEMON in the same run) — join
+// rather than pick one, so the receipt never under-reports what actually fired.
+const verdictLines = lines.filter((l) => l.startsWith('VERDICT:'));
+const verdictLabel = verdictLines.map((l) => l.replace(/^VERDICT:\s*/, '').split(' — ')[0]).join('+') || 'CURRENT';
+const verdictDetail = verdictLines.map((l) => l.replace(/^VERDICT:\s*/, '')).join(' | ');
+writeReceipt(code, verdictLabel, verdictDetail);
 process.exit(code);
