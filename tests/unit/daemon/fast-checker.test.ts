@@ -1494,6 +1494,11 @@ describe('FastChecker', () => {
         .map(f => JSON.parse(readFileSync(join(dir, f), 'utf-8')));
     }
 
+    // Fork policy (see the observe-only describe above): with
+    // ctx_handoff_threshold unset the monitor never acts, so these scenarios
+    // opt in explicitly at upstream's default 60% handoff threshold.
+    const OPTED_IN = { ctx_handoff_threshold: 60 };
+
     // Default (claude) runtime grace window is 120_000ms — advance past it.
     const GRACE_MS = 120_000;
 
@@ -1503,7 +1508,7 @@ describe('FastChecker', () => {
       vi.setSystemTime(t0);
       const agent = makeCtxAgent();
       const checker = new FastChecker(agent, paths, frameworkRoot);
-      writeConfig({});
+      writeConfig(OPTED_IN);
 
       // Birth an anchored session already above the 60% handoff threshold.
       writeCtxStatus(72, 'sess-heavy');
@@ -1539,7 +1544,7 @@ describe('FastChecker', () => {
       vi.setSystemTime(t0);
       const agent = makeCtxAgent();
       const checker = new FastChecker(agent, paths, frameworkRoot);
-      writeConfig({});
+      writeConfig(OPTED_IN);
 
       writeCtxStatus(20, 'sess-grow');
       await (checker as any).checkContextStatus(); // within grace
@@ -1564,7 +1569,7 @@ describe('FastChecker', () => {
       vi.setSystemTime(t0);
       const agent = makeCtxAgent();
       const checker = new FastChecker(agent, paths, frameworkRoot);
-      writeConfig({});
+      writeConfig(OPTED_IN);
 
       writeCtxStatus(62, 'sess-margin');
       await (checker as any).checkContextStatus(); // within grace
@@ -1588,7 +1593,7 @@ describe('FastChecker', () => {
     it('D: an un-anchored session (no session_id) still hands off at threshold — legacy path', async () => {
       const agent = makeCtxAgent();
       const checker = new FastChecker(agent, paths, frameworkRoot);
-      writeConfig({});
+      writeConfig(OPTED_IN);
 
       // No session_id → ctxSessionStartedAt never set → baseline never captured.
       writeCtxStatus(65);
@@ -1607,13 +1612,14 @@ describe('FastChecker', () => {
       const log = vi.fn();
       const checker = new FastChecker(createMockAgent(), paths, '/tmp/framework', { log }) as any;
       // Hold the inbox lock from "another process" so checkInbox's acquire is refused.
-      const lockHandle = acquireLock(paths.inbox);
-      expect(lockHandle).not.toBe(false);
+      // Fork lock API: boolean acquire, token-fenced releaseLock(dir).
+      const held = acquireLock(paths.inbox);
+      expect(held).toBe(true);
 
       try {
         await checker.pollCycle();
       } finally {
-        if (lockHandle) releaseLock(lockHandle);
+        if (held) expect(releaseLock(paths.inbox)).toEqual({ status: 'ok' });
       }
 
       expect(log).toHaveBeenCalledWith(expect.stringContaining('Inbox check failed'));
@@ -1622,6 +1628,18 @@ describe('FastChecker', () => {
   });
 
   describe('transport re-queue on inject failure', () => {
+    // Fork divergence from upstream (7d26aab): Telegram is delivered per item
+    // through its own journaled delivery path (one injectMessageDetailed call
+    // per update), not folded into the Buzz/Slack/inbox block. The safety
+    // contract is unchanged: on NOT_RUNNING every drained message goes back in
+    // original order, and on recovery each is delivered exactly once.
+    function deliveredCounts(calls: unknown[][], ids: string[]): Record<string, number> {
+      return Object.fromEntries(ids.map(id => [
+        id,
+        calls.filter(call => String(call[0]).includes(id)).length,
+      ]));
+    }
+
     it('NOT_RUNNING: re-queues drained telegram/buzz/slack in order, then delivers once on recovery', async () => {
       vi.useFakeTimers();
       try {
@@ -1638,26 +1656,35 @@ describe('FastChecker', () => {
         await checker.pollCycle();
 
         // The in-memory queues are the only backing store — a NOT_RUNNING inject
-        // must put every drained message back, at the front, in original order.
+        // must put every drained message back, in original order.
         expect(checker.telegramMessages.map((m: { formatted: string }) => m.formatted)).toEqual(['tg-1', 'tg-2']);
         expect(checker.buzzMessages.map((m: { formatted: string }) => m.formatted)).toEqual(['bz-1']);
         expect(checker.slackMessages).toEqual(['sl-1']);
-        expect(log).toHaveBeenCalledWith(expect.stringContaining('re-queued 4 transport message(s)'));
+        expect(log.mock.calls.filter(c => String(c[0]).includes('Telegram injection skipped'))).toHaveLength(2);
+        expect(log).toHaveBeenCalledWith(expect.stringContaining('2 Buzz/Slack message(s) re-queued'));
 
-        // Recovery: the agent comes back, the next cycle delivers the SAME batch
+        // Recovery: the agent comes back, the next cycle delivers every message
         // exactly once and the queues drain.
+        const failedCalls = agent.injectMessageDetailed.mock.calls.length;
         agent.injectMessageDetailed.mockReturnValue({ ok: true });
         const cycle = checker.pollCycle();
         await vi.advanceTimersByTimeAsync(5000); // post-inject cooldown sleep
         await cycle;
-        const delivered = agent.injectMessageDetailed.mock.calls.at(-1)![0] as string;
-        expect(delivered).toContain('tg-1');
-        expect(delivered).toContain('tg-2');
-        expect(delivered).toContain('bz-1');
-        expect(delivered).toContain('sl-1');
+        const recoveryCalls = agent.injectMessageDetailed.mock.calls.slice(failedCalls);
+        expect(deliveredCounts(recoveryCalls, ['tg-1', 'tg-2', 'bz-1', 'sl-1']))
+          .toEqual({ 'tg-1': 1, 'tg-2': 1, 'bz-1': 1, 'sl-1': 1 });
+        const telegramOrder = recoveryCalls
+          .map(call => String(call[0]))
+          .filter(text => text.startsWith('tg-'));
+        expect(telegramOrder).toEqual(['tg-1', 'tg-2']);
         expect(checker.telegramMessages).toEqual([]);
         expect(checker.buzzMessages).toEqual([]);
         expect(checker.slackMessages).toEqual([]);
+
+        // A further idle cycle replays nothing.
+        const afterRecovery = agent.injectMessageDetailed.mock.calls.length;
+        await checker.pollCycle();
+        expect(agent.injectMessageDetailed.mock.calls.length).toBe(afterRecovery);
       } finally {
         vi.useRealTimers();
       }
@@ -1715,7 +1742,10 @@ describe('FastChecker', () => {
         await vi.advanceTimersByTimeAsync(5000); // post-inject cooldown sleep
         await cycle;
 
-        expect(agent.injectMessageDetailed).toHaveBeenCalledTimes(1);
+        // One per-item Telegram submission + one Buzz/Slack block (fork shape).
+        expect(agent.injectMessageDetailed).toHaveBeenCalledTimes(2);
+        expect(deliveredCounts(agent.injectMessageDetailed.mock.calls, ['tg-ok', 'bz-ok', 'sl-ok']))
+          .toEqual({ 'tg-ok': 1, 'bz-ok': 1, 'sl-ok': 1 });
         expect(checker.telegramMessages).toEqual([]);
         expect(checker.buzzMessages).toEqual([]);
         expect(checker.slackMessages).toEqual([]);
