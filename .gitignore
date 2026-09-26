@@ -1,4 +1,7 @@
-node_modules/
+# No trailing slash: `node_modules/` matches only real directories, so a
+# SYMLINKED node_modules (common in worktree checkouts) evades it and can be
+# committed — which once took down every agent sharing this checkout's bus.
+node_modules
 .claude/
 !.claude/commands/
 !.claude/commands/**
@@ -84,3 +87,10 @@ docs/phase-reports/
 # Python bytecode, anywhere. Added 2026-08-07: scripts/__pycache__/ was showing as untracked
 # because only knowledge-base/**/__pycache__/ was covered, never the repo-root scripts/ dir.
 __pycache__/
+
+# claude-to-codex-migration leakage-guard fixture (author-specific ban tokens: fleet
+# roster + specific chat-ids). CI/local ONLY, pointed at by CTX_LEAKAGE_FIXTURE. NEVER
+# public — glob'd broadly so it can never be accidentally committed into the tree.
+leakage-fixture.json
+**/leakage-fixture.json
+*.leakage-fixture.json

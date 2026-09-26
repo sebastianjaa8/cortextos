@@ -72,6 +72,23 @@ export interface RegisterCommandsResult {
   error?: string;
 }
 
+export interface GatedPrInfo {
+  number: number;
+  labeled_at: string | null;
+  age_days: number | null;
+  mergeable: boolean;
+  checks_green: boolean;
+}
+
+export interface MergeGateResult {
+  status: string;
+  gated_queue_depth?: number;
+  oldest_gated_age_days?: number | null;
+  gated_prs?: GatedPrInfo[];
+  error?: string;
+  hint?: string;
+}
+
 // --- collectMetrics ---
 
 /**
@@ -512,6 +529,97 @@ export function checkUpstream(
     commit_log: commitLog,
     changes,
     ...(catalog_additions.length > 0 ? { catalog_additions } : {}),
+  };
+}
+
+// --- checkMergeGateMetrics ---
+
+const REPO_PATTERN = /^[\w.-]+\/[\w.-]+$/;
+const LABEL_PATTERN = /^[\w.-]+$/;
+
+/**
+ * gated_queue_depth / oldest_gated_age_days: throughput observability for a
+ * merge-decision bottleneck. Canonical source is the `merge-ready` gh label —
+ * operator-applied once review PASS + sandbox + bake have all elapsed,
+ * removed on merge or regress. This function never applies or creates the
+ * label; it only reads state.
+ *
+ * A PR counts as gated only when it carries the label AND gh reports it
+ * mergeable AND every check in statusCheckRollup is green — the label is the
+ * human gate, mergeable+checks-green is the machine gate, and both must agree.
+ * A forgotten label undercounts; that is the deliberately safe failure
+ * direction, so gated_queue_depth/oldest_gated_age_days are a documented lower
+ * bound, not an exact count.
+ */
+export function checkMergeGateMetrics(
+  repo: string,
+  options: { label?: string } = {},
+): MergeGateResult {
+  const label = options.label || 'merge-ready';
+  if (!REPO_PATTERN.test(repo)) {
+    return { status: 'error', error: `invalid repo: ${repo}` };
+  }
+  if (!LABEL_PATTERN.test(label)) {
+    return { status: 'error', error: `invalid label: ${label}` };
+  }
+
+  const execOpts = { encoding: 'utf-8' as const, timeout: 30000, stdio: 'pipe' as const };
+
+  interface RawPr {
+    number: number;
+    mergeable: string;
+    statusCheckRollup?: Array<{ conclusion: string | null }>;
+  }
+
+  let prs: RawPr[];
+  try {
+    const raw = execSync(
+      `gh pr list --repo ${repo} --state open --label ${label} --json number,mergeable,statusCheckRollup`,
+      execOpts,
+    );
+    prs = JSON.parse(raw);
+  } catch (err) {
+    return { status: 'error', error: `failed to list "${label}"-labeled PRs`, hint: err instanceof Error ? err.message : String(err) };
+  }
+
+  const gated: GatedPrInfo[] = [];
+
+  for (const pr of prs) {
+    const mergeable = pr.mergeable === 'MERGEABLE';
+    const checks = pr.statusCheckRollup || [];
+    const checksGreen = checks.length > 0 && checks.every(
+      (c) => c.conclusion === 'SUCCESS' || c.conclusion === 'NEUTRAL' || c.conclusion === 'SKIPPED',
+    );
+
+    if (!mergeable || !checksGreen) continue;
+
+    let labeledAt: string | null = null;
+    try {
+      const timeline = execSync(
+        `gh api repos/${repo}/issues/${pr.number}/timeline --jq '.[] | select(.event=="labeled" and .label.name=="${label}") | .created_at'`,
+        execOpts,
+      ).trim();
+      const timestamps = timeline.split('\n').filter(Boolean);
+      // Most recent application of the label to this PR — safe against stale
+      // history if the label was ever removed (regress) and reapplied.
+      labeledAt = timestamps.length > 0 ? timestamps[timestamps.length - 1] : null;
+    } catch { /* leave null; PR still counts toward depth, just lacks an age */ }
+
+    const ageDays = labeledAt ? (Date.now() - new Date(labeledAt).getTime()) / (1000 * 60 * 60 * 24) : null;
+
+    gated.push({ number: pr.number, labeled_at: labeledAt, age_days: ageDays, mergeable, checks_green: checksGreen });
+  }
+
+  // oldest_gated_age_days = age of whichever gated PR was labeled earliest
+  // (the smallest labeled_at timestamp in the set, i.e. the longest-waiting PR).
+  const withAge = gated.filter((g): g is GatedPrInfo & { age_days: number } => g.age_days !== null);
+  const oldestAgeDays = withAge.length > 0 ? Math.max(...withAge.map((g) => g.age_days)) : null;
+
+  return {
+    status: 'ok',
+    gated_queue_depth: gated.length,
+    oldest_gated_age_days: oldestAgeDays,
+    gated_prs: gated,
   };
 }
 

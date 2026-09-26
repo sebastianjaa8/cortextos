@@ -12,7 +12,7 @@ import { updateHeartbeat, readAllHeartbeats } from '../bus/heartbeat.js';
 import { selfRestart, hardRestart, autoCommit, checkGoalStaleness, postActivity } from '../bus/system.js';
 import { createExperiment, runExperiment, evaluateExperiment, listExperiments, gatherContext, manageCycle, loadExperimentConfig } from '../bus/experiment.js';
 import { browseCatalog, installCommunityItem, loadPiiNames, prepareSubmission, submitCommunityItem } from '../bus/catalog.js';
-import { collectMetrics, parseUsageOutput, storeUsageData, checkUpstream, collectTelegramCommands, registerTelegramCommands } from '../bus/metrics.js';
+import { collectMetrics, parseUsageOutput, storeUsageData, checkUpstream, checkMergeGateMetrics, collectTelegramCommands, registerTelegramCommands } from '../bus/metrics.js';
 import { createApproval, updateApproval } from '../bus/approval.js';
 import { createReminder, listReminders, ackReminder, pruneReminders } from '../bus/reminders.js';
 import { updateCronFire, parseDurationMs, readCronState } from '../bus/cron-state.js';
@@ -145,7 +145,7 @@ busCommand
     const paths = resolvePaths(env.agentName, env.instanceId, env.org);
     const msgId = sendMessage(paths, env.agentName, to, priority as Priority, text, effectiveReplyTo);
     try {
-      logEvent(paths, env.agentName, env.org, 'message', 'agent_message_sent', 'info', JSON.stringify({ to, priority, msg_id: msgId, reply_to: effectiveReplyTo ?? null, from_file: true }));
+      logEvent(paths, env.agentName, env.org, 'message', 'agent_message_sent', 'info', JSON.stringify({ to, priority, msg_id: msgId, reply_to: effectiveReplyTo ?? null, from_file: true }), { refreshHeartbeat: true });
     } catch { /* non-fatal */ }
     console.log(msgId);
   });
@@ -193,7 +193,7 @@ busCommand
     const paths = resolvePaths(env.agentName, env.instanceId, env.org);
     const msgId = sendMessage(paths, env.agentName, to, priority as Priority, text, effectiveReplyTo);
     try {
-      logEvent(paths, env.agentName, env.org, 'message', 'agent_message_sent', 'info', JSON.stringify({ to, priority, msg_id: msgId, reply_to: effectiveReplyTo ?? null }));
+      logEvent(paths, env.agentName, env.org, 'message', 'agent_message_sent', 'info', JSON.stringify({ to, priority, msg_id: msgId, reply_to: effectiveReplyTo ?? null }), { refreshHeartbeat: true });
     } catch { /* non-fatal */ }
     console.log(msgId);
   });
@@ -203,8 +203,15 @@ busCommand
   .action(() => {
     const env = resolveEnv();
     const paths = resolvePaths(env.agentName, env.instanceId, env.org);
-    const messages = checkInbox(paths);
-    console.log(JSON.stringify(messages));
+    // An unavailable inbox lock must exit nonzero with an error — printing []
+    // would be indistinguishable from a successfully-read empty inbox.
+    try {
+      const messages = checkInbox(paths);
+      console.log(JSON.stringify(messages));
+    } catch (err) {
+      console.error(`check-inbox failed: ${err instanceof Error ? err.message : String(err)}`);
+      process.exitCode = 1;
+    }
   });
 
 busCommand
@@ -215,7 +222,7 @@ busCommand
     const paths = resolvePaths(env.agentName, env.instanceId, env.org);
     ackInbox(paths, id);
     try {
-      logEvent(paths, env.agentName, env.org, 'message', 'inbox_ack', 'info', JSON.stringify({ msg_id: id }));
+      logEvent(paths, env.agentName, env.org, 'message', 'inbox_ack', 'info', JSON.stringify({ msg_id: id }), { refreshHeartbeat: true });
     } catch { /* non-fatal */ }
     console.log(`ACK'd ${id}`);
   });
@@ -623,14 +630,16 @@ busCommand
   .command('list-tasks')
   .option('--agent <name>', 'Filter by agent')
   .option('--status <s>', 'Filter by status')
+  .option('--project <name>', 'Filter by project (e.g. human-tasks)')
   .option('--format <fmt>', 'Output format: json or text', 'text')
   .option('--respect-deps', 'Sort DAG-aware: unblocked tasks first, blocked tasks last')
-  .action((opts: { agent?: string; status?: string; format?: string; respectDeps?: boolean }) => {
+  .action((opts: { agent?: string; status?: string; project?: string; format?: string; respectDeps?: boolean }) => {
     const env = resolveEnv();
     const paths = resolvePaths(env.agentName, env.instanceId, env.org);
     const tasks = listTasks(paths, {
       agent: opts.agent,
       status: opts.status as TaskStatus,
+      project: opts.project,
       respectDeps: opts.respectDeps ?? false,
     });
 
@@ -644,26 +653,42 @@ busCommand
       console.log('  No tasks found.');
       return;
     }
-
-    const PRIORITY_ICON: Record<string, string> = { urgent: '🔴', high: '🟠', normal: '🔵', low: '⚪' };
-    const STATUS_ICON: Record<string, string> = { pending: '○', in_progress: '●', blocked: '◑', completed: '✓', done: '✓', cancelled: '✗' };
-
-    console.log(`\n  Tasks (${tasks.length})\n`);
-    const header = '  Status  Pri  ID                        Assignee         Title';
-    const separator = '  ' + '-'.repeat(header.length - 2);
-    console.log(header);
-    console.log(separator);
-
-    for (const t of tasks) {
-      const statusIcon = (STATUS_ICON[t.status] || '?').padEnd(8);
-      const priIcon = (PRIORITY_ICON[t.priority] || '·').padEnd(5);
-      const id = t.id.substring(0, 26).padEnd(26);
-      const assignee = (t.assigned_to || '-').substring(0, 16).padEnd(17);
-      const title = t.title.substring(0, 50);
-      console.log(`  ${statusIcon}${priIcon}${id}${assignee}${title}`);
-    }
-    console.log('');
+    console.log(formatTaskTable(tasks));
   });
+
+/**
+ * Render the list-tasks text table. IDs are copy-paste targets for
+ * update-task/complete-task, so they are NEVER truncated — column widths
+ * come from the data (same pattern as the crons table). Every column is
+ * separated by 2+ spaces; the only column that may truncate is the trailing
+ * title, and truncation is marked with "…". (The previous fixed-width render
+ * cut every 27-char id to 26 with no delimiter before the assignee, which
+ * produced plausible-but-wrong ids when copied.)
+ */
+export function formatTaskTable(tasks: Task[]): string {
+  const PRIORITY_ICON: Record<string, string> = { urgent: '🔴', high: '🟠', normal: '🔵', low: '⚪' };
+  const STATUS_ICON: Record<string, string> = { pending: '○', in_progress: '●', blocked: '◑', completed: '✓', done: '✓', cancelled: '✗' };
+  const TITLE_MAX = 50;
+
+  const idW = Math.max(2, ...tasks.map(t => t.id.length));
+  const assigneeW = Math.max(8, ...tasks.map(t => (t.assigned_to || '-').length));
+
+  const lines: string[] = [];
+  lines.push(`\n  Tasks (${tasks.length})\n`);
+  const header = `  Status  Pri  ${'ID'.padEnd(idW)}  ${'Assignee'.padEnd(assigneeW)}  Title`;
+  lines.push(header);
+  lines.push('  ' + '-'.repeat(header.length - 2));
+  for (const t of tasks) {
+    const statusIcon = (STATUS_ICON[t.status] || '?').padEnd(8);
+    const priIcon = (PRIORITY_ICON[t.priority] || '·').padEnd(5);
+    const id = t.id.padEnd(idW);
+    const assignee = (t.assigned_to || '-').padEnd(assigneeW);
+    const title = t.title.length > TITLE_MAX ? t.title.substring(0, TITLE_MAX - 1) + '…' : t.title;
+    lines.push(`  ${statusIcon}${priIcon}${id}  ${assignee}  ${title}`);
+  }
+  lines.push('');
+  return lines.join('\n');
+}
 
 busCommand
   .command('log-event')
@@ -684,7 +709,7 @@ busCommand
     }
     const env = resolveEnv();
     const paths = resolvePaths(env.agentName, env.instanceId, env.org);
-    logEvent(paths, env.agentName, env.org, category as EventCategory, event, severity as EventSeverity, opts.meta);
+    logEvent(paths, env.agentName, env.org, category as EventCategory, event, severity as EventSeverity, opts.meta, { refreshHeartbeat: true });
     console.log(`Logged ${category}/${event} (${severity})`);
   });
 
@@ -745,7 +770,7 @@ busCommand
     // even if the agent itself forgets to call log-event. This makes the
     // dashboard "agents" list derive from heartbeats, not just explicit events.
     try {
-      logEvent(paths, env.agentName, env.org, 'heartbeat', 'heartbeat', 'info', JSON.stringify({ status, task: opts.task ?? '' }));
+      logEvent(paths, env.agentName, env.org, 'heartbeat', 'heartbeat', 'info', JSON.stringify({ status, task: opts.task ?? '' }), { refreshHeartbeat: true });
     } catch {
       // Non-fatal: heartbeat write already succeeded
     }
@@ -1275,6 +1300,16 @@ busCommand
   });
 
 busCommand
+  .command('collect-merge-gate-metrics')
+  .description('Report gated_queue_depth/oldest_gated_age_days from the gh merge-ready label (canonical source; label lifecycle is operator-owned, this only reads)')
+  .argument('<repo>', 'GitHub repo in owner/name form')
+  .option('--label <name>', 'Label marking review-PASS+bake-elapsed PRs', 'merge-ready')
+  .action((repo: string, opts: { label?: string }) => {
+    const result = checkMergeGateMetrics(repo, { label: opts.label });
+    console.log(JSON.stringify(result, null, 2));
+  });
+
+busCommand
   .command('register-telegram-commands')
   .description('Register skills as Telegram bot commands')
   .argument('<bot-token>', 'Telegram bot token')
@@ -1381,7 +1416,7 @@ busCommand
         try {
           const paths = resolvePaths(env.agentName, env.instanceId, env.org);
           const preview = message.length > 120 ? message.slice(0, 120) + '…' : message;
-          logEvent(paths, env.agentName, env.org, 'message', 'telegram_sent', 'info', JSON.stringify({ chat_id: chatId, message_id: sentMessageId, preview }));
+          logEvent(paths, env.agentName, env.org, 'message', 'telegram_sent', 'info', JSON.stringify({ chat_id: chatId, message_id: sentMessageId, preview }), { refreshHeartbeat: true });
         } catch { /* non-fatal */ }
       }
 
@@ -2281,13 +2316,18 @@ function fmtTs(iso: string | undefined): string {
 
 /**
  * Send a reload-crons IPC signal to the daemon (non-blocking, best-effort).
- * Silently swallows errors — the daemon will pick up changes on its next tick.
+ *
+ * This is a fast-path only: it asks the running scheduler to reload crons.json
+ * immediately.  If the signal cannot be delivered, the edit is NOT lost — the
+ * scheduler's tick loop stats crons.json every 30s and reloads on its own when
+ * the file mtime changes (see CronScheduler.tick mtime guard), so a durable
+ * crons.json edit takes effect within one tick regardless of this signal.
  */
 async function signalCronReload(agentName: string, instanceId: string): Promise<void> {
   try {
     const ipc = new IPCClient(instanceId);
     await ipc.send({ type: 'reload-crons', agent: agentName, source: 'cortextos bus cron-cmd' });
-  } catch { /* non-fatal — scheduler picks up file change on next 30s tick */ }
+  } catch { /* non-fatal — the tick loop detects the crons.json mtime change and reloads within ~30s */ }
 }
 
 busCommand
@@ -2635,9 +2675,17 @@ busCommand
         case 'migrated':
           console.log(
             `Migrated ${agentArg}: ${result.cronsMigrated} cron(s) migrated` +
-            (result.cronsSkipped?.length ? `, ${result.cronsSkipped.length} skipped (${result.cronsSkipped.join(', ')})` : '')
+            (result.cronsSkipped?.length ? `, ${result.cronsSkipped.length} skipped (${result.cronsSkipped.join(', ')})` : '') +
+            (result.cronsRefused?.length ? `, ${result.cronsRefused.length} REFUSED (${result.cronsRefused.join(', ')})` : '')
           );
           break;
+      }
+
+      // An unknown key/type must gate, not just print — checkable by exit
+      // code, not by reading log text.
+      if (result.cronsRefused?.length) {
+        console.error(`migrate-crons: ${result.cronsRefused.length} entr${result.cronsRefused.length === 1 ? 'y' : 'ies'} refused for "${agentArg}" — see REFUSED lines above.`);
+        process.exitCode = 1;
       }
     } else {
       // All-agents migration
@@ -2647,6 +2695,8 @@ busCommand
       const skippedAlready = summary.results.filter(r => r.status === 'skipped-already-migrated').length;
       const noConfig = summary.results.filter(r => r.status === 'no-config').length;
       const noCrons = summary.results.filter(r => r.status === 'no-crons').length;
+      const totalRefused = summary.results.reduce((sum, r) => sum + (r.cronsRefused?.length ?? 0), 0);
+      const agentsWithRefusals = summary.results.filter(r => (r.cronsRefused?.length ?? 0) > 0);
 
       console.log(`\nMigration summary:`);
       console.log(`  Agents processed    : ${summary.processed}`);
@@ -2654,6 +2704,15 @@ busCommand
       console.log(`  Already migrated    : ${skippedAlready}`);
       console.log(`  No config.json      : ${noConfig}`);
       console.log(`  No crons in config  : ${noCrons}`);
+      console.log(`  Entries refused     : ${totalRefused}`);
+
+      if (totalRefused > 0) {
+        console.error(
+          `migrate-crons: ${totalRefused} entr${totalRefused === 1 ? 'y' : 'ies'} refused across ${agentsWithRefusals.length} agent(s) ` +
+          `(${agentsWithRefusals.map(r => r.agentName).join(', ')}) — see REFUSED lines above.`
+        );
+        process.exitCode = 1;
+      }
     }
   });
 
@@ -3067,7 +3126,7 @@ busCommand
                 line: trimmed,
                 session: sessionName,
                 high_signal: isHighSignal,
-              });
+              }, { refreshHeartbeat: true });
             } catch { /* Never fail the stream */ }
           } else {
             logLine(`[event] ${trimmed}`);
@@ -3314,7 +3373,7 @@ Out of scope: ${retired.length} disabled agent(s) — ${retired.join(', ')}. The
           acc[f.kind] = (acc[f.kind] ?? 0) + 1;
           return acc;
         }, {}),
-      });
+      }, { refreshHeartbeat: true });
     } catch { /* non-fatal */ }
 
     // ONE message for the whole fleet, never one per agent. Fourteen separate notifications
@@ -3385,7 +3444,7 @@ busCommand
         }, {}),
         evaluable: result.coverage.evaluable,
         declared: result.coverage.declared,
-      });
+      }, { refreshHeartbeat: true });
     } catch { /* non-fatal */ }
 
     // ONE message for the whole fleet, never one per agent — same rule as check-cron-drift.
@@ -3403,6 +3462,127 @@ busCommand
         `Expectation check: ${result.findings.length} failure(s).\n\n${formatSweep(result)}`,
       );
     } catch { /* the event above already carries the finding */ }
+  });
+
+busCommand
+  .command('send-slack')
+  .description('Send a message to a Slack channel')
+  .argument('<channel>', 'Slack channel ID (e.g. C1234567890) or name (e.g. #general)')
+  .argument('<message>', 'Message text')
+  .action(async (channel: string, message: string) => {
+    const env = resolveEnv();
+    let slackToken = '';
+
+    if (env.agentDir) {
+      const { readFileSync, existsSync } = require('fs');
+      const { join } = require('path');
+      const agentEnv = join(env.agentDir, '.env');
+      if (existsSync(agentEnv)) {
+        const content = readFileSync(agentEnv, 'utf-8') as string;
+        const match = content.match(/^SLACK_BOT_TOKEN=(.+)$/m);
+        if (match?.[1]?.trim()) slackToken = match[1].trim();
+      }
+    }
+
+    if (!slackToken) slackToken = process.env.SLACK_BOT_TOKEN ?? '';
+
+    if (!slackToken) {
+      console.error('Warning: SLACK_BOT_TOKEN not set. Skipping Slack message. Set it in your agent .env file or as SLACK_BOT_TOKEN env var.');
+      process.exit(0);
+    }
+
+    const { SlackAPI } = await import('../slack/api.js');
+    const api = new SlackAPI(slackToken);
+    try {
+      await api.postMessage(channel, message, await resolveSlackDisplayIdentity(env));
+      console.log(`Slack message sent to ${channel}`);
+    } catch (err) {
+      console.error(`Failed to send Slack message: ${err}`);
+      process.exit(1);
+    }
+  });
+
+/** D4 display identity from the agent's slack.json, when present — GATED.
+ * The persona gate is structural: only gateSlackDisplayIdentity can produce a
+ * value postMessage accepts, and it permits nothing but the agent's plain
+ * functional name (custom names/icons loudly suppressed) until the
+ * brand/persona review exists as an authority. */
+async function resolveSlackDisplayIdentity(
+  env: ReturnType<typeof resolveEnv>,
+): Promise<import('../slack/slack-routing.js').GatedDisplayIdentity | undefined> {
+  if (!env.frameworkRoot || !env.org || !env.agentName) return undefined;
+  const { resolveGatedDisplayIdentity } = await import('../slack/slack-routing.js');
+  return resolveGatedDisplayIdentity(env.frameworkRoot, env.org, env.agentName, (line) =>
+    console.error(line),
+  );
+}
+
+/** Shared Slack token resolution: agent .env first, then process env — the
+ * same flow as send-slack so all three commands act as the same identity. */
+function resolveSlackBotToken(env: ReturnType<typeof resolveEnv>): string {
+  if (env.agentDir) {
+    const { readFileSync, existsSync } = require('fs');
+    const { join } = require('path');
+    const agentEnv = join(env.agentDir, '.env');
+    if (existsSync(agentEnv)) {
+      const content = readFileSync(agentEnv, 'utf-8') as string;
+      const match = content.match(/^SLACK_BOT_TOKEN=(.+)$/m);
+      if (match?.[1]?.trim()) return match[1].trim();
+    }
+  }
+  return process.env.SLACK_BOT_TOKEN ?? '';
+}
+
+busCommand
+  .command('slack-test-send')
+  .description('Post a test message to a Slack channel and print the outcome (config verification aid)')
+  .argument('<channel>', 'Slack channel ID (e.g. C1234567890)')
+  .argument('[message]', 'Test message text', 'cortextos slack test message')
+  .action(async (channel: string, message: string) => {
+    const env = resolveEnv();
+    const slackToken = resolveSlackBotToken(env);
+    if (!slackToken) {
+      console.error('Error: SLACK_BOT_TOKEN not set (agent .env or environment).');
+      process.exit(1);
+    }
+    const { SlackAPI } = await import('../slack/api.js');
+    try {
+      await new SlackAPI(slackToken)
+        .postMessage(channel, message, await resolveSlackDisplayIdentity(env));
+      console.log(`OK: test message posted to ${channel}`);
+    } catch (err) {
+      // Unlike send-slack's soft-skip, a TEST send failing is the answer the
+      // operator asked for — exit nonzero with the API's reason.
+      console.error(`FAIL: ${err instanceof Error ? err.message : err}`);
+      process.exit(1);
+    }
+  });
+
+busCommand
+  .command('slack-discover-channels')
+  .description('List Slack channels the bot is a member of, with ids (slack.json authoring aid)')
+  .option('--all', 'Include channels the bot is NOT a member of', false)
+  .action(async (opts: { all?: boolean }) => {
+    const env = resolveEnv();
+    const slackToken = resolveSlackBotToken(env);
+    if (!slackToken) {
+      console.error('Error: SLACK_BOT_TOKEN not set (agent .env or environment).');
+      process.exit(1);
+    }
+    const { SlackAPI } = await import('../slack/api.js');
+    try {
+      const channels = await new SlackAPI(slackToken).listChannels(!opts.all);
+      if (channels.length === 0) {
+        console.log(opts.all ? 'No channels visible to this bot.' : 'Bot is not a member of any channel. Invite it, or use --all to list visible channels.');
+        return;
+      }
+      for (const c of channels) {
+        console.log(`${c.id}\t${c.name}${c.isMember ? '' : '\t(not a member)'}`);
+      }
+    } catch (err) {
+      console.error(`FAIL: ${err instanceof Error ? err.message : err}`);
+      process.exit(1);
+    }
   });
 
 function sleepMs(ms: number): Promise<void> {

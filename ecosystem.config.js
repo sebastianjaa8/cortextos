@@ -27,6 +27,15 @@ module.exports = {
         CTX_ORG: CTX_ORG,
         PATH: process.env.PATH,
         PATHEXT: process.env.PATHEXT,
+        // On by default. global fetch (Undici) hardcodes autoSelectFamily=false
+        // and wedges on broken-dual-stack hosts (IPv6 configured but blackholed)
+        // by committing to the dead family for the full timeout. Routing the
+        // Telegram JSON API calls and file downloads over a dedicated keep-alive
+        // node:https path gives us Happy Eyeballs (autoSelectFamily) instead,
+        // which races the families and self-heals, without breaking IPv6-only
+        // hosts (multipart photo/document uploads stay on pooled fetch). Set to
+        // '0' to opt out and force pooled fetch.
+        CORTEXTOS_TELEGRAM_UNPOOLED_HTTPS: process.env.CORTEXTOS_TELEGRAM_UNPOOLED_HTTPS || '1',
         // Debug-only: set to '1' to enable SIGUSR2 signal → controlled
         // uncaughtException for testing the crash-visibility path
         // (.daemon-crashed markers + crash-loop operator Telegram alert).
