@@ -150,6 +150,7 @@ module.exports = {
         CTX_ORG: CTX_ORG,
         PATH: process.env.PATH,
         PATHEXT: process.env.PATHEXT,
+        CORTEXTOS_TELEGRAM_UNPOOLED_HTTPS: process.env.CORTEXTOS_TELEGRAM_UNPOOLED_HTTPS || '1',
       },
       kill_timeout: ${PM2_SUPERVISOR_POLICY.killTimeoutMs},
       listen_timeout: ${PM2_SUPERVISOR_POLICY.listenTimeoutMs},

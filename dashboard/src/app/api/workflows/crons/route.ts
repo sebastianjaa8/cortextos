@@ -75,28 +75,40 @@ function readAgentCrons(agentName: string): CronDefinition[] {
   }
 }
 
+/**
+ * Last execution entry for EVERY cron of an agent, from ONE pass over the log.
+ *
+ * This replaced a per-cron `readLastExecution(agent, cronName)`, which re-read
+ * and re-parsed the agent's entire cron-execution.log on every call — with 10
+ * crons per agent, ten full reads of the same file per request. /health already
+ * read each agent's log exactly once, which is why it benchmarked several times
+ * faster than /crons over the same dataset. Cost is now O(agents) reads instead
+ * of O(crons).
+ *
+ * Walking backwards and keeping the FIRST hit per cron name preserves the old
+ * "last entry in file order wins" semantics exactly.
+ */
 function readLastExecutions(agentName: string): Map<string, CronExecutionLogEntry> {
+  const byCron = new Map<string, CronExecutionLogEntry>();
   const logPath = path.join(CTX_ROOT, CRONS_DIR, agentName, 'cron-execution.log');
-  const latest = new Map<string, CronExecutionLogEntry>();
-  if (!fs.existsSync(logPath)) return latest;
+  if (!fs.existsSync(logPath)) return byCron;
   try {
     const raw = fs.readFileSync(logPath, 'utf-8');
     const lines = raw.split('\n');
-    // Walk backwards once and keep the first entry seen for each cron.
     for (let i = lines.length - 1; i >= 0; i--) {
       const line = lines[i].trim();
       if (!line) continue;
       try {
         const entry = JSON.parse(line) as CronExecutionLogEntry;
-        if (!latest.has(entry.cron)) latest.set(entry.cron, entry);
+        if (!byCron.has(entry.cron)) byCron.set(entry.cron, entry);
       } catch {
         // skip malformed line
       }
     }
   } catch {
-    return latest;
+    // unreadable log -> no history
   }
-  return latest;
+  return byCron;
 }
 
 // ---------------------------------------------------------------------------
@@ -119,6 +131,7 @@ export async function GET(request: NextRequest) {
 
     for (const agent of agents) {
       const crons = readAgentCrons(agent.name);
+      // One log read per AGENT, reused across that agent's crons.
       const lastExecutions = readLastExecutions(agent.name);
       for (const cron of crons) {
         if (searchFilter && !cron.name.toLowerCase().includes(searchFilter)) continue;

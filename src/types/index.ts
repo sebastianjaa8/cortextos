@@ -238,11 +238,25 @@ export interface AgentConfig {
    */
   opencode_agent?: string;
   /**
+   * Communication connector kind. When absent, the daemon's legacy-compat
+   * resolver infers `'telegram'` iff the agent's .env passes the existing
+   * BOT_TOKEN + CHAT_ID + numeric ALLOWED_USER gate, else `'none'`. Explicit
+   * values override the inference. Added in the pluggable-connectors PR1
+   * (`work/feat-pluggable-connectors/PLAN.md`); follow-up PRs will add
+   * Matrix, RocketChat, and other kinds to this union and the runtime
+   * `CONNECTOR_ALLOWLIST` (`src/connectors/index.ts`) together.
+   */
+  connector?: 'telegram' | 'none';
+  /**
    * Whether this agent runs a Telegram poller. Defaults to true when absent
    * (preserves existing behaviour). Set to false on specialist agents that
    * should not own a Telegram bot — only the designated orchestrator agent
    * should poll. Requires BOT_TOKEN + CHAT_ID to already be unset or the
    * poller will be skipped regardless.
+   *
+   * Note: for connectors other than `'telegram'`, this field is IGNORED
+   * (not an error) — the generic `inbound_polling` successor field lands
+   * with PR2 of the connector stack.
    */
   telegram_polling?: boolean;
 }
@@ -276,6 +290,16 @@ export interface CronEntry {
 //
 // Example records
 // ---------------
+// WARNING: these are crons.json (CronDefinition) examples, not config.json.
+// The `enabled` field shown below belongs to CronDefinition ONLY — CronEntry
+// (config.json, above) has no `enabled` field. Setting `enabled: false` on a
+// config.json cron entry does nothing; it migrates as an enabled live cron
+// regardless. To disable a config.json cron, set `type: "disabled"` instead.
+//
+// Migration REPLACES crons.json, it does not merge: runMigrationCore() (see
+// src/daemon/cron-migration.ts) writes the full crons.json envelope from
+// config.json's crons array alone. A live cron with no config.json
+// counterpart is not preserved — it is deleted on the next migration run.
 //
 // Heartbeat — every 6 hours (interval shorthand):
 // {
@@ -828,6 +852,16 @@ export interface IPCRequest {
    * Optional for backwards compatibility — older clients fall back to 'unknown'.
    */
   source?: string;
+  /**
+   * disable-resurrection fix: for the `stop-agent` command, whether this stop was
+   * directly initiated by the user (`cortextos stop` / `cortextos disable`) — in
+   * which case a queued pendingRestart is DROPPED (stop wins) — vs an internal
+   * stop that is part of a larger restart (`cortextos restart`'s stop-half),
+   * which must set this to false so its own follow-up start-agent is honored via
+   * the pendingRestart path. The handler defaults to true when omitted so plain
+   * stop/disable keep "stop wins".
+   */
+  userInitiated?: boolean;
 }
 
 // Worker Types
@@ -883,4 +917,30 @@ export interface AgentStatus {
   model?: string;
   /** Sanitized startup failure reason for a configured runtime that could not launch. */
   lastError?: string;
+  awaitingConfirmation?: boolean; // first-run observability fix: PTY parked on an
+  // interactive first-run prompt past the auto-accept backstop (wedged, not bootstrapped)
+  dormant?: boolean; // silent-dormancy fix: enabled agent whose heartbeat is stale
+  // relative to its own liveness baseline (uptime, or daemon uptime if absent-from-map)
+  dormancyReason?: string; // human explanation of the dormancy verdict
+}
+
+export type TrustLevel = 'owner' | 'manager' | 'member';
+
+export const VALID_TRUST_LEVELS: TrustLevel[] = ['owner', 'manager', 'member'];
+
+/**
+ * A human team member connected via Slack.
+ * Stored in org config or agent config under team_members.
+ */
+export interface TeamMember {
+  /** Display name (e.g. "Jordan Rivera") */
+  name: string;
+  /** Job role or title (e.g. "Operations Manager") */
+  role: string;
+  /** Slack handle without @ (e.g. "jordan.rivera") */
+  slack_handle: string;
+  /** Trust level — determines how the agent treats messages from this person */
+  trust_level: TrustLevel;
+  /** Optional persona-agent routing hint */
+  assigned_to_agent?: string;
 }

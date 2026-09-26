@@ -29,6 +29,17 @@ const CODEX_SKILLS = join(
   'cortextos-agent-skills',
   'skills',
 );
+const OPENCODE_SKILLS = join(
+  __dirname,
+  '..',
+  '..',
+  '..',
+  'templates',
+  'agent-opencode',
+  'plugins',
+  'cortextos-agent-skills',
+  'skills',
+);
 
 function listSkillDirs(root: string): string[] {
   return readdirSync(root, { withFileTypes: true })
@@ -56,6 +67,26 @@ describe('agent template skill-tree parity', () => {
 
   it('skill counts match exactly', () => {
     expect(listSkillDirs(CODEX_SKILLS).length).toBe(listSkillDirs(CLAUDE_SKILLS).length);
+  });
+
+  it('opencode template ships every skill that the claude template ships', () => {
+    const claudeSkills = listSkillDirs(CLAUDE_SKILLS);
+    const opencodeSkills = listSkillDirs(OPENCODE_SKILLS);
+
+    const missingInOpencode = claudeSkills.filter((skill) => !opencodeSkills.includes(skill));
+    expect(missingInOpencode).toEqual([]);
+  });
+
+  it('opencode template does not ship skills that the claude template lacks', () => {
+    const claudeSkills = listSkillDirs(CLAUDE_SKILLS);
+    const opencodeSkills = listSkillDirs(OPENCODE_SKILLS);
+
+    const extraInOpencode = opencodeSkills.filter((skill) => !claudeSkills.includes(skill));
+    expect(extraInOpencode).toEqual([]);
+  });
+
+  it('opencode skill counts match exactly', () => {
+    expect(listSkillDirs(OPENCODE_SKILLS).length).toBe(listSkillDirs(CLAUDE_SKILLS).length);
   });
 
   it.each([

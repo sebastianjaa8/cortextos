@@ -732,7 +732,12 @@ export class IPCServer {
           } else {
             const insp = this.agentManager.inspectAgentOp('stop', request.agent);
             if (insp.ok) {
-              await this.agentManager.stopAgent(request.agent);
+              // Fork keeps the synchronous await-then-respond shape (unlike
+              // upstream's fire-and-forget dispatch elsewhere in this file) so
+              // an IPC caller's response means the agent is actually stopped,
+              // not just that a stop was accepted. userInitiated (upstream,
+              // disable-resurrection fix) still threads through.
+              await this.agentManager.stopAgent(request.agent, request.userInitiated ?? true);
               response = { success: true, data: `Stopped ${request.agent}` };
             } else {
               console.log(`[ipc] stop-agent ${request.agent}: ${insp.code} — ${insp.message}`);

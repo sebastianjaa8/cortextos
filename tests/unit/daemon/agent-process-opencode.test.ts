@@ -4,6 +4,12 @@ vi.mock('../../../src/utils/process-ownership.js', () => ({
   writeRuntimeProcessRecord: vi.fn((_stateDir, input) => ({ ...input, ownerToken: 'a'.repeat(64) })),
   removeRuntimeProcessRecord: vi.fn(() => true),
   terminateProcessTree: vi.fn(() => true),
+  // bus/event.ts (imported transitively) now pulls in utils/lock.ts, which calls
+  // inspectProcessIdentity(process.pid) at MODULE LOAD TIME -- an unmocked export
+  // here throws immediately on import, not on use (task_1787099506036).
+  inspectProcessIdentity: vi.fn(() => null),
+  probeProcessIdentity: vi.fn(() => ({ status: 'absent' })),
+  processIdentityEquals: vi.fn(() => false),
 }));
 
 let capturedOnExit: ((exitCode: number, signal?: number) => void) | null = null;
