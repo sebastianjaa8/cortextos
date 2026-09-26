@@ -94,6 +94,16 @@ describe('AgentManager.discoverAndStart - BUG-028 fix', () => {
     expect(namesStarted).toEqual(['alice', 'bob']);
   });
 
+  it('does not start hidden directories such as agents/.shared', async () => {
+    mkdirSync(join(frameworkRoot, 'orgs', 'acme', 'agents', '.shared'), { recursive: true });
+    const am = new AgentManager('test-instance', ctxRoot, frameworkRoot, 'acme');
+    const startSpy = vi.spyOn(am, 'startAgent').mockResolvedValue();
+
+    await am.discoverAndStart();
+
+    expect(startSpy.mock.calls.map(call => call[0]).sort()).toEqual(['alice', 'bob']);
+  });
+
   it('starts all discovered agents when enabled-agents.json is empty {}', async () => {
     writeFileSync(join(ctxRoot, 'config', 'enabled-agents.json'), '{}');
     const am = new AgentManager('test-instance', ctxRoot, frameworkRoot, 'acme');
