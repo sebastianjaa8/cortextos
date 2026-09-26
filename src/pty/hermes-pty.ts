@@ -20,7 +20,7 @@ const STARTUP_PROMPT_FILE = '.cortextos-startup.md';
  *
  * Key differences from Claude Code (AgentPTY):
  * - Binary: `hermes` (not `claude`)
- * - Session continuity: `--continue` flag when ~/.hermes/state.db exists
+ * - Session continuity: `--continue` flag when <HERMES_HOME>/state.db exists (HERMES_HOME from the agent .env)
  * - No positional prompt arg: startup prompt written to a temp file and
  *   injected as a short read command after the `❯` prompt appears
  * - Bootstrap signal: `❯` in output (not Claude Code's "permissions" status bar)
@@ -58,12 +58,18 @@ export class HermesPTY extends AgentPTY {
    * temp file to avoid bracketed paste issues (see class-level comment).
    */
   protected buildClaudeArgs(mode: 'fresh' | 'continue', _prompt: string): string[] {
-    // mode='continue' means shouldContinue() returned true — Hermes DB exists.
-    // We pass --continue so Hermes resumes the last session.
+    // --cli: classic prompt_toolkit REPL, the one HERMES_BOOTSTRAP_PATTERN (❯)
+    // matches. --in: pin the workspace to the agent dir, so --continue resumes
+    // the most recent session for THIS agent's workspace, not the profile's
+    // most recent session overall. mode='continue' means shouldContinue()
+    // found state.db in the profile the PTY runs.
+    // No -m (oneshot/tui only; model comes from the profile config.yaml) and
+    // no --yolo (approvals come from the profile's approvals.* config).
+    const args = ['--cli', '--in', this.agentDir];
     if (mode === 'continue') {
-      return ['--continue'];
+      args.push('--continue');
     }
-    return [];
+    return args;
   }
 
   /**

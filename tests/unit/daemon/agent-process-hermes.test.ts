@@ -36,8 +36,12 @@ const mockPty = {
   }),
 };
 
+// readPtyEnvFiles is what shouldContinue() resolves HERMES_HOME from — controlled per-test.
+const mockReadPtyEnvFiles = vi.fn().mockReturnValue({});
+
 vi.mock('../../../src/pty/agent-pty.js', () => ({
   AgentPTY: function AgentPTY() { return mockPty; },
+  readPtyEnvFiles: (...args: unknown[]) => mockReadPtyEnvFiles(...args),
 }));
 
 // hermesDbExists is the key hook — we control it per-test
@@ -59,10 +63,7 @@ vi.mock('../../../src/utils/atomic.js', () => ({
   atomicWriteSync: vi.fn(),
 }));
 
-// Partial mock: resolveHermesHome() now parses the agent .env through the shared
-// parseEnvFile so it agrees with AgentPTY about the same file, so the REAL parser
-// must stay reachable here. Stubbing it out would make this suite pass against a
-// resolver that no longer parses anything.
+// Partial mock: keep the real env.ts helpers reachable; only stub the writers.
 vi.mock('../../../src/utils/env.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../../src/utils/env.js')>()),
   writeCortextosEnv: vi.fn(),
@@ -204,19 +205,38 @@ describe('AgentProcess - Hermes runtime: shouldContinue', () => {
     expect(mockPty.spawn).toHaveBeenCalledWith('continue', expect.any(String));
   });
 
-  it('passes HERMES_HOME env var to hermesDbExists', async () => {
+  it('resolves HERMES_HOME from the PTY env files (agent .env), not the daemon env', async () => {
     const originalHermesHome = process.env['HERMES_HOME'];
-    process.env['HERMES_HOME'] = '/custom/hermes';
+    process.env['HERMES_HOME'] = '/daemon/hermes';
+    mockReadPtyEnvFiles.mockReturnValue({ HERMES_HOME: '/agent/profile' });
     mockHermesDbExists.mockReturnValue(false);
+    try {
+      const ap = new AgentProcess('hermes-agent', mockEnv, { runtime: 'hermes' });
+      await ap.start();
+      expect(mockReadPtyEnvFiles).toHaveBeenCalledWith(mockEnv);
+      expect(mockHermesDbExists).toHaveBeenCalledWith('/agent/profile');
+    } finally {
+      if (originalHermesHome === undefined) delete process.env['HERMES_HOME'];
+      else process.env['HERMES_HOME'] = originalHermesHome;
+      mockReadPtyEnvFiles.mockReturnValue({});
+    }
+  });
 
-    const ap = new AgentProcess('hermes-agent', mockEnv, { runtime: 'hermes' });
-    await ap.start();
-
-    expect(mockHermesDbExists).toHaveBeenCalledWith('/custom/hermes');
-    if (originalHermesHome === undefined) {
-      delete process.env['HERMES_HOME'];
-    } else {
-      process.env['HERMES_HOME'] = originalHermesHome;
+  it('ignores the daemon HERMES_HOME when the env files set none (PTY does not inherit it)', async () => {
+    const originalHermesHome = process.env['HERMES_HOME'];
+    process.env['HERMES_HOME'] = '/daemon/hermes';
+    mockReadPtyEnvFiles.mockReturnValue({ HERMES_HOME: '' });
+    mockHermesDbExists.mockReturnValue(false);
+    try {
+      const ap = new AgentProcess('hermes-agent', mockEnv, { runtime: 'hermes' });
+      await ap.start();
+      // Empty/missing -> undefined -> hermesDbExists falls back to ~/.hermes, the
+      // same default the PTY's hermes process uses.
+      expect(mockHermesDbExists).toHaveBeenCalledWith(undefined);
+    } finally {
+      if (originalHermesHome === undefined) delete process.env['HERMES_HOME'];
+      else process.env['HERMES_HOME'] = originalHermesHome;
+      mockReadPtyEnvFiles.mockReturnValue({});
     }
   });
 

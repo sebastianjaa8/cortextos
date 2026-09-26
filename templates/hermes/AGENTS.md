@@ -20,7 +20,7 @@ Persistent cortextOS agent using the Hermes runtime. Controlled by the bus and o
 
 ## Crons
 
-Crons are daemon-managed. Do not use CronCreate or `/loop` for persistent scheduling.
+Crons are scheduled by the cortextOS daemon (`crons.json`) and arrive as `[CRON FIRED <ts>] <name>: <prompt>` messages. Do not create your own schedules: no `hermes cron` jobs, no `/loop`.
 
 ## Restart
 

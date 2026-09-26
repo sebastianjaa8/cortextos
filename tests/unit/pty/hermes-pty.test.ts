@@ -84,18 +84,35 @@ describe('HermesPTY', () => {
     expect(resolveHermesBinary('C:\\missing;C:\\tools')).toBe(join('C:\\tools', 'hermes.exe'));
   });
 
-  it('buildClaudeArgs returns [] for fresh mode', () => {
+  it('buildClaudeArgs pins classic REPL + agent workspace for fresh mode', () => {
     const pty = new HermesPTY(mockEnv, {});
     const args = (pty as unknown as { buildClaudeArgs(m: string, p: string): string[] })
       .buildClaudeArgs('fresh', 'hello');
-    expect(args).toEqual([]);
+    expect(args).toEqual(['--cli', '--in', mockEnv.agentDir]);
   });
 
-  it('buildClaudeArgs returns ["--continue"] for continue mode', () => {
+  it('buildClaudeArgs adds --continue for continue mode (resume scoped by --in)', () => {
     const pty = new HermesPTY(mockEnv, {});
     const args = (pty as unknown as { buildClaudeArgs(m: string, p: string): string[] })
       .buildClaudeArgs('continue', 'hello');
-    expect(args).toEqual(['--continue']);
+    expect(args).toEqual(['--cli', '--in', mockEnv.agentDir, '--continue']);
+  });
+
+  it('buildClaudeArgs uses working_directory for --in when configured', () => {
+    const pty = new HermesPTY(mockEnv, { working_directory: '/work/dir' });
+    const args = (pty as unknown as { buildClaudeArgs(m: string, p: string): string[] })
+      .buildClaudeArgs('fresh', 'hello');
+    expect(args).toEqual(['--cli', '--in', '/work/dir']);
+  });
+
+  it('never passes -m or --yolo', () => {
+    const pty = new HermesPTY(mockEnv, {});
+    const b = pty as unknown as { buildClaudeArgs(m: string, p: string): string[] };
+    for (const mode of ['fresh', 'continue']) {
+      const args = b.buildClaudeArgs(mode, 'hello');
+      expect(args).not.toContain('-m');
+      expect(args).not.toContain('--yolo');
+    }
   });
 
   it('isBootstrapped() fires on "❯" in output', () => {

@@ -464,10 +464,9 @@ describe('AgentManager.reloadCrons - silent-success bug fix (iter 7)', () => {
   // window would write crons.json, ask the daemon to reload, get a TRUE back,
   // and the cron would never fire — until the next daemon boot.
   //
-  // Fix: lazy-create the scheduler when missing for non-Hermes agents so the
-  // newly-written crons.json is read immediately. Hermes agents intentionally
-  // have no daemon scheduler (they manage crons natively), so for them the
-  // reload remains a no-op that returns true.
+  // Fix: lazy-create the scheduler when missing so the newly-written crons.json
+  // is read immediately. This now includes Hermes agents: their crons are
+  // daemon-scheduled and injected like any other runtime (hermes-runtime-crons).
 
   let testDir: string;
   let ctxRoot: string;
@@ -515,7 +514,7 @@ describe('AgentManager.reloadCrons - silent-success bug fix (iter 7)', () => {
     (am as any).cronSchedulers.get('alice').stop();
   });
 
-  it('returns true without creating a scheduler for Hermes agents (no-op preserved)', () => {
+  it('lazy-creates a scheduler for Hermes agents too (crons are daemon-scheduled)', () => {
     const am = new AgentManager('test-instance', ctxRoot, frameworkRoot, 'acme');
     const fakeProcess = { config: { runtime: 'hermes' } } as any;
     (am as any).agents.set('alice', { process: fakeProcess, checker: {} });
@@ -523,7 +522,8 @@ describe('AgentManager.reloadCrons - silent-success bug fix (iter 7)', () => {
     const result = am.reloadCrons('alice');
 
     expect(result).toBe(true);
-    expect((am as any).cronSchedulers.has('alice')).toBe(false);
+    expect((am as any).cronSchedulers.has('alice')).toBe(true);
+    (am as any).cronSchedulers.get('alice').stop();
   });
 
   it('reuses existing scheduler when one is already wired', () => {
