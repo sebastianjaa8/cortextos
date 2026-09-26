@@ -130,13 +130,15 @@ describe('Message Bus', () => {
       // caller can retry — returning [] here is indistinguishable from a
       // successfully-read empty inbox and silently black-holes every message.
       sendMessage(senderPaths, 'sender', 'receiver', 'normal', 'must not vanish');
+      // Fork lock API: acquireLock(dir) -> boolean, releaseLock(dir) is fenced
+      // by the owner token recorded at acquire (upstream uses a handle).
       const held = acquireLock(receiverPaths.inbox);
-      expect(held).not.toBe(false);
+      expect(held).toBe(true);
       try {
         expect(() => checkInbox(receiverPaths)).toThrow(InboxLockUnavailableError);
         expect(() => checkInbox(receiverPaths)).toThrow(/Inbox lock unavailable/);
       } finally {
-        if (held) releaseLock(held);
+        if (held) expect(releaseLock(receiverPaths.inbox)).toEqual({ status: 'ok' });
       }
       // Once the lock is free the message is still there and delivers — nothing
       // was consumed or lost during the locked window.

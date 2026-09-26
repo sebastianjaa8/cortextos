@@ -310,7 +310,6 @@ describe('Task Management', () => {
       // name must not silently degrade into an unfiltered list.
       expect(listTasks(paths, { project: 'no-such-project' }).length).toBe(0);
     });
-  });
 });
 
 /**
