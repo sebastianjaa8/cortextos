@@ -26,7 +26,7 @@ import { execSync } from 'node:child_process';
 import { existsSync, readFileSync, appendFileSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 
-const REPO = 'C:/Users/Sebas/cortextos';
+const REPO = '/Users/Sebas/cortextos';
 const CTX_ROOT = (process.env.CTX_ROOT || `${process.env.HOME}/.cortextos/default`).replace(/\\/g, '/');
 const DEFAULT_CYCLES = 2;
 

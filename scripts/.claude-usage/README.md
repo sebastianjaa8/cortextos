@@ -5,7 +5,7 @@ Hourly screenshot of `claude.ai/settings/usage` for analyst calibration. Sebasti
 ## First-run (one-time, interactive)
 
 ```bash
-cd /c/Users/Sebas/cortextos/scripts/.claude-usage
+cd /Users/Sebas/cortextos/scripts/.claude-usage
 node claude-usage-scrape.js --visible
 ```
 
@@ -34,7 +34,7 @@ Register-ScheduledTask -TaskName "claude-usage-scrape" -Action $action -Trigger 
 analyst should read latest screenshot per scan:
 
 ```bash
-ls -t /c/Users/Sebas/cortextos/scripts/.claude-usage/screenshots/usage-*.png | head -1
+ls -t /Users/Sebas/cortextos/scripts/.claude-usage/screenshots/usage-*.png | head -1
 ```
 
 Parse via Read multimodal tool. Cap %ages live in the page UI.

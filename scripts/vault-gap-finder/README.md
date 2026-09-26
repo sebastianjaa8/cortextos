@@ -12,7 +12,7 @@ Scans Sebastian's Obsidian vault for knowledge-quality gaps. Built per build men
 
 ```bash
 # Weekly auto-write to vault Knowledge/system/vault-gap-report-<YYYY-MM-DD>.md
-python C:/Users/Sebas/cortextos/scripts/vault-gap-finder/gap_finder.py
+python /Users/Sebas/cortextos/scripts/vault-gap-finder/gap_finder.py
 
 # Just print, don't write
 python gap_finder.py --report-only
@@ -43,7 +43,7 @@ Weekly Sunday morning cron via cortextos:
 # In seb_boss crons.json
 - name: vault-gap-finder-weekly
   schedule: "0 8 * * 0"  # Sunday 8am ET
-  command: "python C:/Users/Sebas/cortextos/scripts/vault-gap-finder/gap_finder.py"
+  command: "python /Users/Sebas/cortextos/scripts/vault-gap-finder/gap_finder.py"
   on_fire: "Surface report to Sebastian if delta vs last week (more orphans / new dead-ends) > 10%"
 ```
 
@@ -51,7 +51,7 @@ Sunday brief surfaces the report. Sebastian reviews + fixes any new gaps. Idempo
 
 ## Output location
 
-`C:/Users/Sebas/OneDrive/Documentos/Obsidian Vault/Knowledge/system/vault-gap-report-<YYYY-MM-DD>.md`
+`/Users/Sebas/Library/CloudStorage/OneDrive-Personal/Documentos/Obsidian Vault/Knowledge/system/vault-gap-report-<YYYY-MM-DD>.md`
 
 ## Baseline (first run 2026-05-28)
 

@@ -23,7 +23,7 @@
 set -uo pipefail
 
 HOME_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"   # analyst agent home (absolute)
-REPO_DIR="/c/Users/Sebas/cortextos"                          # for auto-commit git evidence
+REPO_DIR="/Users/Sebas/cortextos"                          # for auto-commit git evidence
 NOW=$(date -u +%s)
 GRACE_MIN=${CRON_EV_GRACE_MIN:-45}   # LLM-cron handler needs minutes; 45min absorbs herd serial-delay
 # (raised 30->45 2026-06-28: theta-wave-pulse self-flagged when co-fired crons serialized its own

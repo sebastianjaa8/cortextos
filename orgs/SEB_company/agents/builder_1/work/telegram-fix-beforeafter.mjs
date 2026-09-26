@@ -20,7 +20,7 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
 const SELF = fileURLToPath(import.meta.url);
-const REPO = 'C:/Users/Sebas/cortextos';
+const REPO = '/Users/Sebas/cortextos';
 const API = path.join(REPO, 'src/telegram/api.ts');
 
 if (process.argv[2] === '--one') {

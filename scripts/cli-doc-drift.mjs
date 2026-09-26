@@ -22,7 +22,7 @@ import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 
-const REPO = 'C:/Users/Sebas/cortextos';
+const REPO = '/Users/Sebas/cortextos';
 const CLI = path.join(REPO, 'dist/cli.js');
 const JSON_OUT = process.argv.includes('--json');
 

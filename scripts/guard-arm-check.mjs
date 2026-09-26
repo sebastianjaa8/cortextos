@@ -50,7 +50,7 @@ import { dirname } from 'node:path';
 // must not reach into one user's org data for a build step. See scripts/build-stamp.mjs.
 import { verdict as stampVerdict, currentProvenance, readStamp } from './build-stamp.mjs';
 
-const REPO = 'C:/Users/Sebas/cortextos';
+const REPO = '/Users/Sebas/cortextos';
 const BUNDLE = `${REPO}/dist/daemon.js`;
 const CTX_ROOT = (process.env.CTX_ROOT || `${process.env.HOME}/.cortextos/default`).replace(/\\/g, '/');
 

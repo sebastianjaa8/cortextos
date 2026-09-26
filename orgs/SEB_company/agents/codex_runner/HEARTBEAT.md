@@ -99,7 +99,7 @@ Patterns / user preferences / system behaviors learned this cycle → append.
 ## Step 10: KB re-ingest
 ```bash
 FT_KB_SKIP_UNCHANGED=1 \
-  node C:/Users/Sebas/cortextos/scripts/kb-ingest-receipt.mjs \
+  node /Users/Sebas/cortextos/scripts/kb-ingest-receipt.mjs \
   --agent $CTX_AGENT_NAME --org $CTX_ORG ./MEMORY.md \
   --optional ./memory/$(date -u +%Y-%m-%d).md
 ```

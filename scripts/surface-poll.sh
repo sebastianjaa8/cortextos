@@ -14,8 +14,8 @@ LOG_FILE="$SCRIPT_DIR/.surface-poll.log"
 RELAYED_FILE="$SCRIPT_DIR/.surface-poll-relayed.jsonl"
 CHAT_ID="8788724873"
 NOW_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-INBOX_DIR="/c/Users/Sebas/.cortextos/default/inbox/seb_boss"
-PROCESSED_DIR="/c/Users/Sebas/.cortextos/default/processed/seb_boss"
+INBOX_DIR="/Users/Sebas/.cortextos/default/inbox/seb_boss"
+PROCESSED_DIR="/Users/Sebas/.cortextos/default/processed/seb_boss"
 BRIDGE_DIR="$SCRIPT_DIR/.bus-to-chat-bridge"
 BRIDGE_STATE="$BRIDGE_DIR/last-scan.txt"
 
@@ -34,7 +34,7 @@ if [ -d "$INBOX_DIR/.lock.d" ]; then
   fi
   # If lock dir >1h old AND pid file empty/missing → clear it
   if [ "$LOCK_AGE" -gt 3600 ] && [ "$PID_FILE_SIZE" -eq 0 ]; then
-    TRASH="/c/Users/Sebas/OneDrive/Documentos/07_Archive/claude-trash/$(date -u +%Y-%m-%d)/surface-poll-stale-lock-$NOW_UTC"
+    TRASH="/Users/Sebas/.claude-trash/$(date -u +%Y-%m-%d)/surface-poll-stale-lock-$NOW_UTC"
     mkdir -p "$TRASH"
     mv -f "$INBOX_DIR/.lock.d" "$TRASH/" 2>/dev/null && \
       echo "$NOW_UTC self_heal_stale_lock age=${LOCK_AGE}s -> trash" >> "$LOG_FILE"

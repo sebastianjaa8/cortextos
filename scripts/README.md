@@ -37,7 +37,7 @@ Get-ScheduledTask -TaskName "cortextos-surface-poll" | Get-ScheduledTaskInfo
 schtasks /query /tn cortextos-surface-poll /v /fo LIST
 ```
 
-**Log file:** `tail -20 C:/Users/Sebas/cortextos/scripts/.surface-poll.log`
+**Log file:** `tail -20 /Users/Sebas/cortextos/scripts/.surface-poll.log`
 
 **Health-check:** seb_boss hourly-pulse cron checks mtime of `.surface-poll.log`. If last entry >15min old → bundles "surface-poll STALE" alert into pulse Telegram.
 

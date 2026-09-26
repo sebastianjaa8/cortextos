@@ -53,7 +53,7 @@ Spec: task_1781451630869_9938334 · built by builder_1 · 2026-06-30
 ## Wiring (NOT done by builder_1 — seb_boss to register; mutating seb_boss runtime is its call)
 Either fold into the existing unified-watchdog routine (alongside boot-liveness-check.sh /
 check-poke-unconfirmed.sh):
-    python /c/Users/Sebas/cortextos/orgs/SEB_company/agents/seb_boss/scripts/cron-effectiveness-audit.py --quiet
+    python /Users/Sebas/cortextos/orgs/SEB_company/agents/seb_boss/scripts/cron-effectiveness-audit.py --quiet
 or register a standalone cron (every 6h, offset off the :00 stampede):
     cortextos bus add-cron seb_boss cron-effectiveness "30 */6 * * *" \
       "Run scripts/cron-effectiveness-audit.py to flag crons firing without producing bus events."
