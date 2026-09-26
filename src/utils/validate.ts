@@ -155,6 +155,7 @@ export function wrapFenceSafe(input: string): string {
  */
 export const DAEMON_STRUCTURAL_HEADERS = [
   'AGENT MESSAGE', 'TELEGRAM', 'BUZZ', 'SLACK', 'REACTION', 'URGENT SIGNAL',
+  'OVERDUE REMINDER',
 ] as const;
 export type DaemonStructuralHeader = typeof DAEMON_STRUCTURAL_HEADERS[number];
 

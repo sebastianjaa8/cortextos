@@ -13,6 +13,19 @@ import { tmpdir } from 'os';
 // marker, restarts.log, and the real opencode-session.json that shouldContinue()
 // reads to decide fresh vs --continue.
 
+// Fork: start() refuses to report 'running' until runtime process ownership
+// is recorded (utils/process-ownership). The stub PTY's pid is fake, so the
+// ownership layer is stubbed exactly as in agent-process-opencode.test.ts;
+// the marker/log/session files below remain real fs.
+vi.mock('../../../src/utils/process-ownership.js', () => ({
+  writeRuntimeProcessRecord: vi.fn((_stateDir, input) => ({ ...input, ownerToken: 'a'.repeat(64) })),
+  removeRuntimeProcessRecord: vi.fn(() => true),
+  terminateProcessTree: vi.fn(() => true),
+  inspectProcessIdentity: vi.fn(() => null),
+  probeProcessIdentity: vi.fn(() => ({ status: 'absent' })),
+  processIdentityEquals: vi.fn(() => false),
+}));
+
 let capturedOnExit: ((exitCode: number, signal?: number) => void) | null = null;
 
 const mockOpencodePty = {

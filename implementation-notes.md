@@ -583,3 +583,79 @@ files / 30 failed tests / 2703 passed (was 27/63/2687) -- the delta is exactly t
 moved. Remaining 23/30 are the pre-existing, already-disclosed categories (cron double-fire,
 opencode-wedge, fast-checker pollCycle reconciliation, lock-contract census tests, validate.test.ts
 header registration, bus/hooks/dashboard/integration -- none of these were in Codex's blocking list).
+
+## 2026-09-26 — merge/upstream-2026-09-26-v2: clearing the remaining 29/30 unit failures
+
+Baseline 009035e: 1 failed / 1692. 48ebe69 as re-measured here: 29 failed / 2122 + 2 files that
+failed to load (bus/task, hooks/hook-crash-alert). Final on this branch: 1 failed / 2227 (the
+allowed macOS /tmp symlink case in hooks.test.ts). upstream/main has not moved past what 48ebe69
+merged (`git log 48ebe69..upstream/main` is empty), so no second upstream merge was needed.
+
+### Locks (utils/lock*, 17 tests + hook-crash-alert load failure)
+- 23:05Z — decision (c): keep the fork's guard-serialized, token-fenced lock (metadata.json +
+  heartbeat + process identity; acquireLock(dir)->boolean, releaseLock(dir)/touchLock(dir) ->
+  LockMutationResult). Upstream 7d26aab replaced lock.ts with a handle-based pid-file lock; the merge
+  kept the fork file but took upstream's four new test files, which are written against upstream's
+  internals (`pid.<token>.pending`, `.takeover` markers, `releaseLock(handle): boolean`). Adopting
+  upstream's lock would drop touchLock/staleAfterMs and the process-identity proof the daemon-instance
+  lock relies on. Rejected upstream lock implementation; kept its safety intent.
+- 23:05Z — change (a, real bug found by porting upstream's EACCES/EIO/EMFILE scenario): the fork
+  treated ANY metadata read failure as "missing metadata", so a live lock older than the 2s grace with
+  a persistently unreadable metadata.json was reclaimed (installFreshLock's re-check read null ===
+  null). Now only ENOENT/unparseable = missing; other errno = unreadable -> acquire refuses,
+  touch/release return `busy` (retryable) instead of `ownership-lost` (which previously dropped the
+  token from HELD_LOCKS and orphaned our own live lock). Verified the ported test fails on the old
+  lock.ts and passes on the new one.
+- 23:05Z — change (a): lock.ts probes its own process identity at import. Since upstream 8552434,
+  bus/heartbeat.ts imports withFileLockSync, so hook-crash-alert.test.ts (child_process mocked without
+  spawnSync) could not even load: the darwin probe threw at import. The import-time probe is now
+  wrapped in try/catch and degrades to the /proc fallback exactly like a probe returning null. Kept it
+  eager (not lazy) so lock-identity-failure's "no identity inspection while waiting on a live lock"
+  contract is untouched.
+- 23:05Z — tests (c): lock-recovery-concurrency / lock-acquire-failure rewritten against the fork API,
+  one scenario per upstream scenario (single winner when a reclaimer interleaves at the liveness
+  decision and at the quarantine rename for dead/absent/empty metadata; live guard never age-stolen;
+  old ownerless/dead guard recovered; unreadable metadata never reaped even with staleAfterMs:1 +
+  metadataGraceMs:0; EPERM liveness never reaped; numeric-prefix pid treated as corrupt; contender
+  mid-publication loses, also with the partial generation aged; a publisher failing mid-publication
+  throws, cleans up only its own partial dir, does not affect the contender; ENOSPC on each of
+  metadata/heartbeat/pid cleans up). lock-handle-opacity now asserts the ownership internals
+  (HELD_LOCKS, readMetadata, installFreshLock, publishLock) are not importable (TS2459) — the fork
+  analog of handle opacity. lock-release-callers roster lists the fork's four dir-bound callers.
+- gotcha: in the fork the reclaim guard serializes every decision, so upstream's "two winners"
+  interleavings resolve as "contender returns false" rather than "delayed reclaimer revoked".
+- could-be-better: the guard's 30s staleness is the only ceiling on a stuck reclaimer; unchanged.
+
+### Bus (message.test x1, task.test load failure)
+- 23:05Z — message.test (b/c): same inbox contract (throws InboxLockUnavailableError, message survives
+  and delivers after release); only the release call is adapted to releaseLock(dir) and now asserts
+  `{status:'ok'}`.
+- 23:05Z — task.test (a): merge resolution added a stray `});` after upstream's new "filters by
+  project" test, closing the outer describe early (parse error). Removed; 80/80 pass.
+
+### Fast-checker (7 tests)
+- 23:05Z — futile-baseline guard A-D (c): fork keeps observe-only when ctx_handoff_threshold is unset
+  (existing MERGE-DECISION). Tests now opt in with `ctx_handoff_threshold: 60` (upstream's default);
+  every assertion unchanged. The guard code itself was merged correctly.
+- 23:05Z — inbox lock failure visibility (b): release adapted to releaseLock(dir) + asserts ok.
+- 23:05Z — transport re-queue x2 (c): fork delivers Telegram per item through its journaled delivery
+  path (one injectMessageDetailed per update) instead of folding it into the Buzz/Slack/inbox block.
+  Kept. Tests now assert the same safety contract in the fork shape: NOT_RUNNING restores every queue
+  in original order; recovery delivers each message exactly once (per-message count), Telegram order
+  preserved, a further idle cycle replays nothing; success = 2 calls (1 Telegram + 1 block), each
+  message exactly once.
+
+### Cron scheduler (1 test)
+- 23:05Z — (f) post-fire reload (c): not a reload bug. The fork's BUG 1 fix anchors nextFireAt to the
+  scheduled slot, so a '1m' cron caught up at T+30s legitimately fires its T+60s slot on the very next
+  tick; upstream advances from `now`. Test switched to a '5m' cron (last fired 6m ago) so a second fire
+  can only come from the reload, and now also asserts nextFireAt is preserved. Verified it still fails
+  if the changeKey-preserve branch is disabled.
+
+### Rest
+- 23:05Z — validate census (a): fork's overdue-reminder injection emits `=== OVERDUE REMINDER`; added
+  it to DAEMON_STRUCTURAL_HEADERS so forged copies in unfenced previews are quoted.
+- 23:05Z — opencode wedge (b): fork's start() requires a runtime ownership record before `running`
+  and consuming `.force-fresh`; the stub PTY's pid is fake, so the test now stubs
+  utils/process-ownership exactly like agent-process-opencode.test.ts. Marker/log/session files stay
+  real fs; assertions unchanged.
