@@ -41,7 +41,7 @@ If there is an active experiment (check `experiments/active.json`):
 ```bash
 cortextos bus evaluate-experiment <experiment_id> <measured_value> --justification "Why this result makes sense"
 ```
-For qualitative metrics, use `--score <1-10>` with a written justification.
+For qualitative metrics, pass the score itself as the positional <value> (e.g. `evaluate-experiment <id> 7 --justification "..."`). Do NOT pass a placeholder 0 with `--score` -- evaluate-experiment no longer lets --score override the measured value (task_1790208385830: this used to silently clobber a real quantitative 0). --score is still accepted as an optional confidence annotation folded into the learning text, never as a value substitute.
 
 ### Step 3: Hypothesize
 Based on accumulated learnings:
@@ -94,7 +94,7 @@ RATE=$(echo "scale=2; $COMPLETED / $TOTAL * 100" | bc)
 ### Qualitative (subjective)
 You evaluate output quality on a 1-10 scale. You MUST write a justification.
 ```bash
-cortextos bus evaluate-experiment <id> 0 --score 7 --justification "Output is more concise and actionable than baseline, but loses some nuance"
+cortextos bus evaluate-experiment <id> 7 --justification "Output is more concise and actionable than baseline, but loses some nuance"
 ```
 
 ### Qualitative (comparative)

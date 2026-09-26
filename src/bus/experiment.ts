@@ -263,34 +263,27 @@ export function evaluateExperiment(
   }
 
   // Compare measured vs baseline using direction
-  let decision: 'keep' | 'discard';
-  if (experiment.direction === 'higher') {
-    decision = measuredValue > experiment.baseline_value ? 'keep' : 'discard';
-  } else {
-    decision = measuredValue < experiment.baseline_value ? 'keep' : 'discard';
-  }
+  const decision: 'keep' | 'discard' = experiment.direction === 'higher'
+    ? (measuredValue > experiment.baseline_value ? 'keep' : 'discard')
+    : (measuredValue < experiment.baseline_value ? 'keep' : 'discard');
 
   experiment.status = 'completed';
   experiment.completed_at = nowISO();
   experiment.result_value = measuredValue;
   experiment.decision = decision;
 
-  // For qualitative metrics: if score is provided, use it as the measured value
-  // (agent passes 0 as placeholder measuredValue and --score 7 as the actual value)
-  if (options?.score !== undefined) {
-    measuredValue = options.score;
-    // Re-evaluate decision with the correct measured value
-    if (experiment.direction === 'higher') {
-      decision = measuredValue > experiment.baseline_value ? 'keep' : 'discard';
-    } else {
-      decision = measuredValue < experiment.baseline_value ? 'keep' : 'discard';
-    }
-    experiment.result_value = measuredValue;
-    experiment.decision = decision;
-  }
-
-  // Build learning from options
+  // Build learning from options. --score is a qualitative confidence rating
+  // (documented in autoresearch SKILL.md) -- it is recorded as an annotation,
+  // never used to overwrite measuredValue. task_1790208385830: the old design
+  // treated --score as a substitute for a placeholder-0 measuredValue, but
+  // there is no way to tell "0 is a real quantitative measurement" from "0 is
+  // the documented qualitative placeholder" from the CLI args alone -- no
+  // per-experiment metric_type field exists to disambiguate (only
+  // ExperimentCycle has one, findCycleDefaults() doesn't forward it, and an
+  // ad-hoc experiment may have no cycle at all). Callers reporting a
+  // qualitative score should pass it as the positional <value> directly.
   const learningParts: string[] = [];
+  if (options?.score !== undefined) learningParts.push(`Score: ${options.score}/10`);
   if (options?.learning) learningParts.push(options.learning);
   if (options?.justification) learningParts.push(options.justification);
   if (learningParts.length > 0) {

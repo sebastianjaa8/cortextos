@@ -255,6 +255,33 @@ describe('Sprint 3: Experiment Framework', () => {
       const id = createExperiment(testDir, 'testbot', 'ctr', 'test');
       expect(() => evaluateExperiment(testDir, id, 10)).toThrow("expected 'running'");
     });
+
+    // task_1790208385830: --score used to silently overwrite a real measured
+    // value (the old design assumed 0+--score meant "qualitative placeholder",
+    // but a real quantitative measurement can also legitimately be 0).
+    it('does NOT let --score overwrite a real quantitative measured value of 0', () => {
+      const id = createExperiment(testDir, 'testbot', 'up-note-references', 'Rollup counter suffices', {
+        direction: 'higher',
+      });
+      runExperiment(testDir, id);
+      // Real measurement: 0 references found. Caller also passes a confidence score.
+      const result = evaluateExperiment(testDir, id, 0, { score: 9, justification: 'confident in the count' });
+
+      expect(result.result_value).toBe(0);
+      expect(result.decision).toBe('discard'); // 0 is not > baseline_value 0
+      expect(result.baseline_value).toBe(0); // NOT clobbered by the score
+    });
+
+    it('records --score as a learning annotation without touching result_value', () => {
+      const id = createExperiment(testDir, 'testbot', 'output_quality', 'Terser prompt', {
+        direction: 'higher',
+      });
+      runExperiment(testDir, id);
+      const result = evaluateExperiment(testDir, id, 7, { score: 7, justification: 'more concise' });
+
+      expect(result.result_value).toBe(7); // the positional value, not re-derived from score
+      expect(result.learning).toBe('Score: 7/10 — more concise');
+    });
   });
 
   describe('listExperiments', () => {
