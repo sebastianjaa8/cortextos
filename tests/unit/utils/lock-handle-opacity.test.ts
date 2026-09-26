@@ -2,8 +2,12 @@ import { describe, expect, it } from 'vitest';
 import { join } from 'node:path';
 import ts from 'typescript';
 
-describe('LockHandle compile-time opacity', () => {
-  it('does not expose filesystem generation identity to importing callers', () => {
+// Upstream asserted compile-time opacity of its generation LockHandle. The
+// fork's lock has no handle: ownership is a module-private token checked
+// against on-disk metadata. The equivalent guarantee is that none of the
+// ownership internals are reachable by importing callers.
+describe('lock ownership compile-time opacity', () => {
+  it('does not expose owner-token or publication internals to importing callers', () => {
     const root = process.cwd();
     const fixture = join(root, 'tests/fixtures/lock-handle-opacity-consumer.ts');
     const configPath = join(root, 'tsconfig.json');
@@ -18,20 +22,16 @@ describe('LockHandle compile-time opacity', () => {
     const diagnostics = ts.getPreEmitDiagnostics(program)
       .filter(diagnostic => diagnostic.file?.fileName === fixture);
 
-    expect(diagnostics.map(diagnostic => diagnostic.code)).toEqual([
-      2339,
-      2339,
-      2339,
-      2339,
-    ]);
-    expect(diagnostics.map(diagnostic => ts.flattenDiagnosticMessageText(
+    const messages = diagnostics.map(diagnostic => ts.flattenDiagnosticMessageText(
       diagnostic.messageText,
       '\n',
-    ))).toEqual([
-      expect.stringContaining("Property 'lockDir' does not exist on type 'GenerationLockHandle'"),
-      expect.stringContaining("Property 'generation' does not exist on type 'GenerationLockHandle'"),
-      expect.stringContaining("Property 'generation' does not exist on type 'GenerationLockHandle'"),
-      expect.stringContaining("Property 'generation' does not exist on type 'GenerationLockHandle'"),
+    ));
+    expect(messages).toEqual([
+      expect.stringContaining("declares 'HELD_LOCKS' locally, but it is not exported"),
+      expect.stringContaining("declares 'readMetadata' locally, but it is not exported"),
+      expect.stringContaining("declares 'installFreshLock' locally, but it is not exported"),
+      expect.stringContaining("declares 'publishLock' locally, but it is not exported"),
     ]);
+    expect(diagnostics.map(diagnostic => diagnostic.code)).toEqual([2459, 2459, 2459, 2459]);
   });
 });

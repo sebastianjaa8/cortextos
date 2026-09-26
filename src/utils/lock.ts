@@ -52,8 +52,21 @@ export type LockMutationResult =
 const HELD_LOCKS = new Map<string, string>();
 const PROCESS_STARTED_AT_MS = Date.now() - Math.floor(process.uptime() * 1_000);
 const BOOT_ID = readBootId();
-const PROCESS_IDENTITY = inspectProcessIdentity(process.pid);
-const PROCESS_START_IDENTITY = PROCESS_IDENTITY?.startIdentity ?? readProcessStartIdentity(process.pid);
+const PROCESS_START_IDENTITY = ownStartIdentityAtLoad();
+
+// Runs at import time for every module that transitively imports this file
+// (since the upstream merge that includes bus/heartbeat.ts, bus/event.ts). An
+// identity probe that throws must not make the importer unloadable; it degrades
+// to the /proc fallback exactly like a probe that returns null.
+function ownStartIdentityAtLoad(): string | undefined {
+  let identity: ReturnType<typeof inspectProcessIdentity> = null;
+  try {
+    identity = inspectProcessIdentity(process.pid);
+  } catch {
+    identity = null;
+  }
+  return identity?.startIdentity ?? readProcessStartIdentity(process.pid);
+}
 
 function readBootId(): string | undefined {
   if (process.platform !== 'linux') return undefined;
@@ -134,13 +147,39 @@ function isMetadata(value: unknown): value is LockMetadata {
     && typeof metadata.processStartedAtMs === 'number';
 }
 
-function readMetadata(metadataFile: string): LockMetadata | undefined {
+/**
+ * Only a genuinely absent (ENOENT) or unparseable metadata file describes a
+ * partial/abandoned acquire. Any other read failure (EACCES, EIO, EMFILE, ...)
+ * says nothing about the owner, so callers must preserve mutual exclusion
+ * rather than reclaim, and must not treat it as proof of ownership loss.
+ */
+type MetadataRead =
+  | { state: 'ok'; metadata: LockMetadata }
+  | { state: 'missing' }
+  | { state: 'unreadable' };
+
+function readMetadata(metadataFile: string): MetadataRead {
+  let raw: string;
   try {
-    const parsed: unknown = JSON.parse(readFileSync(metadataFile, 'utf8'));
-    return isMetadata(parsed) ? parsed : undefined;
-  } catch {
-    return undefined;
+    raw = readFileSync(metadataFile, 'utf8');
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === 'ENOENT'
+      ? { state: 'missing' }
+      : { state: 'unreadable' };
   }
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    return isMetadata(parsed) ? { state: 'ok', metadata: parsed } : { state: 'missing' };
+  } catch {
+    return { state: 'missing' };
+  }
+}
+
+/** Our token still owns the lock: 'yes', 'no' (provably lost), or 'unknown'. */
+function ownsLock(metadataFile: string, ownerToken: string): 'yes' | 'no' | 'unknown' {
+  const read = readMetadata(metadataFile);
+  if (read.state === 'unreadable') return 'unknown';
+  return read.state === 'ok' && read.metadata.ownerToken === ownerToken ? 'yes' : 'no';
 }
 
 function atomicWrite(file: string, content: string): void {
@@ -364,7 +403,9 @@ function installFreshLock(
 
   try {
     if (!guardStillOwned(guard)) return false;
-    const currentOwnerToken = readMetadata(paths.metadataFile)?.ownerToken ?? null;
+    const current = readMetadata(paths.metadataFile);
+    if (current.state === 'unreadable') return false;
+    const currentOwnerToken = current.state === 'ok' ? current.metadata.ownerToken : null;
     if (currentOwnerToken !== expectedOwnerToken) return false;
     renameSync(staleLockDir, quarantine);
     mkdirSync(paths.lockDir);
@@ -414,13 +455,15 @@ export function acquireLock(dir: string, opts: AcquireLockOptions = {}): boolean
       }
     }
 
-    const metadata = readMetadata(paths.metadataFile);
+    const read = readMetadata(paths.metadataFile);
+    if (read.state === 'unreadable') return false;
     const metadataGraceMs = opts.metadataGraceMs ?? DEFAULT_METADATA_GRACE_MS;
-    if (!metadata) {
+    if (read.state === 'missing') {
       return lockAgeMs(paths.lockDir) > metadataGraceMs
         ? installFreshLock(dir, paths.lockDir, guard, null)
         : false;
     }
+    const metadata = read.metadata;
 
     const status = processStatus(metadata, opts.staleAfterMs !== undefined);
     if (status === 'live') return false;
@@ -445,7 +488,9 @@ export function touchLock(dir: string): LockMutationResult {
   if (!guard) return { status: 'busy' };
   try {
     const paths = lockPaths(dir);
-    if (readMetadata(paths.metadataFile)?.ownerToken !== ownerToken) {
+    const owned = ownsLock(paths.metadataFile, ownerToken);
+    if (owned === 'unknown') return { status: 'busy' };
+    if (owned === 'no') {
       HELD_LOCKS.delete(key);
       return { status: 'ownership-lost' };
     }
@@ -456,7 +501,7 @@ export function touchLock(dir: string): LockMutationResult {
     }));
     return { status: 'ok' };
   } catch {
-    if (readMetadata(lockPaths(dir).metadataFile)?.ownerToken !== ownerToken) {
+    if (ownsLock(lockPaths(dir).metadataFile, ownerToken) === 'no') {
       HELD_LOCKS.delete(key);
       return { status: 'ownership-lost' };
     }
@@ -484,7 +529,9 @@ export function releaseLock(dir: string): LockMutationResult {
   if (!guard) return { status: 'busy' };
   try {
     const paths = lockPaths(dir);
-    if (readMetadata(paths.metadataFile)?.ownerToken !== ownerToken) {
+    const owned = ownsLock(paths.metadataFile, ownerToken);
+    if (owned === 'unknown') return { status: 'busy' };
+    if (owned === 'no') {
       HELD_LOCKS.delete(key);
       return { status: 'ownership-lost' };
     }
@@ -500,7 +547,7 @@ export function releaseLock(dir: string): LockMutationResult {
     }
     return { status: 'ok' };
   } catch {
-    if (readMetadata(lockPaths(dir).metadataFile)?.ownerToken !== ownerToken) {
+    if (ownsLock(lockPaths(dir).metadataFile, ownerToken) === 'no') {
       HELD_LOCKS.delete(key);
       return { status: 'ownership-lost' };
     }

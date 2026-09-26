@@ -30,24 +30,30 @@ describe('lock acquisition failure cleanup', () => {
     rmSync(testDir, { recursive: true, force: true });
   });
 
-  it('removes the partial lock directory when writing the pid fails with ENOSPC', () => {
-    const enospc = Object.assign(new Error('disk full'), { code: 'ENOSPC' });
-    const actualWriteFileSync = fsMock.writeFileSync.getMockImplementation()!;
-    let failed = false;
-    fsMock.writeFileSync.mockImplementation(((target, ...rest) => {
-      if (!failed && String(target).endsWith('.pending')) {
-        failed = true;
-        throw enospc;
-      }
-      return actualWriteFileSync(target, ...rest);
-    }) as typeof import('fs').writeFileSync);
+  // Fork layout: the owner is published as metadata.json (then heartbeat, pid)
+  // via temp-file + rename, rather than upstream's `pid.<token>.pending`.
+  it.each(['metadata.json', 'heartbeat', 'pid'])(
+    'removes the partial lock directory when publishing %s fails with ENOSPC',
+    file => {
+      const enospc = Object.assign(new Error('disk full'), { code: 'ENOSPC' });
+      const actualWriteFileSync = fsMock.writeFileSync.getMockImplementation()!;
+      const lockDir = join(testDir, '.lock.d');
+      let failed = false;
+      fsMock.writeFileSync.mockImplementation(((target, ...rest) => {
+        const path = String(target);
+        if (!failed && path.startsWith(join(lockDir, `${file}.`)) && path.endsWith('.tmp')) {
+          failed = true;
+          throw enospc;
+        }
+        return actualWriteFileSync(target, ...rest);
+      }) as typeof import('fs').writeFileSync);
 
-    expect(() => acquireLock(testDir)).toThrow(enospc);
-    expect(existsSync(join(testDir, '.lock.d'))).toBe(false);
+      expect(() => acquireLock(testDir)).toThrow(enospc);
+      expect(failed).toBe(true);
+      expect(existsSync(lockDir)).toBe(false);
 
-    const handle = acquireLock(testDir);
-    expect(handle).not.toBe(false);
-    if (!handle) throw new Error('expected lock handle');
-    expect(releaseLock(handle)).toBe(true);
-  });
+      expect(acquireLock(testDir)).toBe(true);
+      expect(releaseLock(testDir)).toEqual({ status: 'ok' });
+    },
+  );
 });

@@ -40,9 +40,14 @@ describe('generation-bound release caller roster', () => {
       visit(source);
     }
 
+    // Fork API: releaseLock(dir) is fenced by the owner token recorded at
+    // acquire time, so each caller must release the SAME directory it
+    // acquired. Any new caller must be reviewed and added here.
     expect(calls.sort()).toEqual([
-      'src/bus/message.ts:lockHandle',
-      'src/utils/lock.ts:handle',
+      'src/bus/message.ts:inbox',
+      'src/daemon-restart-helper.ts:lockDir',
+      "src/daemon/index.ts:join(ctxRoot, '.daemon-instance')",
+      'src/utils/lock.ts:dir',
     ]);
   });
 });

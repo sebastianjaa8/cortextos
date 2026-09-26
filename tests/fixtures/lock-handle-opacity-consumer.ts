@@ -1,11 +1,11 @@
-import type { LockHandle } from '../../src/utils/lock';
+import { HELD_LOCKS, readMetadata, installFreshLock, publishLock } from '../../src/utils/lock';
 
-declare const staleHandle: LockHandle;
-
-// These are the exact identity members a caller used to rewrite a stale
-// handle into a live successor. The opacity test compiles this fixture and
-// requires every access to remain a property-not-found diagnostic.
-staleHandle.lockDir;
-staleHandle.generation.snapshot.dev = 1;
-staleHandle.generation.snapshot.ino = 1;
-staleHandle.generation.ownerToken = 'successor-owner-token';
+// The fork's lock fences ownership with a module-private owner token
+// (HELD_LOCKS) and on-disk metadata. These are exactly the internals a caller
+// would need to forge ownership of a successor's lock or rewrite a stale claim;
+// the opacity test compiles this fixture and requires every import to remain a
+// missing-export diagnostic.
+void HELD_LOCKS;
+void readMetadata;
+void installFreshLock;
+void publishLock;
