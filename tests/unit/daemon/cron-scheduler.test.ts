@@ -1082,9 +1082,14 @@ describe('CronScheduler', () => {
   });
 
   it('(f) post-fire reload happens once and does not double-fire', async () => {
-    const twoMinAgo = new Date(Date.now() - 2 * 60_000).toISOString();
+    // Fork divergence: advanceNextFireAt anchors to the scheduled slot (BUG 1
+    // fix), so a '1m' cron caught up at T+30s legitimately fires again at its
+    // T+60s slot — one tick later. Use a '5m' interval so the next scheduled
+    // slot is far outside this test; any second fire can then only come from
+    // the reload rebuilding the entry from the stale last_fired_at on disk.
+    const sixMinAgo = new Date(Date.now() - 6 * 60_000).toISOString();
     mockReadCrons.mockReturnValue([
-      makeCron({ name: 'job', schedule: '1m', last_fired_at: twoMinAgo, fire_count: 1 }),
+      makeCron({ name: 'job', schedule: '5m', last_fired_at: sixMinAgo, fire_count: 1 }),
     ]);
     mockCronsFileMtimeMs.mockReturnValue(1000);
     scheduler.start();
@@ -1094,6 +1099,8 @@ describe('CronScheduler', () => {
     expect(fired.filter(c => c.name === 'job')).toHaveLength(1);
 
     const loadsBefore = mockReadCronsWithStatus.mock.calls.length;
+    const nextBefore = scheduler.getNextFireTimes().find(e => e.name === 'job');
+    expect(nextBefore).toBeDefined();
 
     // tick's own updateCron bookkeeping advanced the file mtime (updateCron is
     // mocked and does not move the mocked mtime, so we simulate it). Contents
@@ -1106,6 +1113,7 @@ describe('CronScheduler', () => {
     // ...but the cron did not double-fire (nextFireAt preserved for the
     // unchanged changeKey).
     expect(fired.filter(c => c.name === 'job')).toHaveLength(1);
+    expect(scheduler.getNextFireTimes().find(e => e.name === 'job')).toEqual(nextBefore);
   });
 
   it('(g) external edit across a fire is applied and logged (suppression never hides a real edit)', async () => {
