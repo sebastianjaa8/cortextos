@@ -425,3 +425,76 @@ files, which is a comparable scope of work to the original agent-manager.ts merg
 careful feature-by-feature reconciliation, not a mechanical conflict resolution) — not attempted here
 under time pressure on a Tier-3 daemon-core branch. Recommend a dedicated follow-up pass before merging
 to main, or an explicit decision that these features can be deferred to a later fast-follow.
+
+---
+
+## Final verification tally before push (2026-09-26)
+
+Full-suite baseline comparison, 645b5a8 (original merge commit) vs this branch after all fixes above:
+
+| | 645b5a8 (baseline) | this branch |
+|---|---|---|
+| Test files failed | 46 | 27 |
+| Tests failed | 65 | 63 |
+| Tests passed | 2443 | 2687 |
+
+Most of the file-count improvement (46 -> 27) is fixing whole-file COLLECTION failures (stale test
+mocks, the agent-manager.ts syntax error) that were hiding hundreds of otherwise-passing tests, not
+newly-passing behavioral fixes — recovering the ability to even SEE the real pass/fail state matters as
+much as the fixes themselves per GUARDRAILS' "fired is not produced" family: a suite that can't collect
+gives zero signal, which is worse than a suite giving an honest partial-fail signal.
+
+### Fixed a real regression introduced by this session's own work
+Restoring the correct brace in agent-manager.ts made agent-manager-eviction-race-round4.test.ts
+collectable for the first time (it also failed to collect at 645b5a8) — which then surfaced a real
+mock/behavior mismatch: the round4 test's AgentProcess mock predates a newer upstream post-start
+liveness-rollback path (`if (status !== 'running') { checker.stop(); agentProcess.forceStop(); }`,
+already present unconflicted in 645b5a8) and didn't implement `forceStop()`. Added it, matching the
+status-transition contract the real class documents. Not a regression from removing runAgentLifecycle
+as first suspected — verified by isolating the same test against a clean 645b5a8 checkout in a scratch
+worktree, where it ALSO fails to collect for the identical parse-error reason. Recorded here because the
+suspicion was wrong and worth not re-litigating.
+
+### 27 files / 63 tests still failing — NOT attempted, pre-existing on 645b5a8 unless noted
+Categorized by root cause, so a reviewer can judge risk without re-deriving it:
+
+1. **Telegram transport (4 files, ~30 tests)** — `api.test.ts`, `poller.test.ts`, `send-message.test.ts`,
+   `transport-retry.test.ts`. Root cause per the original per-file notes above: keeping
+   `src/telegram/{api,poller}.ts` wholesale (correct for delivery-journal reasons) silently dropped
+   upstream's genuinely-new HTML parse_mode default, Happy-Eyeballs unpooled HTTPS, and backoff
+   refinements. Needs a dedicated feature-porting pass into fork's canonical files, comparable in scope
+   to the original agent-manager.ts conflict resolution.
+2. **cron-scheduler.test.ts (1 test)** — "(f) post-fire reload happens once and does not double-fire".
+   Confirmed pre-existing on 645b5a8 (isolated in a scratch worktree). Looks like a real interaction bug
+   between the mtime-triggered reload path and post-fire nextFireAt advancement — worth real
+   investigation given this codebase's history of cron double-fire incidents (MEMORY.md 2026-08-13,
+   catch-up-spread), not a guess-and-patch fix under time pressure.
+3. **agent-process-opencode-wedge.test.ts (1 test)** — confirmed pre-existing on 645b5a8. Not
+   investigated past confirming it predates this session's changes.
+4. **fast-checker.test.ts (6 tests)** — "context-handoff futile-baseline guard" (4), "inbox lock failure
+   visibility" (1), "transport re-queue on inject failure" (2). Per the original merge notes, this file's
+   `pollCycle` required real reconciliation between fork's per-item Telegram delivery-tracking and
+   upstream's new Buzz/Slack blob-queue draining — these failures likely live in that reconciliation, not
+   confirmed against a clean baseline individually (time did not permit; flagging as the same class as
+   #1-2 rather than asserting root cause with confidence I don't have).
+5. **lock-*.test.ts (4 files)** — `lock-acquire-failure`, `lock-handle-opacity`, `lock-recovery-concurrency`,
+   `lock-release-callers`. `lock-release-callers.test.ts`'s failure is a DIRECT, EXPECTED consequence of
+   the original merge's lock.ts decision (kept fork's implementation, adapted bus/message.ts's calling
+   convention) — its hardcoded caller roster needs updating to the new call-site names, not a functional
+   bug. The other 3 not individually confirmed; likely the same root cause (a census/contract test
+   written against upstream's LockHandle API shape).
+6. **validate.test.ts (1 test)** — "every daemon-emitted === HEADER marker is registered" flags
+   `OVERDUE REMINDER` as uncovered. Small, mechanical (add one string to
+   `DAEMON_STRUCTURAL_HEADERS`), not investigated for correctness of the underlying reminders feature.
+7. **bus/message.test.ts, bus/task.test.ts, hooks/*.test.ts (3 files)** — not individually triaged.
+8. **dashboard/*, tests/integration/* (7 files)** — not individually triaged. Some dashboard test
+   failures may be pre-existing/environmental (dashboard has its own build) rather than merge-caused;
+   not confirmed either way.
+
+**Recommendation**: this branch is ready to PUSH for review as instructed, not to merge to main.
+Categories 1, 2, and 5 are understood well enough to scope follow-up work; categories 4, 7, 8 need a
+fresh triage pass before anyone can say whether they're mechanical (test needs updating for a real,
+correct behavior change) or a genuine functional regression. Given daemon-core blast radius and this
+repo's own standing rule (GUARDRAILS.md, 2026-08-17: mandatory Codex review on daemon-core work catches
+real blockers self-review cannot), recommend Codex review before any merge to main, with explicit focus
+on section 5 of this file (the runAgentLifecycle removal) and the fast-checker pollCycle reconciliation.

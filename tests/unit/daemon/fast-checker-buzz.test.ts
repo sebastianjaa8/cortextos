@@ -1,6 +1,12 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
-vi.mock('child_process', () => ({ execFile: vi.fn() }));
+vi.mock('child_process', () => ({
+  execFile: vi.fn(),
+  // process-ownership.ts's spawnSync-based identity probe is reachable transitively
+  // via bus/event.ts -> utils/lock.ts (task_1787099506036 class). status:1/empty
+  // stdout reads as "process not found", a safe default for a file not testing this.
+  spawnSync: vi.fn(() => ({ status: 1, stdout: '', stderr: '' })),
+}));
 import { mkdtempSync, rmSync, mkdirSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';

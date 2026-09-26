@@ -82,6 +82,12 @@ vi.mock('../../../src/daemon/agent-process.js', () => ({
 
     async stop() { this.status = 'stopped'; this.pid = undefined; }
 
+    /** Post-start liveness rollback (agent-manager.ts's startAgentNow) calls this
+     * when start() resolves without status 'running' -- reachable here since
+     * simulateExitDuringSpawn() leaves status 'crashed'. Real class tears the PTY
+     * down synchronously; this mock only needs to match the status transition. */
+    forceStop() { this.status = 'stopped'; this.pid = undefined; }
+
     getStatus() { return { name: this.name, status: this.status, pid: this.pid }; }
 
     onExit() { /* no-op */ }
