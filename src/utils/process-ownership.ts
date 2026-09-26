@@ -46,12 +46,21 @@ function sleepSync(ms: number): void {
  * do not need the process reaped at all to know the kill worked.
  */
 function isPidGoneOrZombie(pid: number): boolean {
-  // /proc is Linux-only. On macOS (the only other non-Windows platform this
-  // file supports) there is no procfs to read at all -- readFileSync would
-  // ALWAYS throw ENOENT there regardless of whether the PID is actually
-  // still alive, which would make this function report "gone" immediately
-  // on the very first poll, defeating the retry entirely. Fall back to the
-  // ordinary identity probe there, same as before this fix.
+  // /proc is Linux-only. On macOS there is no procfs to read at all --
+  // readFileSync would ALWAYS throw ENOENT there regardless of whether the PID
+  // is actually still alive, which would make this function report "gone"
+  // immediately on the very first poll, defeating the retry entirely. macOS
+  // `ps -o stat=` exposes the same state letter, so read it there instead.
+  if (platform() === 'darwin') {
+    const result = spawnSync('/bin/ps', ['-o', 'stat=', '-p', String(pid)], {
+      encoding: 'utf8',
+      timeout: 5_000,
+    }) as ReturnType<typeof spawnSync> | undefined;
+    if (!result || typeof result.stdout !== 'string') return false;
+    const state = result.stdout.trim();
+    if (result.status === 1 && !state) return true;
+    return result.status === 0 && state.startsWith('Z');
+  }
   if (platform() !== 'linux') return probeProcessIdentity(pid).status === 'absent';
   try {
     const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
@@ -108,6 +117,47 @@ function powershellPath(): string {
     : 'powershell.exe';
 }
 
+let cachedDarwinBootTime: string | null = null;
+
+function darwinBootTime(): string | null {
+  if (cachedDarwinBootTime) return cachedDarwinBootTime;
+  const result = spawnSync('/usr/sbin/sysctl', ['-n', 'kern.boottime'], {
+    encoding: 'utf8',
+    timeout: 5_000,
+  }) as ReturnType<typeof spawnSync> | undefined;
+  const sec = typeof result?.stdout === 'string' ? /sec = (\d+)/.exec(result.stdout)?.[1] : undefined;
+  if (!result || result.status !== 0 || !sec) return null;
+  cachedDarwinBootTime = sec;
+  return sec;
+}
+
+/**
+ * macOS has no procfs. `ps -o lstart=` gives the process start time (second
+ * resolution); prefixed with the kernel boot time it is unique for a PID the
+ * same way Linux's boot_id:starttime is. The executable path is left empty:
+ * ps reports the mutable process title, which processIdentityMatches would
+ * then compare, and an empty path makes that comparison a no-op.
+ */
+function probeDarwinProcessIdentity(pid: number): ProcessIdentityProbe {
+  const result = spawnSync('/bin/ps', ['-o', 'lstart=', '-p', String(pid)], {
+    encoding: 'utf8',
+    timeout: 5_000,
+    env: { ...process.env, LC_ALL: 'C' },
+  }) as ReturnType<typeof spawnSync> | undefined;
+  if (!result || typeof result.stdout !== 'string') return { status: 'unknown' };
+  const started = result.stdout.trim();
+  if (result.status === 1 && !started) return { status: 'absent' };
+  if (result.status !== 0 || !/^\w{3} \w{3} +\d{1,2} \d\d:\d\d:\d\d \d{4}$/.test(started)) {
+    return { status: 'unknown' };
+  }
+  const boot = darwinBootTime();
+  if (!boot) return { status: 'unknown' };
+  return {
+    status: 'present',
+    identity: { pid, startIdentity: `${boot}:${started}`, executablePath: '' },
+  };
+}
+
 /** Distinguish a missing PID from an identity probe that could not be trusted. */
 export function probeProcessIdentity(pid: number): ProcessIdentityProbe {
   if (!Number.isSafeInteger(pid) || pid <= 0) return { status: 'absent' };
@@ -150,6 +200,8 @@ export function probeProcessIdentity(pid: number): ProcessIdentityProbe {
       return { status: 'unknown' };
     }
   }
+
+  if (platform() === 'darwin') return probeDarwinProcessIdentity(pid);
 
   if (platform() !== 'linux') {
     try {
