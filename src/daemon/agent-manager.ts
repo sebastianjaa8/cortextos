@@ -2288,8 +2288,10 @@ export class AgentManager {
       if (!existsSync(agentsBase)) continue;
 
       try {
+        // Hidden dirs (e.g. agents/.shared, notes agents keep for each other) are
+        // not agents: starting one crash-loops it for lack of a config.json.
         const dirs = readdirSync(agentsBase, { withFileTypes: true })
-          .filter(d => d.isDirectory())
+          .filter(d => d.isDirectory() && !d.name.startsWith('.'))
           .map(d => d.name);
 
         for (const name of dirs) {
