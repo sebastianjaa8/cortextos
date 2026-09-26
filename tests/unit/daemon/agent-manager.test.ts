@@ -281,7 +281,11 @@ describe('AgentManager.restartAgent - BUG-007 fix (rebuild Telegram poller)', ()
     await am.restartAgent('alice');
 
     expect(stopSpy).toHaveBeenCalledWith('alice');
-    expect(startSpy).toHaveBeenCalledWith('alice', '');
+    // restartAgentNow now calls the PUBLIC startAgent (runAgentLifecycle removed,
+    // no more re-entrancy/deadlock risk -- see agent-manager.ts), which forwards
+    // all 4 params to startAgentNow explicitly rather than the 2-arg direct call
+    // this test used to observe.
+    expect(startSpy).toHaveBeenCalledWith('alice', '', undefined, undefined);
     // Verify call order: stop must complete before start, so the old poller
     // is fully torn down before the new one is constructed
     const stopOrder = stopSpy.mock.invocationCallOrder[0];

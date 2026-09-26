@@ -5,6 +5,14 @@ vi.mock('../../../src/utils/process-ownership.js', () => ({
   writeRuntimeProcessRecord: vi.fn((_stateDir, input) => ({ ...input, ownerToken: 'a'.repeat(64) })),
   removeRuntimeProcessRecord: vi.fn(() => true),
   terminateProcessTree: vi.fn(() => true),
+  // bus/event.ts (imported transitively) now pulls in utils/lock.ts, which calls
+  // inspectProcessIdentity(process.pid) at MODULE LOAD TIME -- an unmocked export
+  // here throws immediately on import, not on use. This file's own locking
+  // behavior is not under test; a null/absent identity is a safe default that
+  // matches inspectProcessIdentity's real return type (task_1787099506036).
+  inspectProcessIdentity: vi.fn(() => null),
+  probeProcessIdentity: vi.fn(() => ({ status: 'absent' })),
+  processIdentityEquals: vi.fn(() => false),
 }));
 
 const native = (value: string): string => normalize(value);

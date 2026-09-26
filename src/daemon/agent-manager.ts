@@ -11,7 +11,7 @@ import type { CronDefinition } from '../types/index.js';
 import { TelegramAPI } from '../telegram/api.js';
 import { TelegramPoller, type TelegramDeliveryContext } from '../telegram/poller.js';
 import type { TelegramDeliveryHealth } from '../telegram/delivery-journal.js';
-import { TelegramConnector, NullConnector } from '../connectors/index.js';
+import { NullConnector } from '../connectors/index.js';
 import type { MessageConnector } from '../connectors/index.js';
 import { SlackSocketListener } from './slack-socket-listener.js';
 import { loadSlackRoutingConfig, slackConfigPath, claimSlackAppToken, releaseSlackAppTokens } from '../slack/slack-routing.js';
@@ -119,7 +119,6 @@ export class AgentManager {
   private frameworkRoot: string;
   private org: string;
   private shuttingDown = false;
-  private agentLifecycleOps: Map<string, Promise<void>> = new Map();
 
   // Set true at construction time if any agent in state/ has a stale
   // .daemon-crashed marker, meaning the previous daemon process died
@@ -407,23 +406,12 @@ export class AgentManager {
     return { ok: true };
   }
 
-  private async runAgentLifecycle(name: string, operation: () => Promise<void>): Promise<void> {
-    const previous = this.agentLifecycleOps.get(name) ?? Promise.resolve();
-    const current = previous.catch(() => undefined).then(operation);
-    this.agentLifecycleOps.set(name, current);
-    try {
-      await current;
-    } finally {
-      if (this.agentLifecycleOps.get(name) === current) this.agentLifecycleOps.delete(name);
-    }
-  }
-
   async startAgent(name: string, agentDir: string, config?: AgentConfig, org?: string): Promise<void> {
     if (this.shuttingDown) {
       console.log(`[agent-manager] Ignoring start for ${name}: daemon shutdown is in progress`);
       return;
     }
-    await this.runAgentLifecycle(name, () => this.startAgentNow(name, agentDir, config, org));
+    await this.startAgentNow(name, agentDir, config, org);
   }
 
   private async startAgentNow(name: string, agentDir: string, config?: AgentConfig, org?: string): Promise<void> {
@@ -596,6 +584,7 @@ export class AgentManager {
         this.evictingAgents.delete(name);
       }
       // fall through synchronously to the fresh-start path below
+      }
     }
 
     // BUG-043 fix: resolve the agent's true org instead of using `this.org`.
@@ -697,18 +686,16 @@ export class AgentManager {
       }
 
       if (botToken && chatId) {
-        // PR1 of pluggable connectors + Codex M2.cr: construct the
-        // TelegramConnector FIRST, then extract its internal TelegramAPI
-        // for the legacy fields. Single shared TelegramAPI instance so
-        // rate-limiting (api.ts:85) and self-chat warning dedup (api.ts:88)
-        // stay in lock-step across the connector path and the legacy-field
-        // path. PR2 migrates the legacy-field call sites and removes them.
-        connector = new TelegramConnector(agentDir, {
-          BOT_TOKEN: botToken,
-          CHAT_ID: chatId,
-          ALLOWED_USER: allowedUserId ?? '',
-        });
-        telegramApi = (connector as TelegramConnector).rawTelegramApi();
+        // NOT adopting upstream's TelegramConnector mirror here: its
+        // rawTelegramApi() returns src/connectors/telegram/api.ts's TelegramAPI,
+        // which lacks fork's delivery-journal surface (postOnce, journalDelivery,
+        // botIdentity, getBotIdentity, lastAttemptCount) that the rest of this
+        // method and agent-process.ts actively call. Wiring the connector mirror
+        // in would silently swap a feature-incomplete Telegram client into real
+        // message sending. `connector` stays null here (only set for the
+        // explicit config.connector === 'none' opt-out above); telegramApi is
+        // fork's own real implementation, unchanged from pre-merge behavior.
+        telegramApi = new TelegramAPI(botToken);
         // Don't log sensitive user IDs — just indicate the gate is enabled
         log(`Telegram configured (chat_id: ****${String(chatId).slice(-4)}, allowed_user: enabled)`);
       }
@@ -721,12 +708,10 @@ export class AgentManager {
     if (telegramApi && chatId) {
       agentProcess.setTelegramHandle(telegramApi, chatId);
     }
-    // PR1 of pluggable connectors: also wire the MessageConnector handle
-    // when present. AgentProcess.setConnector populates the legacy
-    // telegramApi/telegramChatId fields when the connector is a
-    // TelegramConnector (one-way mirror), so this call after
-    // setTelegramHandle is idempotent for the legacy fields and additive
-    // for the new connector field.
+    // Wire the MessageConnector handle when present (currently only ever a
+    // NullConnector, for the explicit config.connector === 'none' opt-out —
+    // see the telegramApi assignment above for why a real TelegramConnector
+    // is not constructed here).
     if (connector) {
       agentProcess.setConnector(connector);
     }
@@ -935,10 +920,13 @@ export class AgentManager {
           recordInboundTelegram(paths, this.ctxRoot, name, resolvedOrg, from, msg, log);
         } catch (err) {
           log(`recordInboundTelegram FAILED for msg_id=${msg.message_id}: ${err}`);
+          // daemon logging ABOUT the agent — no opts means no refresh, which is what we
+          // want: refreshing its heartbeat here would mask the staleness this event exists
+          // to surface.
           logEvent(paths, name, resolvedOrg, 'error', 'inbound_persistence_failed', 'error', {
             message_id: msg.message_id,
             error: String(err),
-          }, true); // daemon logging ABOUT the agent — refreshing its heartbeat here would mask the staleness this event exists to surface
+          });
           throw err;
         }
 
@@ -1526,23 +1514,20 @@ export class AgentManager {
    * Stop a specific agent.
    */
   async stopAgent(name: string, userInitiated = false): Promise<void> {
-    await this.runAgentLifecycle(name, () => this.stopAgentNow(name, userInitiated));
+    // idempotency fix (#923): claim synchronously BEFORE the first await inside
+    // stopAgentNow, so a concurrent startAgent() call racing this teardown sees
+    // the marker immediately.
+    this.stoppingAgents.add(name);
+    await this.stopAgentNow(name, userInitiated);
   }
 
   private async stopAgentNow(name: string, userInitiated = false): Promise<void> {
-    const entry = this.agents.get(name);
-    if (!entry) {
-      console.log(`[agent-manager] Agent ${name} not found`);
-      return;
-    }
-
-    // idempotency fix (#923): claim the name synchronously BEFORE the first await
-    // (entry.process.stop() below) so a startAgent() racing this teardown sees
-    // the marker and queues via pendingRestarts instead of taking the no-op
-    // path. finally (NOT catch) so a throw from process.stop() still propagates
-    // to callers while the marker is always released.
-    this.stoppingAgents.add(name);
     try {
+      const entry = this.agents.get(name);
+      if (!entry) {
+        console.log(`[agent-manager] Agent ${name} not found`);
+        return;
+      }
       // map-entry-race fix (#895): capture every name-keyed resource we own
       // BEFORE the await below. entry.process.stop() yields for up to ~21s
       // (BUG-032's graceful /exit dance plus BUG-040's 15s exit wait), and a NEW
@@ -1682,7 +1667,7 @@ export class AgentManager {
    */
   async restartAgent(name: string): Promise<void> {
     if (this.shuttingDown) return;
-    await this.runAgentLifecycle(name, () => this.restartAgentNow(name));
+    await this.restartAgentNow(name);
   }
 
   private async restartAgentNow(name: string): Promise<void> {
@@ -1693,10 +1678,10 @@ export class AgentManager {
     }
     console.log(`[agent-manager] Restarting ${name}`);
     this.pendingRestarts.delete(name);
-    // Private stopAgentNow/startAgentNow, NOT the public stopAgent/startAgent —
-    // this method already runs inside runAgentLifecycle's per-name queue, and
-    // calling the public wrapper again would re-enter that same queue and
-    // deadlock (it would await a promise chained after its own in-flight op).
+    // idempotency fix (#923): claim synchronously, same as the public stopAgent
+    // wrapper -- a concurrent caller racing this restart's internal stop phase
+    // must see stoppingAgents immediately, not after stopAgentNow's first await.
+    this.stoppingAgents.add(name);
     await this.stopAgentNow(name);
     // map-entry-race fix: a normal stop leaves the name UNBOUND, so the test is
     // "did somebody else bind it", not stillMapped(). If a new instance took the
@@ -1711,7 +1696,11 @@ export class AgentManager {
       console.log(`[agent-manager] ${name} was re-registered while restarting — a new instance already holds the name, skipping the start.`);
       return;
     }
-    if (!this.shuttingDown) await this.startAgentNow(name, '');
+    // Public startAgent, not the private startAgentNow -- no more serialization
+    // queue to re-enter (runAgentLifecycle was removed), so there is no deadlock
+    // risk, and going through the public method keeps its own shuttingDown
+    // check and any future cross-cutting behavior in one place.
+    if (!this.shuttingDown) await this.startAgent(name, '');
     console.log(`[agent-manager] Restart complete for ${name}`);
   }
 
@@ -1770,9 +1759,10 @@ export class AgentManager {
       }
     }
 
-    const agentStops = names.map((name) =>
-      this.runAgentLifecycle(name, () => this.stopAgentNow(name)),
-    );
+    const agentStops = names.map((name) => {
+      this.stoppingAgents.add(name);
+      return this.stopAgentNow(name);
+    });
     const workerStops = [...this.workers.entries()].map(async ([name, worker]) => {
       try {
         await worker.terminate();
@@ -2160,6 +2150,9 @@ export class AgentManager {
     meta: Record<string, unknown>,
   ): void {
     const paths = resolvePaths(agentName, this.instanceId, this.org);
+    // The daemon is reporting ON this agent, not the agent reporting on itself: no opts
+    // means no refresh, which is what we want -- refreshing its heartbeat here would fake
+    // liveness for a process that may not even be up yet.
     logEvent(
       paths,
       agentName,
@@ -2168,9 +2161,6 @@ export class AgentManager {
       'cron_migration_would_overwrite',
       'error',
       meta,
-      // The daemon is reporting ON this agent, not the agent reporting on itself: refreshing
-      // its heartbeat here would fake liveness for a process that may not even be up yet.
-      true,
     );
 
     // Route to the org's orchestrator if context.json names one. Same resolution the PTY uses

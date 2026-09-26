@@ -10,7 +10,6 @@ import { OpencodePTY, opencodeSessionExists } from '../pty/opencode-pty.js';
 import { MessageDedup, injectMessage } from '../pty/inject.js';
 import type { TelegramAPI } from '../telegram/api.js';
 import type { MessageConnector } from '../connectors/index.js';
-import { TelegramConnector } from '../connectors/index.js';
 import { ensureDir } from '../utils/atomic.js';
 import { writeCortextosEnv } from '../utils/env.js';
 import { getOverdueReminders } from '../bus/reminders.js';
@@ -954,7 +953,6 @@ export class AgentProcess {
           content_preview: content.slice(0, 200),
           enqueued_at: new Date(enqueuedAt).toISOString(),
         },
-        true,
       );
     } catch (err) {
       this.log(`Failed to emit cron_inject_dropped event: ${err instanceof Error ? err.message : String(err)}`);
@@ -1016,23 +1014,16 @@ export class AgentProcess {
    * — the daemon calls `setConnector` once at startAgent time; legacy
    * call sites that still use `setTelegramHandle` continue to work.
    *
-   * One-way mirror: if `c` is a `TelegramConnector`, the legacy
-   * `telegramApi`/`telegramChatId` fields are populated via
-   * `c.rawTelegramApi()` so CodexAppServerPTY's session-refresh re-wire
-   * (`agent-process.ts:126-128`) continues to find them. For any other
-   * connector kind, the legacy fields are left untouched (a Null- or
-   * future Matrix-connector does not clobber an existing Telegram
-   * handle that was set earlier in the lifecycle).
+   * Not mirroring a TelegramConnector into the legacy telegramApi/
+   * telegramChatId fields here: agent-manager.ts never constructs a real
+   * TelegramConnector (its rawTelegramApi() returns
+   * src/connectors/telegram/api.ts's TelegramAPI, which lacks fork's
+   * delivery-journal surface that setTelegramHandle's callers depend on) —
+   * only NullConnector, for the explicit config.connector === 'none' opt-out.
+   * The legacy fields are set exclusively via setTelegramHandle().
    */
   setConnector(c: MessageConnector): void {
     this.connector = c;
-    if (c instanceof TelegramConnector) {
-      this.telegramApi = c.rawTelegramApi();
-      this.telegramChatId = c.getChatId();
-      if (this.config.runtime === 'codex-app-server' && this.pty) {
-        (this.pty as CodexAppServerPTY).setTelegramHandle(this.telegramApi, this.telegramChatId);
-      }
-    }
   }
 
   /**

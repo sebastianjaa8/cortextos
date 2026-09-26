@@ -24,9 +24,11 @@ vi.mock('../../../src/daemon/agent-process.js', () => ({
       this.name = name;
       this.dir = dir;
     }
-    async start() { /* overridden per-test where a deferred start is needed */ }
-    async stop() { /* no-op */ }
-    getStatus() { return { name: this.name, status: 'stopped' }; }
+    status = 'stopped';
+    async start() { this.status = 'running'; /* overridden per-test where a deferred start is needed */ }
+    async stop() { this.status = 'stopped'; }
+    forceStop() { this.status = 'stopped'; }
+    getStatus() { return { name: this.name, status: this.status }; }
     onExit() { /* no-op */ }
     onStatusChanged() { /* no-op */ }
     setTelegramHandle() { /* no-op */ }
@@ -66,9 +68,12 @@ vi.mock('../../../src/telegram/poller.js', () => ({
     suffix: string | undefined;
     startCount = 0;
     stopCount = 0;
-    messageHandlers: ((m: unknown) => void)[] = [];
-    callbackHandlers: ((q: unknown) => void)[] = [];
-    reactionHandlers: ((r: unknown) => void)[] = [];
+    messageHandlers: ((m: unknown, delivery?: unknown) => void)[] = [];
+    callbackHandlers: ((q: unknown, delivery?: unknown) => void)[] = [];
+    reactionHandlers: ((r: unknown, delivery?: unknown) => void)[] = [];
+    markDeliveryAccepted() { /* no-op */ }
+    markDeliveryDispatch() { /* no-op */ }
+    markDeliveryFailure() { /* no-op */ }
     constructor(_api?: unknown, _stateDir?: string, _interval?: number, suffix?: string) {
       this.suffix = suffix;
     }
@@ -410,7 +415,14 @@ describe('AgentManager map-entry race — a poller must attach to the entry that
     const { AgentProcess } = await import('../../../src/daemon/agent-process.js');
     const startSpy = vi
       .spyOn(AgentProcess.prototype as unknown as { start: () => Promise<void> }, 'start')
-      .mockImplementation(() => d.promise);
+      .mockImplementation(function (this: { status: string }) {
+        // These tests race timing around a parked start(), not a startup
+        // failure -- once the deferred promise resolves, simulate the same
+        // status transition a real successful start() performs, so
+        // startAgentNow's post-start liveness check does not misread these
+        // parked-then-resolved starts as failed and roll them back.
+        return d.promise.then(() => { this.status = 'running'; });
+      });
 
     const p = am.startAgent('alice', agentDir);
     await Promise.resolve();                       // let startAgent reach the park
@@ -566,7 +578,14 @@ describe('AgentManager map-entry race — the activity poller attaches to the en
     const { AgentProcess } = await import('../../../src/daemon/agent-process.js');
     const startSpy = vi
       .spyOn(AgentProcess.prototype as unknown as { start: () => Promise<void> }, 'start')
-      .mockImplementation(() => d.promise);
+      .mockImplementation(function (this: { status: string }) {
+        // These tests race timing around a parked start(), not a startup
+        // failure -- once the deferred promise resolves, simulate the same
+        // status transition a real successful start() performs, so
+        // startAgentNow's post-start liveness check does not misread these
+        // parked-then-resolved starts as failed and roll them back.
+        return d.promise.then(() => { this.status = 'running'; });
+      });
 
     const p = am.startAgent('alice', agentDir, undefined, 'acme');
     await Promise.resolve();
@@ -618,7 +637,7 @@ describe('AgentManager map-entry race — poller callbacks act on their own entr
     agentsOf(am).set('alice', E2);
 
     // An unauthorized sender: ALLOWED_USER is 999, this is not it.
-    poller.messageHandlers[0]({ from: { id: 111, first_name: 'mallory' }, chat: { id: 999 }, text: 'hi' });
+    poller.messageHandlers[0]({ from: { id: 111, first_name: 'mallory' }, chat: { id: 999 }, text: 'hi' }, { deliveryId: 'test' });
 
     expect(ownEntry.telegramRejectCount).toBe(1);
     expect(E2.telegramRejectCount).toBeUndefined();
@@ -633,7 +652,7 @@ describe('AgentManager map-entry race — poller callbacks act on their own entr
     const E2 = fakeEntry(async () => {}) as unknown as AgentEntryLike;
     agentsOf(am).set('alice', E2);
 
-    poller.reactionHandlers[0]({ user: { id: 111, first_name: 'mallory' }, chat: { id: 999 }, message_id: 1 });
+    poller.reactionHandlers[0]({ user: { id: 111, first_name: 'mallory' }, chat: { id: 999 }, message_id: 1 }, { deliveryId: 'test' });
 
     expect(ownEntry.telegramRejectCount).toBe(1);
     expect(E2.telegramRejectCount).toBeUndefined();
@@ -836,7 +855,14 @@ describe('AgentManager map-entry race — startAgent must not wire a scheduler i
     const { AgentProcess } = await import('../../../src/daemon/agent-process.js');
     const startSpy = vi
       .spyOn(AgentProcess.prototype as unknown as { start: () => Promise<void> }, 'start')
-      .mockImplementation(() => d.promise);
+      .mockImplementation(function (this: { status: string }) {
+        // These tests race timing around a parked start(), not a startup
+        // failure -- once the deferred promise resolves, simulate the same
+        // status transition a real successful start() performs, so
+        // startAgentNow's post-start liveness check does not misread these
+        // parked-then-resolved starts as failed and roll them back.
+        return d.promise.then(() => { this.status = 'running'; });
+      });
     const p = am.startAgent('alice', agentDir);
     await Promise.resolve();
     return { p, d, startSpy };
@@ -1077,7 +1103,7 @@ describe('AgentManager map-entry race — round 3: an unmapped entry must not ac
     // A message already in flight in the getUpdates batch that was open when
     // stop() was called. The poller mock does not itself gate delivery, which
     // mirrors the real class: stop() sets a flag, it cannot recall a batch.
-    pollerA.messageHandlers[0]({ from: { id: 111 } });
+    pollerA.messageHandlers[0]({ from: { id: 111 } }, { deliveryId: 'test' });
 
     // UNPATCHED this is 1 — and at the threshold it sends a WATCHDOG Telegram on
     // behalf of an agent the operator has already stopped.
@@ -1089,7 +1115,7 @@ describe('AgentManager map-entry race — round 3: an unmapped entry must not ac
     const entryA = entryOf(am, 'alice');
     const pollerA = entryA.poller as PollerLike;
 
-    pollerA.messageHandlers[0]({ from: { id: 111 } });
+    pollerA.messageHandlers[0]({ from: { id: 111 } }, { deliveryId: 'test' });
 
     // 0 here means the guard swallowed the live path: the ALLOWED_USER watchdog
     // silently stops working and unsolicited contact is never surfaced. That is
@@ -1104,7 +1130,7 @@ describe('AgentManager map-entry race — round 3: an unmapped entry must not ac
     expect(pollerA.reactionHandlers.length).toBe(1);  // positive control
 
     await am.stopAgent('alice', true);
-    pollerA.reactionHandlers[0]({ user: { id: 111 } });
+    pollerA.reactionHandlers[0]({ user: { id: 111 } }, { deliveryId: 'test' });
 
     expect(entryA.telegramRejectCount ?? 0).toBe(0);
   });
@@ -1114,7 +1140,7 @@ describe('AgentManager map-entry race — round 3: an unmapped entry must not ac
     const entryA = entryOf(am, 'alice');
     const pollerA = entryA.poller as PollerLike;
 
-    pollerA.reactionHandlers[0]({ user: { id: 111 } });
+    pollerA.reactionHandlers[0]({ user: { id: 111 } }, { deliveryId: 'test' });
 
     expect(entryA.telegramRejectCount).toBe(1);
   });
@@ -1132,7 +1158,14 @@ describe('AgentManager map-entry race — round 3: an unmapped entry must not ac
     const { AgentProcess } = await import('../../../src/daemon/agent-process.js');
     const startSpy = vi
       .spyOn(AgentProcess.prototype as unknown as { start: () => Promise<void> }, 'start')
-      .mockImplementation(() => d.promise);
+      .mockImplementation(function (this: { status: string }) {
+        // These tests race timing around a parked start(), not a startup
+        // failure -- once the deferred promise resolves, simulate the same
+        // status transition a real successful start() performs, so
+        // startAgentNow's post-start liveness check does not misread these
+        // parked-then-resolved starts as failed and roll them back.
+        return d.promise.then(() => { this.status = 'running'; });
+      });
 
     const p = am.startAgent('alice', agentDir);
     await Promise.resolve();                          // reach the park inside start()
@@ -1169,7 +1202,14 @@ describe('AgentManager map-entry race — round 3: an unmapped entry must not ac
     const { AgentProcess } = await import('../../../src/daemon/agent-process.js');
     const startSpy = vi
       .spyOn(AgentProcess.prototype as unknown as { start: () => Promise<void> }, 'start')
-      .mockImplementation(() => d.promise);
+      .mockImplementation(function (this: { status: string }) {
+        // These tests race timing around a parked start(), not a startup
+        // failure -- once the deferred promise resolves, simulate the same
+        // status transition a real successful start() performs, so
+        // startAgentNow's post-start liveness check does not misread these
+        // parked-then-resolved starts as failed and roll them back.
+        return d.promise.then(() => { this.status = 'running'; });
+      });
 
     const p = am.startAgent('alice', agentDir);
     await Promise.resolve();
