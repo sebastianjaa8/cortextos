@@ -1,3 +1,4 @@
+import { join } from 'path';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 vi.mock('../../../src/utils/process-ownership.js', () => ({
@@ -198,11 +199,29 @@ describe('AgentProcess - Hermes runtime: shouldContinue', () => {
     expect(mockPty.spawn).toHaveBeenCalledWith('fresh', expect.any(String));
   });
 
-  it('spawns in continue mode when Hermes state.db exists', async () => {
+  it('spawns in continue mode when Hermes state.db exists and the agent has booted before', async () => {
     mockHermesDbExists.mockReturnValue(true);
+    fsMocks.existsSync.mockImplementation((p: string) => String(p).endsWith('.hermes-booted'));
     const ap = new AgentProcess('hermes-agent', mockEnv, { runtime: 'hermes' });
     await ap.start();
     expect(mockPty.spawn).toHaveBeenCalledWith('continue', expect.any(String));
+  });
+
+  it('spawns fresh when state.db exists but this agent never booted (no .hermes-booted)', async () => {
+    // hermes -c with no session for the --in workspace falls back to the profile's
+    // latest session of any kind, so a shared/used profile must not be resumed blindly.
+    mockHermesDbExists.mockReturnValue(true);
+    const ap = new AgentProcess('hermes-agent', mockEnv, { runtime: 'hermes' });
+    await ap.start();
+    expect(mockPty.spawn).toHaveBeenCalledWith('fresh', expect.any(String));
+  });
+
+  it('writes .hermes-booted after a successful hermes spawn', async () => {
+    mockHermesDbExists.mockReturnValue(false);
+    const ap = new AgentProcess('hermes-agent', mockEnv, { runtime: 'hermes' });
+    await ap.start();
+    const written = fsMocks.writeFileSync.mock.calls.map((c: unknown[]) => String(c[0]));
+    expect(written.some((p: string) => p.endsWith(join('state', 'hermes-agent', '.hermes-booted')))).toBe(true);
   });
 
   it('resolves HERMES_HOME from the PTY env files (agent .env), not the daemon env', async () => {
@@ -353,6 +372,7 @@ describe('AgentProcess - Hermes runtime: shouldContinue', () => {
     // the two-probe version made twice.
     let statCalls = 0;
     fsMocks.existsSync.mockImplementation((p: string) => {
+      if (String(p).endsWith('.hermes-booted')) return true; // booted before, so continue is eligible
       if (!String(p).endsWith('.force-fresh')) return false;
       return statCalls > 0;
     });

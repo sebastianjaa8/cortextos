@@ -14,6 +14,12 @@ const HERMES_BOOTSTRAP_PATTERN = '❯';
 // Using a file avoids bracketed paste (ESC[200~) which is buggy in Hermes
 // (NousResearch/hermes-agent issue #7316 — leaked markers corrupt input).
 const STARTUP_PROMPT_FILE = '.cortextos-startup.md';
+const STARTUP_SETTLE_TICK_MS = 1000;
+const STARTUP_SETTLE_MAX_TICKS = 15;
+const STARTUP_TYPE_SETTLE_MS = 300;
+// A submitted turn prints a spinner/tool output far beyond a redraw of the typed line.
+const STARTUP_SUBMIT_MIN_BYTES = 500;
+const STARTUP_ENTER_VERIFY_MS = [4000, 10000, 20000];
 
 /**
  * PTY wrapper for Hermes agents (NousResearch/hermes-agent, Python REPL).
@@ -122,17 +128,32 @@ export class HermesPTY extends AgentPTY {
   }
 
   private async waitForPromptThenInject(timeoutMs = 30000): Promise<void> {
+    const buffer = this.getOutputBuffer();
     const start = Date.now();
-    while (Date.now() - start < timeoutMs) {
-      if (this.getOutputBuffer().isBootstrapped()) {
-        // `❯` appeared — Hermes is ready. Inject the read command.
-        this.write(`Read ${STARTUP_PROMPT_FILE} and follow the instructions there.\r`);
-        return;
-      }
+    while (Date.now() - start < timeoutMs && !buffer.isBootstrapped()) {
       await sleep(500);
     }
-    // Timeout: Hermes took too long to boot. Inject anyway and let it handle.
-    this.write(`Read ${STARTUP_PROMPT_FILE} and follow the instructions there.\r`);
+    // `❯` can paint before Hermes finishes its boot output (update notice, tips);
+    // a line typed then is echoed but its Enter is swallowed. Observed live:
+    // the startup read sat unsubmitted at the prompt. Wait for output to settle.
+    let last = buffer.getTotalBytes();
+    for (let i = 0; i < STARTUP_SETTLE_MAX_TICKS; i++) {
+      await sleep(STARTUP_SETTLE_TICK_MS);
+      const now = buffer.getTotalBytes();
+      if (now === last) break;
+      last = now;
+    }
+    this.write(`Read ${STARTUP_PROMPT_FILE} and follow the instructions there.`);
+    await sleep(STARTUP_TYPE_SETTLE_MS);
+    // Submit, then verify a turn actually started (output well beyond the echo);
+    // re-send Enter if not. Same verify-and-retry shape as inject.ts.
+    for (const delay of STARTUP_ENTER_VERIFY_MS) {
+      const before = buffer.getTotalBytes();
+      this.write('\r');
+      await sleep(delay);
+      if (buffer.getTotalBytes() - before >= STARTUP_SUBMIT_MIN_BYTES) return;
+    }
+    console.error('[hermes-pty] Startup read may not have been submitted (no turn output after retries)');
   }
 
 }

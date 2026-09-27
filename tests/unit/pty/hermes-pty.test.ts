@@ -127,3 +127,49 @@ describe('HermesPTY', () => {
     expect(pty.getOutputBuffer().isBootstrapped()).toBe(false);
   });
 });
+
+describe('HermesPTY startup injection', () => {
+  type Inj = { waitForPromptThenInject(t?: number): Promise<void>; write(d: string): void };
+
+  it('waits for boot output to settle, types the read line, retries Enter until a turn starts', async () => {
+    vi.useFakeTimers();
+    try {
+      const pty = new HermesPTY(mockEnv, {});
+      const writes: string[] = [];
+      (pty as unknown as Inj).write = (d: string) => { writes.push(d); };
+      pty.getOutputBuffer().push('⚔ ❯ ');
+      const p = (pty as unknown as Inj).waitForPromptThenInject();
+      await vi.advanceTimersByTimeAsync(500);
+      pty.getOutputBuffer().push('⚠ 599 commits behind — run hermes update');  // late boot output
+      await vi.advanceTimersByTimeAsync(3000);
+      expect(writes[0]).toBe('Read .cortextos-startup.md and follow the instructions there.');
+      // First Enter swallowed (no turn output); second produces a turn.
+      await vi.advanceTimersByTimeAsync(4500);
+      expect(writes.filter(w => w === '\r').length).toBe(2);
+      pty.getOutputBuffer().push('x'.repeat(600));
+      await vi.advanceTimersByTimeAsync(10000);
+      await p;
+      expect(writes.filter(w => w === '\r').length).toBe(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('never types before output has settled', async () => {
+    vi.useFakeTimers();
+    try {
+      const pty = new HermesPTY(mockEnv, {});
+      const writes: string[] = [];
+      (pty as unknown as Inj).write = (d: string) => { writes.push(d); };
+      pty.getOutputBuffer().push('⚔ ❯ ');
+      void (pty as unknown as Inj).waitForPromptThenInject();
+      for (let i = 0; i < 5; i++) {
+        pty.getOutputBuffer().push(`boot line ${i}`);
+        await vi.advanceTimersByTimeAsync(1000);
+      }
+      expect(writes).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
