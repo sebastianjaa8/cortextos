@@ -97,38 +97,7 @@ export class AgentPTY {
       CRM_TEMPLATE_ROOT: this.env.frameworkRoot,
     };
 
-    // Source org-level shared secrets (orgs/{org}/secrets.env).
-    // These are shared across all agents in the org: OPENAI_KEY, APIFY_TOKEN, GEMINI_API_KEY, etc.
-    // Agent .env is loaded after and overrides org values — agent-specific keys win.
-    if (this.env.org && this.env.projectRoot) {
-      const orgEnvFile = join(this.env.projectRoot, 'orgs', this.env.org, 'secrets.env');
-      if (existsSync(orgEnvFile)) {
-        const content = readFileSync(orgEnvFile, 'utf-8');
-        for (const line of content.split('\n')) {
-          const trimmed = line.trim();
-          if (!trimmed || trimmed.startsWith('#')) continue;
-          const eqIdx = trimmed.indexOf('=');
-          if (eqIdx > 0) {
-            ptyEnv[trimmed.slice(0, eqIdx).trim()] = trimmed.slice(eqIdx + 1).trim();
-          }
-        }
-      }
-    }
-
-    // Source agent .env file (overrides org secrets.env for same key names).
-    // Contains agent-specific secrets: BOT_TOKEN, CHAT_ID, CLAUDE_CODE_OAUTH_TOKEN.
-    const agentEnvFile = join(this.env.agentDir, '.env');
-    if (existsSync(agentEnvFile)) {
-      const content = readFileSync(agentEnvFile, 'utf-8');
-      for (const line of content.split('\n')) {
-        const trimmed = line.trim();
-        if (!trimmed || trimmed.startsWith('#')) continue;
-        const eqIdx = trimmed.indexOf('=');
-        if (eqIdx > 0) {
-          ptyEnv[trimmed.slice(0, eqIdx).trim()] = trimmed.slice(eqIdx + 1).trim();
-        }
-      }
-    }
+    Object.assign(ptyEnv, readPtyEnvFiles(this.env));
 
     // Add convenience CTX_* aliases used throughout agent templates.
     // CTX_TELEGRAM_CHAT_ID: alias for CHAT_ID from the agent's .env
@@ -475,4 +444,32 @@ export class AgentPTY {
 
     return env;
   }
+}
+
+/**
+ * Merge orgs/{org}/secrets.env then the agent .env (agent wins for the same key).
+ * Org secrets are shared across the org (OPENAI_KEY, GEMINI_API_KEY, ...); the agent
+ * .env holds agent-specific keys (BOT_TOKEN, CHAT_ID, HERMES_HOME). An empty value
+ * (`KEY=`) is kept, so an agent can blank an org secret.
+ *
+ * Exported so the daemon resolves env-dependent decisions (e.g. HermesPTY's
+ * HERMES_HOME for --continue) from exactly what the PTY process will see.
+ */
+export function readPtyEnvFiles(env: CtxEnv): Record<string, string> {
+  const out: Record<string, string> = {};
+  const files: string[] = [];
+  if (env.org && env.projectRoot) files.push(join(env.projectRoot, 'orgs', env.org, 'secrets.env'));
+  files.push(join(env.agentDir, '.env'));
+  for (const file of files) {
+    if (!existsSync(file)) continue;
+    for (const line of readFileSync(file, 'utf-8').split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) continue;
+      const eqIdx = trimmed.indexOf('=');
+      if (eqIdx > 0) {
+        out[trimmed.slice(0, eqIdx).trim()] = trimmed.slice(eqIdx + 1).trim();
+      }
+    }
+  }
+  return out;
 }

@@ -2082,15 +2082,14 @@ export class AgentManager {
    *
    * Called by the IPC server after a `bus add-cron` / `bus remove-cron` write so
    * the daemon-level scheduler picks up the new definition without waiting for
-   * the next 30 s tick.  Returns true on a successful reload (or no-op for
-   * Hermes agents, which manage their own crons natively); false if the agent
+   * the next 30 s tick.  Returns true on a successful reload; false if the agent
    * is not running at all.
    *
    * Iter 7 fix: previously this returned `true` for any registered agent even
    * when no scheduler existed in `cronSchedulers`, silently dropping reload
    * requests during the start-window gap between `this.agents.set(name, ...)`
    * and `startAgentCronScheduler(name)` (across the `await agentProcess.start()`
-   * yield in `startAgent`). Now: for non-Hermes agents that lack a scheduler we
+   * yield in `startAgent`). Now: for agents that lack a scheduler we
    * lazy-wire one so the just-written crons.json is read immediately.
    */
   reloadCrons(agentName: string): boolean {
@@ -2104,14 +2103,7 @@ export class AgentManager {
     const entry = this.agents.get(agentName);
     if (!entry) return false;
 
-    // Hermes manages its own crons natively — no daemon scheduler exists by
-    // design. The reload IS a no-op; report success so the caller does not
-    // retry forever.
-    if (entry.process['config']?.runtime === 'hermes') {
-      return true;
-    }
-
-    // Non-Hermes agent registered but no scheduler: this is the start-window
+    // Agent registered but no scheduler: this is the start-window
     // gap. Lazy-wire the scheduler now; its start() reads crons.json which
     // already contains the new entry the caller just wrote.
     this.startAgentCronScheduler(agentName);
@@ -2187,12 +2179,6 @@ export class AgentManager {
 
     const entry = this.agents.get(agentName);
     if (!entry) return;
-
-    // Hermes manages its own cron scheduling — don't double-schedule
-    if (entry.process['config']?.runtime === 'hermes') {
-      console.log(`[daemon] Skipping external cron scheduler for Hermes agent "${agentName}"`);
-      return;
-    }
 
     const onFire = async (cron: CronDefinition): Promise<void> => {
       // DELIBERATE EXCEPTION to the identity rule: this fires on a timer long

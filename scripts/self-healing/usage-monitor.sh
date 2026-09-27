@@ -64,7 +64,8 @@ start_iso=$(echo "$active" | "$JQ_BIN" -r '.startTime')
 # Strip the .NNNZ suffix and parse as UTC
 start_unix=""
 if [[ "$OSTYPE" == "darwin"* ]]; then
-  start_unix=$(date -j -u -f "%Y-%m-%dT%H:%M:%S" "${start_iso%.*}" +%s 2>/dev/null)
+  # GNU date may be first on PATH (coreutils gnubin, 2026-09-27); fall back to it.
+  start_unix=$(date -j -u -f "%Y-%m-%dT%H:%M:%S" "${start_iso%.*}" +%s 2>/dev/null || date -u -d "${start_iso}" +%s 2>/dev/null)
 else
   start_unix=$(date -u -d "${start_iso}" +%s 2>/dev/null)
 fi

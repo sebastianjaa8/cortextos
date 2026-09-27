@@ -84,18 +84,35 @@ describe('HermesPTY', () => {
     expect(resolveHermesBinary('C:\\missing;C:\\tools')).toBe(join('C:\\tools', 'hermes.exe'));
   });
 
-  it('buildClaudeArgs returns [] for fresh mode', () => {
+  it('buildClaudeArgs pins classic REPL + agent workspace for fresh mode', () => {
     const pty = new HermesPTY(mockEnv, {});
     const args = (pty as unknown as { buildClaudeArgs(m: string, p: string): string[] })
       .buildClaudeArgs('fresh', 'hello');
-    expect(args).toEqual([]);
+    expect(args).toEqual(['--cli', '--in', mockEnv.agentDir]);
   });
 
-  it('buildClaudeArgs returns ["--continue"] for continue mode', () => {
+  it('buildClaudeArgs adds --continue for continue mode (resume scoped by --in)', () => {
     const pty = new HermesPTY(mockEnv, {});
     const args = (pty as unknown as { buildClaudeArgs(m: string, p: string): string[] })
       .buildClaudeArgs('continue', 'hello');
-    expect(args).toEqual(['--continue']);
+    expect(args).toEqual(['--cli', '--in', mockEnv.agentDir, '--continue']);
+  });
+
+  it('buildClaudeArgs uses working_directory for --in when configured', () => {
+    const pty = new HermesPTY(mockEnv, { working_directory: '/work/dir' });
+    const args = (pty as unknown as { buildClaudeArgs(m: string, p: string): string[] })
+      .buildClaudeArgs('fresh', 'hello');
+    expect(args).toEqual(['--cli', '--in', '/work/dir']);
+  });
+
+  it('never passes -m or --yolo', () => {
+    const pty = new HermesPTY(mockEnv, {});
+    const b = pty as unknown as { buildClaudeArgs(m: string, p: string): string[] };
+    for (const mode of ['fresh', 'continue']) {
+      const args = b.buildClaudeArgs(mode, 'hello');
+      expect(args).not.toContain('-m');
+      expect(args).not.toContain('--yolo');
+    }
   });
 
   it('isBootstrapped() fires on "❯" in output', () => {
@@ -108,5 +125,51 @@ describe('HermesPTY', () => {
     const pty = new HermesPTY(mockEnv, {});
     pty.getOutputBuffer().push('loading...');
     expect(pty.getOutputBuffer().isBootstrapped()).toBe(false);
+  });
+});
+
+describe('HermesPTY startup injection', () => {
+  type Inj = { waitForPromptThenInject(t?: number): Promise<void>; write(d: string): void };
+
+  it('waits for boot output to settle, types the read line, retries Enter until a turn starts', async () => {
+    vi.useFakeTimers();
+    try {
+      const pty = new HermesPTY(mockEnv, {});
+      const writes: string[] = [];
+      (pty as unknown as Inj).write = (d: string) => { writes.push(d); };
+      pty.getOutputBuffer().push('⚔ ❯ ');
+      const p = (pty as unknown as Inj).waitForPromptThenInject();
+      await vi.advanceTimersByTimeAsync(500);
+      pty.getOutputBuffer().push('⚠ 599 commits behind — run hermes update');  // late boot output
+      await vi.advanceTimersByTimeAsync(3000);
+      expect(writes[0]).toBe('Read .cortextos-startup.md and follow the instructions there.');
+      // First Enter swallowed (no turn output); second produces a turn.
+      await vi.advanceTimersByTimeAsync(4500);
+      expect(writes.filter(w => w === '\r').length).toBe(2);
+      pty.getOutputBuffer().push('x'.repeat(600));
+      await vi.advanceTimersByTimeAsync(10000);
+      await p;
+      expect(writes.filter(w => w === '\r').length).toBe(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('never types before output has settled', async () => {
+    vi.useFakeTimers();
+    try {
+      const pty = new HermesPTY(mockEnv, {});
+      const writes: string[] = [];
+      (pty as unknown as Inj).write = (d: string) => { writes.push(d); };
+      pty.getOutputBuffer().push('⚔ ❯ ');
+      void (pty as unknown as Inj).waitForPromptThenInject();
+      for (let i = 0; i < 5; i++) {
+        pty.getOutputBuffer().push(`boot line ${i}`);
+        await vi.advanceTimersByTimeAsync(1000);
+      }
+      expect(writes).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

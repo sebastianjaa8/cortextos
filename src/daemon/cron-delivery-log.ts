@@ -80,6 +80,13 @@ function rotateIfNeeded(filePath: string): void {
  * Called from AgentProcess.drainTick() on confirmed successful PTY delivery ONLY — there is no
  * failure variant of this call (failure already has emitDroppedInjectEvent's bus event).
  * Must not throw — any I/O error is swallowed so it never disrupts the drain loop.
+ *
+ * Same silent-swallow gap as cron-execution-log.ts's appendExecutionLog(), same partial fix
+ * (task_1790474717185 item 1, 2026-09-27): a write failure here used to be indistinguishable
+ * from "delivery genuinely still pending" — Codex review flagged that the "absence means
+ * pending or lost" diagnosis in the broader design doc is unsound while BOTH loggers can fail
+ * silently. console.error does not make absence unambiguous on its own, but it stops this
+ * specific write failure from vanishing with zero trace anywhere.
  */
 export function appendDeliveryLog(
   agentName: string,
@@ -93,8 +100,13 @@ export function appendDeliveryLog(
     appendFileSync(filePath, line, { encoding: 'utf-8' });
 
     rotateIfNeeded(filePath);
-  } catch {
-    // Never crash the caller — delivery logging is observational only.
+  } catch (err) {
+    // Never crash the caller — delivery logging is observational only. But
+    // never used to say why it failed, either.
+    console.error(
+      `[cron-delivery-log] failed to write entry for agent "${agentName}" ` +
+      `(cron "${entry.cron}"): ${err instanceof Error ? err.message : String(err)}`,
+    );
   }
 }
 

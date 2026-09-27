@@ -1,8 +1,8 @@
-import { appendFileSync, existsSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'fs';
 import { join, sep } from 'path';
 import { homedir } from 'os';
 import type { AgentConfig, AgentStatus, CtxEnv } from '../types/index.js';
-import { AgentPTY } from '../pty/agent-pty.js';
+import { AgentPTY, readPtyEnvFiles } from '../pty/agent-pty.js';
 import { CodexAppServerPTY } from '../pty/codex-app-server-pty.js';
 import { CodexExecPTY, codexExecSessionExists } from '../pty/codex-exec-pty.js';
 import { HermesPTY, hermesDbExists } from '../pty/hermes-pty.js';
@@ -325,6 +325,7 @@ export class AgentProcess {
       // Gated on mode: a marker that did not select `fresh` was never honoured
       // and must survive for the next start.
       if (mode === 'fresh' && observedForceFresh) this.deleteForceFreshMarker(observedForceFresh);
+      if (this.config.runtime === 'hermes') this.writeHermesBootedMarker();
 
       this.maybeSendRuntimeLifecycleNotification();
 
@@ -1425,6 +1426,27 @@ export class AgentProcess {
     } catch { /* best effort — a stray reserve file is inert */ }
   }
 
+  private hermesBootedMarkerPath(): string {
+    return join(this.env.ctxRoot, 'state', this.name, '.hermes-booted');
+  }
+
+  /** Records that this hermes agent has had a successful spawn (see shouldContinue). */
+  private writeHermesBootedMarker(): void {
+    try {
+      mkdirSync(join(this.env.ctxRoot, 'state', this.name), { recursive: true });
+      writeFileSync(this.hermesBootedMarkerPath(), new Date().toISOString() + '\n', 'utf-8');
+    } catch (err) {
+      this.log(`Failed to write .hermes-booted marker: ${err}`);
+    }
+  }
+
+  /** Startup-prompt cron line. Hermes has no CronCreate/CronList tools, so name what it does have. */
+  private cronRestoreNote(): string {
+    return this.config.runtime === 'hermes'
+      ? 'Crons are scheduled by the cortextOS daemon and arrive as [CRON FIRED <ts>] <name>: messages — do NOT create your own schedules (no hermes cron jobs).'
+      : 'External crons are auto-loaded by the daemon — do NOT call CronCreate or CronList for cron restoration.';
+  }
+
   private shouldContinue(
     observedForceFresh: { ino: number; mtimeMs: number; size: number } | null,
   ): boolean {
@@ -1445,11 +1467,19 @@ export class AgentProcess {
       return false;
     }
 
-    // Hermes: session continuity is determined by whether the SQLite DB exists.
-    // HERMES_HOME env var overrides the default ~/.hermes path.
+    // Hermes: session continuity is determined by whether the SQLite DB exists
+    // in the profile the PTY will actually run. The PTY does not inherit the
+    // daemon's HERMES_HOME (getBaseEnv allowlist); it gets it only from
+    // secrets.env / the agent .env, so resolve it from the same files. Reading
+    // process.env here checked ~/.hermes (a personal profile) for an agent
+    // whose PTY runs a dedicated profile.
     if (this.config.runtime === 'hermes') {
-      const hermesHome = process.env['HERMES_HOME'];
-      return hermesDbExists(hermesHome);
+      // state.db alone is not enough: with no session yet for the agent's --in
+      // workspace, `hermes -c` falls back to the profile's latest session of any
+      // kind (observed: it resumed a CLI oneshot in /tmp). Only continue once this
+      // agent has booted at least once, so its own workspace session exists.
+      const hermesHome = readPtyEnvFiles(this.env)['HERMES_HOME'];
+      return hermesDbExists(hermesHome || undefined) && existsSync(this.hermesBootedMarkerPath());
     }
 
     // codex-app-server: session continuity is tracked by the adapter's own
@@ -1536,7 +1566,7 @@ export class AgentProcess {
     const onlineMessage = isHandoffRestart || !shouldPromptTelegram
       ? ''
       : ' Send a Telegram message to the user saying you are back online.';
-    return `You are starting a new session. Current UTC time: ${nowUtc}. Read AGENTS.md and all bootstrap files listed there. External crons are auto-loaded by the daemon — do NOT call CronCreate or CronList for cron restoration.${reminderBlock}${deliverablesBlock}${handoffBlock}${handoffUxOverride}${onlineMessage}${onboardingAppend}`;
+    return `You are starting a new session. Current UTC time: ${nowUtc}. Read AGENTS.md and all bootstrap files listed there. ${this.cronRestoreNote()}${reminderBlock}${deliverablesBlock}${handoffBlock}${handoffUxOverride}${onlineMessage}${onboardingAppend}`;
   }
 
   private buildContinuePrompt(): string {
@@ -1548,7 +1578,7 @@ export class AgentProcess {
     const onlineMessage = this.shouldPromptTelegramOnlineMessage()
       ? ' After checking inbox, send a Telegram message to the user saying you are back online.'
       : '';
-    return `SESSION CONTINUATION: Your CLI process was restarted with --continue to reload configs. Current UTC time: ${nowUtc}. Your full conversation history is preserved. Re-read AGENTS.md and ALL bootstrap files listed there. External crons are auto-loaded by the daemon — do NOT call CronCreate or CronList for cron restoration.${reminderBlock}${deliverablesBlock} Check inbox. Resume normal operations.${onlineMessage}`;
+    return `SESSION CONTINUATION: Your CLI process was restarted with --continue to reload configs. Current UTC time: ${nowUtc}. Your full conversation history is preserved. Re-read AGENTS.md and ALL bootstrap files listed there. ${this.cronRestoreNote()}${reminderBlock}${deliverablesBlock} Check inbox. Resume normal operations.${onlineMessage}`;
   }
 
   private shouldPromptTelegramOnlineMessage(): boolean {

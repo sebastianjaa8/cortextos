@@ -110,6 +110,18 @@ function rotateIfNeeded(filePath: string): void {
  * This is the only public function; it is called by the scheduler's fire path.
  * It must not throw — any I/O error is swallowed so it never disrupts scheduling.
  *
+ * A swallowed write failure here used to leave NO trace anywhere — a genuinely
+ * exhausted retry (fireWithRetry giving up and calling this with status:
+ * 'failed') and a disk-full/permission error ON THIS WRITE were
+ * indistinguishable from "never attempted" (task_1790474717185 item 1,
+ * partial fix 2026-09-27 — the fireId/per-tick-decision correlation design
+ * this was scoped out of is tracked separately, still under Codex review).
+ * console.error is a partial fix, not a full one: it surfaces the failure to
+ * the daemon's own stderr/process log for a human or a future structured
+ * reader to find, but does not itself distinguish "logged the failure
+ * successfully to a DIFFERENT channel" from "reader never looked at stderr
+ * either" — still strictly better than the prior silent discard.
+ *
  * @param agentName - Agent whose log file to write.
  * @param entry     - Log entry to append.
  */
@@ -127,7 +139,14 @@ export function appendExecutionLog(
     // Rotation check: only pay the stat cost when the file might be large.
     // This is a fast path for the common case.
     rotateIfNeeded(filePath);
-  } catch {
-    // Never crash the caller — execution logging is observational only.
+  } catch (err) {
+    // Never crash the caller — execution logging is observational only. But
+    // never used to say why it failed, either — a write failure here read
+    // identically to a cron that never fired.
+    console.error(
+      `[cron-execution-log] failed to write entry for agent "${agentName}" ` +
+      `(cron "${entry.cron}", status "${entry.status}"): ` +
+      `${err instanceof Error ? err.message : String(err)}`,
+    );
   }
 }

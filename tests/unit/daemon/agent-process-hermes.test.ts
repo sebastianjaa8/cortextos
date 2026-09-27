@@ -1,3 +1,4 @@
+import { join } from 'path';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 vi.mock('../../../src/utils/process-ownership.js', () => ({
@@ -36,8 +37,12 @@ const mockPty = {
   }),
 };
 
+// readPtyEnvFiles is what shouldContinue() resolves HERMES_HOME from — controlled per-test.
+const mockReadPtyEnvFiles = vi.fn().mockReturnValue({});
+
 vi.mock('../../../src/pty/agent-pty.js', () => ({
   AgentPTY: function AgentPTY() { return mockPty; },
+  readPtyEnvFiles: (...args: unknown[]) => mockReadPtyEnvFiles(...args),
 }));
 
 // hermesDbExists is the key hook — we control it per-test
@@ -59,10 +64,7 @@ vi.mock('../../../src/utils/atomic.js', () => ({
   atomicWriteSync: vi.fn(),
 }));
 
-// Partial mock: resolveHermesHome() now parses the agent .env through the shared
-// parseEnvFile so it agrees with AgentPTY about the same file, so the REAL parser
-// must stay reachable here. Stubbing it out would make this suite pass against a
-// resolver that no longer parses anything.
+// Partial mock: keep the real env.ts helpers reachable; only stub the writers.
 vi.mock('../../../src/utils/env.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../../src/utils/env.js')>()),
   writeCortextosEnv: vi.fn(),
@@ -197,26 +199,63 @@ describe('AgentProcess - Hermes runtime: shouldContinue', () => {
     expect(mockPty.spawn).toHaveBeenCalledWith('fresh', expect.any(String));
   });
 
-  it('spawns in continue mode when Hermes state.db exists', async () => {
+  it('spawns in continue mode when Hermes state.db exists and the agent has booted before', async () => {
     mockHermesDbExists.mockReturnValue(true);
+    fsMocks.existsSync.mockImplementation((p: string) => String(p).endsWith('.hermes-booted'));
     const ap = new AgentProcess('hermes-agent', mockEnv, { runtime: 'hermes' });
     await ap.start();
     expect(mockPty.spawn).toHaveBeenCalledWith('continue', expect.any(String));
   });
 
-  it('passes HERMES_HOME env var to hermesDbExists', async () => {
-    const originalHermesHome = process.env['HERMES_HOME'];
-    process.env['HERMES_HOME'] = '/custom/hermes';
-    mockHermesDbExists.mockReturnValue(false);
-
+  it('spawns fresh when state.db exists but this agent never booted (no .hermes-booted)', async () => {
+    // hermes -c with no session for the --in workspace falls back to the profile's
+    // latest session of any kind, so a shared/used profile must not be resumed blindly.
+    mockHermesDbExists.mockReturnValue(true);
     const ap = new AgentProcess('hermes-agent', mockEnv, { runtime: 'hermes' });
     await ap.start();
+    expect(mockPty.spawn).toHaveBeenCalledWith('fresh', expect.any(String));
+  });
 
-    expect(mockHermesDbExists).toHaveBeenCalledWith('/custom/hermes');
-    if (originalHermesHome === undefined) {
-      delete process.env['HERMES_HOME'];
-    } else {
-      process.env['HERMES_HOME'] = originalHermesHome;
+  it('writes .hermes-booted after a successful hermes spawn', async () => {
+    mockHermesDbExists.mockReturnValue(false);
+    const ap = new AgentProcess('hermes-agent', mockEnv, { runtime: 'hermes' });
+    await ap.start();
+    const written = fsMocks.writeFileSync.mock.calls.map((c: unknown[]) => String(c[0]));
+    expect(written.some((p: string) => p.endsWith(join('state', 'hermes-agent', '.hermes-booted')))).toBe(true);
+  });
+
+  it('resolves HERMES_HOME from the PTY env files (agent .env), not the daemon env', async () => {
+    const originalHermesHome = process.env['HERMES_HOME'];
+    process.env['HERMES_HOME'] = '/daemon/hermes';
+    mockReadPtyEnvFiles.mockReturnValue({ HERMES_HOME: '/agent/profile' });
+    mockHermesDbExists.mockReturnValue(false);
+    try {
+      const ap = new AgentProcess('hermes-agent', mockEnv, { runtime: 'hermes' });
+      await ap.start();
+      expect(mockReadPtyEnvFiles).toHaveBeenCalledWith(mockEnv);
+      expect(mockHermesDbExists).toHaveBeenCalledWith('/agent/profile');
+    } finally {
+      if (originalHermesHome === undefined) delete process.env['HERMES_HOME'];
+      else process.env['HERMES_HOME'] = originalHermesHome;
+      mockReadPtyEnvFiles.mockReturnValue({});
+    }
+  });
+
+  it('ignores the daemon HERMES_HOME when the env files set none (PTY does not inherit it)', async () => {
+    const originalHermesHome = process.env['HERMES_HOME'];
+    process.env['HERMES_HOME'] = '/daemon/hermes';
+    mockReadPtyEnvFiles.mockReturnValue({ HERMES_HOME: '' });
+    mockHermesDbExists.mockReturnValue(false);
+    try {
+      const ap = new AgentProcess('hermes-agent', mockEnv, { runtime: 'hermes' });
+      await ap.start();
+      // Empty/missing -> undefined -> hermesDbExists falls back to ~/.hermes, the
+      // same default the PTY's hermes process uses.
+      expect(mockHermesDbExists).toHaveBeenCalledWith(undefined);
+    } finally {
+      if (originalHermesHome === undefined) delete process.env['HERMES_HOME'];
+      else process.env['HERMES_HOME'] = originalHermesHome;
+      mockReadPtyEnvFiles.mockReturnValue({});
     }
   });
 
@@ -333,6 +372,7 @@ describe('AgentProcess - Hermes runtime: shouldContinue', () => {
     // the two-probe version made twice.
     let statCalls = 0;
     fsMocks.existsSync.mockImplementation((p: string) => {
+      if (String(p).endsWith('.hermes-booted')) return true; // booted before, so continue is eligible
       if (!String(p).endsWith('.force-fresh')) return false;
       return statCalls > 0;
     });
