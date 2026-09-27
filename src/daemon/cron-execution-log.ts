@@ -33,6 +33,7 @@ import { join, dirname } from 'path';
 import { randomBytes } from 'crypto';
 import type { CronExecutionLogEntry } from '../types/index.js';
 import { cronExecutionLogPathFor } from '../bus/crons-schema.js';
+import { resolveCtxRoot } from '../utils/env.js';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -51,9 +52,19 @@ export const ROTATION_SIZE_BYTES = 200 * 1_024;
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/** Resolve the absolute path to an agent's execution log. */
+/**
+ * Resolve the absolute path to an agent's execution log.
+ *
+ * Root comes from resolveCtxRoot(), the same helper src/bus/crons.ts uses, so
+ * this file's log path and crons.ts's crons.json path are guaranteed to agree
+ * by sharing one implementation. Previously each file had its OWN identical
+ * copy of the same `process.env.CTX_ROOT ?? process.cwd()` expression — two
+ * files that must agree on root, with nothing enforcing that agreement beyond
+ * the two copies happening to stay textually identical
+ * (task_1790474717185 item 5, fixed 2026-09-27).
+ */
 function logFilePath(agentName: string): string {
-  const ctxRoot = process.env.CTX_ROOT ?? process.cwd();
+  const ctxRoot = resolveCtxRoot();
   return join(ctxRoot, cronExecutionLogPathFor(agentName));
 }
 

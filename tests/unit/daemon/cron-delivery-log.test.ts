@@ -177,6 +177,47 @@ describe('disk persistence across module resets (simulated daemon restart)', () 
 });
 
 // ---------------------------------------------------------------------------
+// resolveCtxRoot / unset CTX_ROOT (task_1790474717185 item 5 follow-up,
+// Codex REQUEST-CHANGES 2026-09-27) — this file's logFilePath() previously
+// resolved root independently via its own `?? process.cwd()` fallback, so a
+// delivery log could land under a different root than cron-execution-log.ts's
+// sibling execution log for the same fire. Mirrors the fake-HOME + cwd-spy
+// fixture cron-execution-log.test.ts uses for the same regression.
+// ---------------------------------------------------------------------------
+
+describe('resolveCtxRoot / unset CTX_ROOT (task_1790474717185 item 5)', () => {
+  let fakeHome: string;
+  let cwdSpy: ReturnType<typeof vi.spyOn> | undefined;
+
+  beforeEach(() => {
+    fakeHome = mkdtempSync(join(tmpdir(), 'ctxroot-fakehome-delivery-'));
+    delete process.env.CTX_ROOT;
+    vi.stubEnv('HOME', fakeHome);
+    vi.stubEnv('USERPROFILE', fakeHome);
+    vi.stubEnv('CTX_INSTANCE_ID', undefined);
+    cwdSpy = vi.spyOn(process, 'cwd').mockReturnValue(tmpRoot);
+    vi.resetModules();
+  });
+
+  afterEach(() => {
+    cwdSpy?.mockRestore();
+    cwdSpy = undefined;
+    vi.unstubAllEnvs();
+    try { rmSync(fakeHome, { recursive: true }); } catch { /* ignore */ }
+  });
+
+  it('appendDeliveryLog places the log under the fake-HOME default root, not process.cwd(), when CTX_ROOT is unset', async () => {
+    const { appendDeliveryLog } = await importLog();
+    appendDeliveryLog('boris', makeEntry({ cron: 'heartbeat' }));
+
+    const fakeHomePath = join(fakeHome, '.cortextos', 'default', '.cortextOS', 'state', 'agents', 'boris', 'cron-delivery.log');
+    expect(existsSync(fakeHomePath)).toBe(true);
+    const cwdPath = join(process.cwd(), '.cortextOS', 'state', 'agents', 'boris', 'cron-delivery.log');
+    expect(existsSync(cwdPath)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Write-failure visibility (task_1790474717185 item 1 piece A, 2026-09-27)
 //
 // A write failure here used to be indistinguishable from "no delivery yet" —

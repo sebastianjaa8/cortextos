@@ -18,7 +18,7 @@ import {
   writeFileSync,
   chmodSync,
 } from 'fs';
-import { join } from 'path';
+import { join, dirname } from 'path';
 import { tmpdir } from 'os';
 import type { CronExecutionLogEntry, CronDefinition } from '../../../src/types/index';
 
@@ -501,6 +501,109 @@ describe('disk persistence across module resets', () => {
     const parsed = raw.split('\n').filter(l => l.trim()).map(l => JSON.parse(l));
     expect(parsed[0].cron).toBe('heartbeat');
     expect(parsed[0].status).toBe('fired');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// resolveCtxRoot / unset CTX_ROOT (task_1790474717185 item 5, fixed 2026-09-27)
+//
+// crons.ts's cronsFilePath() and this file's logFilePath() used to resolve
+// their root independently via `process.env.CTX_ROOT ?? process.cwd()` — when
+// CTX_ROOT was unset, a bus command invoked from the wrong directory would
+// silently create/read a `<cwd>/.cortextOS/...` tree no agent's daemon ever
+// looks at, AND the two files could disagree with each other on where that
+// tree lived. Both now go through the shared resolveCtxRoot() helper in
+// src/utils/env.ts. These tests exercise the actual regression: CTX_ROOT
+// unset, no .cortextos-env file, confirming the resolved path is under a
+// controlled fake HOME (never the real one) and NOT under process.cwd().
+// ---------------------------------------------------------------------------
+
+describe('resolveCtxRoot / unset CTX_ROOT (task_1790474717185 item 5)', () => {
+  let fakeHome: string;
+  let cwdSpy: ReturnType<typeof vi.spyOn> | undefined;
+
+  beforeEach(() => {
+    // The outer beforeEach already set CTX_ROOT=tmpRoot and reset modules;
+    // undo the CTX_ROOT part for this block specifically, and point HOME at
+    // a second, separate tempdir so the default-root fallback is observable
+    // and isolated from both tmpRoot and the real home directory.
+    fakeHome = mkdtempSync(join(tmpdir(), 'ctxroot-fakehome-'));
+    delete process.env.CTX_ROOT;
+    vi.stubEnv('HOME', fakeHome);
+    vi.stubEnv('USERPROFILE', fakeHome);
+    vi.stubEnv('CTX_INSTANCE_ID', undefined);
+    // Keep env-file discovery and any regressed cwd writes inside the sandbox.
+    cwdSpy = vi.spyOn(process, 'cwd').mockReturnValue(tmpRoot);
+    vi.resetModules();
+  });
+
+  afterEach(() => {
+    cwdSpy?.mockRestore();
+    cwdSpy = undefined;
+    vi.unstubAllEnvs();
+    try { rmSync(fakeHome, { recursive: true }); } catch { /* ignore */ }
+    // Outer afterEach restores CTX_ROOT from originalCtxRoot and rm's tmpRoot.
+  });
+
+  function fakeHomeCronsPath(agentName = 'boris'): string {
+    return join(fakeHome, '.cortextos', 'default', '.cortextOS', 'state', 'agents', agentName, 'crons.json');
+  }
+
+  function fakeHomeLogPath(agentName = 'boris'): string {
+    return join(fakeHome, '.cortextos', 'default', '.cortextOS', 'state', 'agents', agentName, 'cron-execution.log');
+  }
+
+  it('crons.ts resolves under the fake HOME default, not process.cwd(), when CTX_ROOT is unset', async () => {
+    const { writeCrons } = await importCrons();
+    writeCrons('boris', [
+      { name: 'heartbeat', prompt: 'hi', schedule: '6h', enabled: true, created_at: '2026-04-01T00:00:00.000Z' },
+    ]);
+
+    expect(existsSync(fakeHomeCronsPath())).toBe(true);
+    // The actual old bug: writing under the CURRENT PROCESS's cwd instead.
+    const cwdPath = join(process.cwd(), '.cortextOS', 'state', 'agents', 'boris', 'crons.json');
+    expect(existsSync(cwdPath)).toBe(false);
+  });
+
+  it('cron-execution-log.ts resolves under the same fake HOME default when CTX_ROOT is unset', async () => {
+    const { appendExecutionLog } = await importLog();
+    appendExecutionLog('boris', makeEntry({ cron: 'heartbeat' }));
+
+    expect(existsSync(fakeHomeLogPath())).toBe(true);
+    const cwdPath = join(process.cwd(), '.cortextOS', 'state', 'agents', 'boris', 'cron-execution.log');
+    expect(existsSync(cwdPath)).toBe(false);
+  });
+
+  it('crons.ts and cron-execution-log.ts agree on the same root when CTX_ROOT is unset', async () => {
+    // The specific disagreement Codex flagged in review: before this fix, each
+    // file's independent `?? process.cwd()` fallback could resolve to the same
+    // VALUE in a given process, but nothing enforced that — this proves both
+    // modules route through the identical resolveCtxRoot() call.
+    const { writeCrons } = await importCrons();
+    const { appendExecutionLog } = await importLog();
+
+    writeCrons('boris', [
+      { name: 'heartbeat', prompt: 'hi', schedule: '6h', enabled: true, created_at: '2026-04-01T00:00:00.000Z' },
+    ]);
+    appendExecutionLog('boris', makeEntry({ cron: 'heartbeat' }));
+
+    expect(existsSync(fakeHomeCronsPath())).toBe(true);
+    expect(existsSync(fakeHomeLogPath())).toBe(true);
+    // Both paths share the identical root prefix up through 'agents/boris'.
+    expect(dirname(fakeHomeCronsPath())).toBe(dirname(fakeHomeLogPath()));
+  });
+
+  it('getExecutionLogPage() reads back an entry written under the fake-HOME default root (Codex REQUEST-CHANGES 2026-09-27: the file-existence agreement test above never exercised this reader — a regression reverting only crons.ts:372 back to the old cwd fallback would escape it)', async () => {
+    const { appendExecutionLog } = await importLog();
+    const { getExecutionLogPage } = await importCrons();
+
+    appendExecutionLog('boris', makeEntry({ cron: 'heartbeat', status: 'fired', attempt: 3 }));
+
+    const page = getExecutionLogPage('boris');
+    expect(page.total).toBe(1);
+    expect(page.hasMore).toBe(false);
+    expect(page.entries).toHaveLength(1);
+    expect(page.entries[0]).toMatchObject({ cron: 'heartbeat', status: 'fired', attempt: 3 });
   });
 });
 

@@ -27,6 +27,7 @@ import { join, dirname } from 'path';
 import { randomBytes } from 'crypto';
 import type { CronDeliveryLogEntry } from '../types/index.js';
 import { cronDeliveryLogPathFor } from '../bus/crons-schema.js';
+import { resolveCtxRoot } from '../utils/env.js';
 
 /** Maximum number of log entries to retain per agent after rotation. Matches cron-execution-log.ts. */
 export const MAX_LOG_LINES = 1_000;
@@ -34,8 +35,15 @@ export const MAX_LOG_LINES = 1_000;
 /** Size threshold (bytes) above which we attempt log rotation. Matches cron-execution-log.ts. */
 export const ROTATION_SIZE_BYTES = 200 * 1_024;
 
+/**
+ * Root comes from resolveCtxRoot() (task_1790474717185 item 5 follow-up,
+ * Codex REQUEST-CHANGES 2026-09-27): this file previously fell back to
+ * process.cwd() independently of cron-execution-log.ts's own (now-fixed)
+ * fallback, so a delivery log and an execution log for the same cron could
+ * silently land under two different roots.
+ */
 function logFilePath(agentName: string): string {
-  const ctxRoot = process.env.CTX_ROOT ?? process.cwd();
+  const ctxRoot = resolveCtxRoot();
   return join(ctxRoot, cronDeliveryLogPathFor(agentName));
 }
 
