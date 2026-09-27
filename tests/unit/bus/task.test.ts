@@ -1251,6 +1251,117 @@ describe('task mutation verbs', () => {
     expect(audit).toMatchObject({ from_assignee: 'agent_one', to_assignee: 'agent_two' });
   });
 
+  /**
+   * ATTRIBUTION BUG (task_1785666339329, fixed 2026-09-27). Before this fix, updateTask's audit
+   * `agent` field recorded the task's ASSIGNEE, not the caller who actually ran the command —
+   * "the audit cannot answer who changed a task, which is the only question an audit exists for."
+   * Two real incidents: an agent editing a task assigned to someone else was misattributed to the
+   * assignee both times.
+   */
+  it('updateTask audits the CALLER (callerAgent), not the assignee, when they differ', () => {
+    const id = createTask(paths, 'assignor', 'org', 'T', { assignee: 'assignee_agent' });
+    updateTask(paths, id, 'in_progress', { callerAgent: 'caller_agent' });
+    const audit = readTaskAudit(paths, id).find((e) => e.event === 'update');
+    expect(audit?.agent).toBe('caller_agent');
+    expect(audit?.agent).not.toBe('assignee_agent');
+  });
+
+  // PAIRED NEGATIVE, exact-fallback: omitting callerAgent must reproduce the OLD behavior
+  // EXACTLY, including the `assignee || 'unknown'` empty-string edge case Codex's plan review
+  // caught (`callerAgent ?? assignee ?? 'unknown'` would have differed from
+  // `callerAgent ?? (assignee || 'unknown')` here) — every existing call site that never passes
+  // callerAgent must see zero behavior change.
+  it('updateTask falls back to assignee when callerAgent is omitted (backward compat)', () => {
+    const id = createTask(paths, 'assignor', 'org', 'T', { assignee: 'assignee_agent' });
+    updateTask(paths, id, 'in_progress');
+    const audit = readTaskAudit(paths, id).find((e) => e.event === 'update');
+    expect(audit?.agent).toBe('assignee_agent');
+  });
+
+  it('updateTask falls back to "unknown" when callerAgent is omitted AND assignee is empty string', () => {
+    const id = createTask(paths, 'assignor', 'org', 'T', { assignee: 'holder' });
+    updateTask(paths, id, 'in_progress', { assignee: '' });
+    const audit = readTaskAudit(paths, id).filter((e) => e.event === 'update').at(-1);
+    expect(audit?.agent).toBe('unknown');
+  });
+
+  it('completeTask audits the CALLER (callerAgent), not the assignee, when they differ', () => {
+    const id = createTask(paths, 'assignor', 'org', 'T', { assignee: 'assignee_agent' });
+    completeTask(paths, id, 'done', undefined, 'caller_agent');
+    const audit = readTaskAudit(paths, id).find((e) => e.event === 'complete');
+    expect(audit?.agent).toBe('caller_agent');
+    expect(audit?.agent).not.toBe('assignee_agent');
+  });
+
+  it('completeTask falls back to assignee when callerAgent is omitted (backward compat)', () => {
+    const id = createTask(paths, 'assignor', 'org', 'T', { assignee: 'assignee_agent' });
+    completeTask(paths, id, 'done');
+    const audit = readTaskAudit(paths, id).find((e) => e.event === 'complete');
+    expect(audit?.agent).toBe('assignee_agent');
+  });
+
+  // PAIRED with updateTask's own empty-assignee fallback test above — same exact-fallback
+  // expression (`callerAgent ?? (assignee || 'unknown')`) must hold on completeTask too. Without
+  // this case, a regression that changed ONLY completeTask to `callerAgent ?? assignee ??
+  // 'unknown'` would pass every other test in this file (Codex diff review finding, 2026-09-27).
+  it('completeTask falls back to "unknown" when callerAgent is omitted AND assignee is empty string', () => {
+    const id = createTask(paths, 'assignor', 'org', 'T', { assignee: 'holder' });
+    updateTask(paths, id, 'pending', { assignee: '' });
+    completeTask(paths, id, 'done');
+    const audit = readTaskAudit(paths, id).find((e) => e.event === 'complete');
+    expect(audit?.agent).toBe('unknown');
+  });
+
+  /**
+   * PROJECT/DUE AUDIT PARITY (task_1785666339329, added 2026-09-27). Same conditional-inclusion
+   * shape as the existing priority/assignee/title pairs above — these two fields previously had
+   * NO audit trail at all.
+   */
+  it('project change is audited with both sides', () => {
+    const id = createTask(paths, 'a', 'org', 'T', { project: 'p1' });
+    updateTask(paths, id, 'pending', { project: 'p2' });
+    const audit = readTaskAudit(paths, id).find((e) => e.from_project !== undefined);
+    expect(audit).toMatchObject({ from_project: 'p1', to_project: 'p2' });
+  });
+
+  it('does NOT write a project audit entry for a no-op re-assertion', () => {
+    const id = createTask(paths, 'a', 'org', 'T', { project: 'p1' });
+    updateTask(paths, id, 'pending', { project: 'p1' });
+    expect(readTaskAudit(paths, id).find((e) => e.from_project !== undefined)).toBeUndefined();
+  });
+
+  it('a status-only update with no --project at all writes no project audit fields', () => {
+    const id = createTask(paths, 'a', 'org', 'T', { project: 'p1' });
+    updateTask(paths, id, 'in_progress');
+    expect(readTaskAudit(paths, id).find((e) => e.from_project !== undefined)).toBeUndefined();
+  });
+
+  it('the FIRST due date a task ever gets records from_due: null (a real prior state, not an omission)', () => {
+    const id = createTask(paths, 'a', 'org', 'T'); // no dueDate at creation -> due_date is null
+    updateTask(paths, id, 'pending', { dueDate: '2026-08-01T00:00:00Z' });
+    const audit = readTaskAudit(paths, id).find((e) => e.from_due !== undefined || e.to_due !== undefined);
+    expect(audit).toMatchObject({ from_due: null, to_due: '2026-08-01T00:00:00Z' });
+  });
+
+  it('an ordinary due-date change is audited with both sides', () => {
+    const id = createTask(paths, 'a', 'org', 'T', { dueDate: '2026-08-01T00:00:00Z' });
+    updateTask(paths, id, 'pending', { dueDate: '2026-09-01T00:00:00Z' });
+    const audit = readTaskAudit(paths, id).find((e) => e.from_due !== undefined);
+    expect(audit).toMatchObject({ from_due: '2026-08-01T00:00:00Z', to_due: '2026-09-01T00:00:00Z' });
+  });
+
+  it('does NOT write a due-date audit entry for a no-op re-assertion', () => {
+    const id = createTask(paths, 'a', 'org', 'T', { dueDate: '2026-08-01T00:00:00Z' });
+    updateTask(paths, id, 'pending', { dueDate: '2026-08-01T00:00:00Z' });
+    expect(readTaskAudit(paths, id).find((e) => e.from_due !== undefined)).toBeUndefined();
+  });
+
+  it('a status-only update with no --due at all writes no due-date audit fields', () => {
+    const id = createTask(paths, 'a', 'org', 'T', { dueDate: '2026-08-01T00:00:00Z' });
+    updateTask(paths, id, 'in_progress');
+    expect(readTaskAudit(paths, id).find((e) => e.from_due !== undefined)).toBeUndefined();
+  });
+
   it('REFUSES to reassign a task another agent holds the claim-lock on', () => {
     // The one place this work can BREAK something rather than unblock it. Silently overwriting
     // assigned_to around an O_EXCL claim-lock is the double-pick race the lock exists to prevent.
