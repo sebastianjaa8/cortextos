@@ -16,6 +16,7 @@ import {
   existsSync,
   readFileSync,
   writeFileSync,
+  chmodSync,
 } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
@@ -500,5 +501,45 @@ describe('disk persistence across module resets', () => {
     const parsed = raw.split('\n').filter(l => l.trim()).map(l => JSON.parse(l));
     expect(parsed[0].cron).toBe('heartbeat');
     expect(parsed[0].status).toBe('fired');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Write-failure visibility (task_1790474717185 item 1 piece A, 2026-09-27)
+//
+// A write failure here used to be indistinguishable from "this cron never
+// fired" — the catch block discarded the error with no trace anywhere,
+// which is exactly the ambiguity that made a genuinely-exhausted retry
+// (fireWithRetry's own 'failed' entry) unverifiable. Still must never throw
+// (the scheduler cannot be disrupted by a logging failure), but a failure is
+// no longer completely silent.
+// ---------------------------------------------------------------------------
+
+describe('write-failure visibility', () => {
+  it('does not throw and logs the failure via console.error when the write fails', async () => {
+    // Force a real write failure (EACCES) rather than mocking fs — vitest/ESM
+    // cannot spy on a named fs export ("Cannot redefine property"), and a real
+    // permission failure exercises the actual error path appendFileSync throws.
+    const agentDir = join(tmpRoot, '.cortextOS', 'state', 'agents', 'boris');
+    mkdirSync(agentDir, { recursive: true });
+    chmodSync(agentDir, 0o500); // read+execute, no write
+
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const { appendExecutionLog } = await importLog();
+      expect(() =>
+        appendExecutionLog('boris', makeEntry({ cron: 'heartbeat', status: 'failed' })),
+      ).not.toThrow();
+
+      expect(errorSpy).toHaveBeenCalledTimes(1);
+      const [message] = errorSpy.mock.calls[0];
+      expect(message).toContain('boris');
+      expect(message).toContain('heartbeat');
+      expect(message).toContain('failed');
+      expect(message).toMatch(/EACCES|permission denied/i);
+    } finally {
+      chmodSync(agentDir, 0o700); // restore so afterEach's rmSync can clean up
+      errorSpy.mockRestore();
+    }
   });
 });
