@@ -596,4 +596,165 @@ describe('TelegramAPI unpooled HTTPS', () => {
     const api = new TelegramAPI('123:TEST');
     await expect(api.getUpdates(0, 1)).rejects.toMatchObject({ cause: connectFailure });
   });
+
+  // --- Codex review fixes, 2026-09-27 (task_1790461967870 follow-up) ---
+  // T7/T8 are regression tests for two P1s: a response that closes before
+  // completing used to hang postOnceUnpooled forever (no reject, no resolve),
+  // and req.setTimeout()'s idle-only clock never covered connect/queue delay.
+  // T9/T10 close the coverage gap the reviewer flagged directly: T6 above
+  // exercises only a single-leg error on an IDEMPOTENT method, which can't
+  // distinguish "retried because never_sent" from "retried because
+  // idempotent". These drive a real multi-leg AggregateError and a real
+  // ambiguous failure through sendMessage (non-idempotent) instead.
+
+  it('T7: a response that closes before end() rejects ambiguous instead of hanging forever', async () => {
+    process.env.CORTEXTOS_TELEGRAM_UNPOOLED_HTTPS = '1';
+    mockedRequest.mockImplementation(((_options: any, cb: any) => {
+      const res: any = {
+        statusCode: 200,
+        _handlers: {} as Record<string, (arg?: any) => void>,
+        on(event: string, h: (arg?: any) => void) { this._handlers[event] = h; return this; },
+        once(event: string, h: (arg?: any) => void) { this._handlers[event] = h; return this; },
+      };
+      const req: any = {
+        setTimeout: vi.fn().mockReturnThis(),
+        on: vi.fn().mockReturnThis(),
+        once: vi.fn().mockReturnThis(),
+        destroy: vi.fn(),
+        // Simulates a server that accepted the connection (headers arrived,
+        // cb(res) fired below) and then died mid-response: 'close' fires with
+        // no preceding 'end'.
+        end: vi.fn(() => {
+          res._handlers['close']?.();
+        }),
+      };
+      cb(res);
+      return req;
+    }) as any);
+
+    const api = new TelegramAPI('123:TEST');
+    await expect(api.getUpdates(0, 1)).rejects.toThrow(/connection closed before response completed/);
+  });
+
+  it('T7b: downloadFile also rejects (not hangs) on a premature close', async () => {
+    process.env.CORTEXTOS_TELEGRAM_UNPOOLED_HTTPS = '1';
+    mockedRequest.mockImplementation(((_options: any, cb: any) => {
+      const res: any = {
+        statusCode: 200,
+        _handlers: {} as Record<string, (arg?: any) => void>,
+        on(event: string, h: (arg?: any) => void) { this._handlers[event] = h; return this; },
+        once(event: string, h: (arg?: any) => void) { this._handlers[event] = h; return this; },
+      };
+      const req: any = {
+        setTimeout: vi.fn().mockReturnThis(),
+        on: vi.fn().mockReturnThis(),
+        once: vi.fn().mockReturnThis(),
+        destroy: vi.fn(),
+        end: vi.fn(() => {
+          res._handlers['close']?.();
+        }),
+      };
+      cb(res);
+      return req;
+    }) as any);
+
+    const api = new TelegramAPI('123:TEST');
+    await expect(api.downloadFile('photos/file_1.jpg')).rejects.toThrow(
+      /connection closed before response completed/,
+    );
+  });
+
+  it('T8: AbortSignal.timeout surfaces as "timed out after 15s", matching the fetch-path shape', async () => {
+    process.env.CORTEXTOS_TELEGRAM_UNPOOLED_HTTPS = '1';
+    const abortErr = Object.assign(new Error('The operation was aborted'), {
+      name: 'AbortError',
+      code: 'ABORT_ERR',
+    });
+    mockedRequest.mockImplementation(((_options: any, _cb: any) => {
+      const req: any = {
+        setTimeout: vi.fn().mockReturnThis(),
+        on: vi.fn().mockReturnThis(),
+        destroy: vi.fn(),
+        end: vi.fn(),
+        once(event: string, h: (arg?: any) => void) {
+          if (event === 'error') h(abortErr);
+          return this;
+        },
+      };
+      return req;
+    }) as any);
+
+    const api = new TelegramAPI('123:TEST');
+    await expect(api.getUpdates(0, 1)).rejects.toThrow(/^Telegram API request timed out after 15s: getUpdates$/);
+  });
+
+  it('T9: sendMessage retries a genuine multi-leg never_sent AggregateError (non-idempotent method)', async () => {
+    process.env.CORTEXTOS_TELEGRAM_UNPOOLED_HTTPS = '1';
+    const leg1 = Object.assign(new Error('connect ETIMEDOUT'), { code: 'ETIMEDOUT', syscall: 'connect' });
+    const leg2 = Object.assign(new Error('connect ENETUNREACH'), { code: 'ENETUNREACH', syscall: 'connect' });
+    const aggregate = new AggregateError([leg1, leg2], 'connect Happy Eyeballs failed');
+
+    let call = 0;
+    mockedRequest.mockImplementation(((_options: any, cb: any) => {
+      call++;
+      if (call === 1) {
+        const req: any = {
+          setTimeout: vi.fn().mockReturnThis(),
+          on: vi.fn().mockReturnThis(),
+          destroy: vi.fn(),
+          end: vi.fn(),
+          once(event: string, h: (arg?: any) => void) {
+            if (event === 'error') h(aggregate);
+            return this;
+          },
+        };
+        return req;
+      }
+      const res: any = {
+        statusCode: 200,
+        _handlers: {} as Record<string, (arg?: any) => void>,
+        on(event: string, h: (arg?: any) => void) { this._handlers[event] = h; return this; },
+        once(event: string, h: (arg?: any) => void) { this._handlers[event] = h; return this; },
+      };
+      const req: any = {
+        setTimeout: vi.fn().mockReturnThis(),
+        on: vi.fn().mockReturnThis(),
+        once: vi.fn().mockReturnThis(),
+        destroy: vi.fn(),
+        end: vi.fn(() => {
+          res._handlers['data']?.(Buffer.from(JSON.stringify({ ok: true, result: { message_id: 42 } })));
+          res._handlers['end']?.();
+        }),
+      };
+      cb(res);
+      return req;
+    }) as any);
+
+    const api = new TelegramAPI('123:TEST');
+    const result = await api.sendMessage('chat1', 'hi');
+
+    expect(result?.result?.message_id).toBe(42);
+    expect(mockedRequest).toHaveBeenCalledTimes(2);
+  });
+
+  it('T10: sendMessage does NOT retry an ambiguous failure (single leg, no syscall info)', async () => {
+    process.env.CORTEXTOS_TELEGRAM_UNPOOLED_HTTPS = '1';
+    mockedRequest.mockImplementation(((_options: any, _cb: any) => {
+      const req: any = {
+        setTimeout: vi.fn().mockReturnThis(),
+        on: vi.fn().mockReturnThis(),
+        destroy: vi.fn(),
+        end: vi.fn(),
+        once(event: string, h: (arg?: any) => void) {
+          if (event === 'error') h(new Error('ECONNRESET'));
+          return this;
+        },
+      };
+      return req;
+    }) as any);
+
+    const api = new TelegramAPI('123:TEST');
+    await expect(api.sendMessage('chat1', 'hi')).rejects.toThrow(/^Telegram API request failed:/);
+    expect(mockedRequest).toHaveBeenCalledTimes(1);
+  });
 });

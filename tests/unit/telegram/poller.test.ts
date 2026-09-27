@@ -522,4 +522,57 @@ describe('TelegramPoller — poll backoff', () => {
     expect(poller.lastExitReason).toBe('conflict-self-die');
     expect(setTimeoutSpy).not.toHaveBeenCalled();
   });
+
+  // Codex review, 2026-09-27, P2: consecutiveErrors used to be a shared instance
+  // field. A stopped generation's in-flight getUpdates() can resolve AFTER a
+  // newer generation has already failed once — pre-fix, that late success
+  // unconditionally zeroed the shared counter, so the newer generation's very
+  // next failure restarted its backoff curve from attempt 1 instead of
+  // continuing to attempt 2. Reproduces the exact interleaving from the review.
+  it('a stale generation resolving late does not reset a newer generation\'s backoff streak', async () => {
+    vi.useFakeTimers();
+    vi.spyOn(Math, 'random').mockReturnValue(0);
+    const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout');
+    const delays = () => setTimeoutSpy.mock.calls.map((c) => Number(c[1]));
+
+    let resolveStaleCall: (v: unknown) => void = () => {};
+    const pendingStaleCall = new Promise((resolve) => {
+      resolveStaleCall = resolve;
+    });
+    let call = 0;
+    const api = {
+      getUpdates: vi.fn(async () => {
+        call++;
+        if (call === 1) return pendingStaleCall; // generation A's call: held open
+        throw new Error('Telegram API request timed out after 15s: getUpdates'); // generation B: always fails
+      }),
+    } as unknown as TelegramAPI;
+
+    const poller = new TelegramPoller(api, stateDir);
+    const runningA = poller.start(); // generation A issues call #1 and hangs on it
+    await vi.advanceTimersByTimeAsync(0);
+
+    poller.stop();
+    const runningB = poller.start(); // generation B
+
+    await vi.advanceTimersByTimeAsync(0); // B's call #2 fails -> first backoff scheduled
+    expect(delays()).toEqual([1000]);
+
+    // Generation A's held call resolves successfully now — LATE, after B has
+    // already failed once. Its own pollOnceForGeneration sees itself as a stale
+    // generation and no-ops; the fix scopes consecutiveErrors to each start()
+    // call so this cannot touch B's counter either way.
+    resolveStaleCall({ result: [] });
+    await vi.advanceTimersByTimeAsync(0);
+
+    await vi.advanceTimersByTimeAsync(1000); // fire B's scheduled backoff -> B's call #3 fails again
+    // Bug signature (pre-fix) would be [1000, 1000] — B's counter wrongly
+    // reset to 0 by A's late success. Fixed behavior continues B's own curve.
+    expect(delays()).toEqual([1000, 2000]);
+
+    poller.stop();
+    await vi.advanceTimersByTimeAsync(2000);
+    await runningA;
+    await runningB;
+  });
 });

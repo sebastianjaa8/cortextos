@@ -954,7 +954,26 @@ export class TelegramAPI {
   private postOnceUnpooled(method: string, data: object): Promise<any> {
     const url = new URL(`${this.baseUrl}/${method}`);
     const body = Buffer.from(JSON.stringify(data));
+    const timeoutMs = 15_000;
     return new Promise((resolve, reject) => {
+      // Guards against settling twice: 'close' (premature-disconnect) and 'error'
+      // can both fire for the same underlying failure, and without this a second
+      // rejection after the promise already settled would be an unhandled
+      // rejection rather than a no-op. Codex review (2026-09-27, P1): the
+      // original version had no such fence.
+      let settled = false;
+      const settle = (fn: () => void) => {
+        if (settled) return;
+        settled = true;
+        fn();
+      };
+      // Absolute deadline covering DNS/connect/queueing/body — NOT the same as
+      // req.setTimeout(), which only resets on socket *inactivity* and therefore
+      // never fires against a trickling response or a slow connect. Matches
+      // postOnce's `AbortSignal.timeout(15000)` fetch-path contract exactly.
+      // Codex review (2026-09-27, P1): the prior req.setTimeout()-only version
+      // could stall well past 15s.
+      const signal = AbortSignal.timeout(timeoutMs);
       const req = httpsRequest({
         protocol: url.protocol,
         hostname: url.hostname,
@@ -962,6 +981,7 @@ export class TelegramAPI {
         path: `${url.pathname}${url.search}`,
         method: 'POST',
         agent: telegramHttpsAgent,
+        signal,
         ...this.unpooledConnectOptions,
         headers: {
           'content-type': 'application/json',
@@ -969,36 +989,52 @@ export class TelegramAPI {
         },
       }, res => {
         const chunks: Buffer[] = [];
+        let ended = false;
         res.on('data', chunk => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
         res.once('end', () => {
+          ended = true;
           let result: any;
           try {
             result = JSON.parse(Buffer.concat(chunks).toString('utf8'));
           } catch (error) {
-            reject(new Error(`Telegram API request failed: invalid JSON response for ${method}`, { cause: error }));
+            settle(() => reject(new Error(`Telegram API request failed: invalid JSON response for ${method}`, { cause: error })));
             return;
           }
           if (!result.ok) {
-            reject(new Error(`Telegram API error: ${result.description || 'Unknown error'}`));
+            settle(() => reject(new Error(`Telegram API error: ${result.description || 'Unknown error'}`)));
             return;
           }
-          resolve(result);
+          settle(() => resolve(result));
+        });
+        res.once('error', error => {
+          settle(() => reject(new Error(`Telegram API request failed: ${error}`, { cause: (error as any)?.cause ?? error })));
+        });
+        // Codex review (2026-09-27, P1): a connection dropped after headers but
+        // before the body completes closes the RESPONSE, and Node does not
+        // reliably surface that on the REQUEST's error handler — the original
+        // version only listened on `req`, so this case hung postOnceUnpooled
+        // forever (no retry, no backoff, poller supervisor stuck awaiting
+        // start()). The request WAS sent and a response WAS started, so this is
+        // genuinely ambiguous (classifyTransportFailure's default), not
+        // never_sent.
+        res.once('close', () => {
+          if (ended) return;
+          settle(() => reject(new Error(`Telegram API request failed: connection closed before response completed for ${method}`)));
         });
       });
-      req.setTimeout(15_000, () => {
-        req.destroy(new Error(`Telegram API request timed out after 15s: ${method}`));
-      });
       req.once('error', error => {
-        // The timeout path destroys the request with the timeout Error above,
-        // which node re-emits here — pass it through unchanged so the classifier's
-        // `/timed out after \d+s/` check still matches.
-        if (error instanceof Error && error.message.startsWith('Telegram API request timed out')) {
-          reject(error);
+        // AbortSignal.timeout() surfaces as an AbortError — translate to the
+        // same "timed out after Ns" shape postOnce's fetch path uses so
+        // classifyTransportFailure's `/timed out after \d+s/` check (which
+        // deliberately does NOT retry — see that function's doc comment) fires
+        // identically regardless of transport.
+        if (error instanceof Error && (error.name === 'AbortError' || (error as any).code === 'ABORT_ERR')) {
+          settle(() => reject(new Error(`Telegram API request timed out after ${Math.round(timeoutMs / 1000)}s: ${method}`)));
           return;
         }
         // Preserve `cause`, matching postOnce's fetch-path contract — see method
         // doc comment for why this differs from upstream.
-        reject(new Error(`Telegram API request failed: ${error}`, { cause: (error as any)?.cause ?? error }));
+        settle(() => reject(new Error(`Telegram API request failed: ${error}`, { cause: (error as any)?.cause ?? error })));
       });
       req.end(body);
     });
@@ -1008,6 +1044,14 @@ export class TelegramAPI {
   private requestUnpooledBuffer(rawUrl: string, timeoutMs: number): Promise<Buffer> {
     const url = new URL(rawUrl);
     return new Promise((resolve, reject) => {
+      // See postOnceUnpooled for why these three fixes exist (Codex review, 2026-09-27).
+      let settled = false;
+      const settle = (fn: () => void) => {
+        if (settled) return;
+        settled = true;
+        fn();
+      };
+      const signal = AbortSignal.timeout(timeoutMs);
       const req = httpsRequest({
         protocol: url.protocol,
         hostname: url.hostname,
@@ -1015,23 +1059,36 @@ export class TelegramAPI {
         path: `${url.pathname}${url.search}`,
         method: 'GET',
         agent: telegramHttpsAgent,
+        signal,
         ...this.unpooledConnectOptions,
       }, res => {
         const chunks: Buffer[] = [];
+        let ended = false;
         res.on('data', chunk => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
         res.once('end', () => {
+          ended = true;
           const status = res.statusCode ?? 0;
           if (status < 200 || status >= 300) {
-            reject(new Error(`Failed to download file: ${status}`));
+            settle(() => reject(new Error(`Failed to download file: ${status}`)));
             return;
           }
-          resolve(Buffer.concat(chunks));
+          settle(() => resolve(Buffer.concat(chunks)));
+        });
+        res.once('error', error => {
+          settle(() => reject(error instanceof Error ? error : new Error(String(error))));
+        });
+        res.once('close', () => {
+          if (ended) return;
+          settle(() => reject(new Error('Telegram file download: connection closed before response completed')));
         });
       });
-      req.setTimeout(timeoutMs, () => {
-        req.destroy(new Error(`Telegram file download timed out after ${Math.round(timeoutMs / 1000)}s`));
+      req.once('error', error => {
+        if (error instanceof Error && (error.name === 'AbortError' || (error as any).code === 'ABORT_ERR')) {
+          settle(() => reject(new Error(`Telegram file download timed out after ${Math.round(timeoutMs / 1000)}s`)));
+          return;
+        }
+        settle(() => reject(error instanceof Error ? error : new Error(String(error))));
       });
-      req.once('error', error => reject(error instanceof Error ? error : new Error(String(error))));
       req.end();
     });
   }
