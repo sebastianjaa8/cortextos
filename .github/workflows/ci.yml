@@ -56,6 +56,17 @@ jobs:
       - name: Install dashboard dependencies
         run: npm ci --prefix dashboard
 
+      # task_1785666339329 (2026-09-27, Codex review finding): `needs: build` only orders job
+      # execution, it does not share the filesystem between runners, and dist/ is gitignored --
+      # so this job previously started with NO dist/cli.js at all. Every CLI-level integration
+      # test guarded by `describe.skipIf(!existsSync(DIST_CLI))` (complete-task-graceful-error,
+      # task-audit-attribution-cli, and any future one following the same pattern) was silently
+      # SKIPPED in CI, not run -- a green run looked identical to a green run that actually
+      # exercised the CLI. Building here closes that gap for the whole class, not just this one
+      # test file.
+      - name: Build CLI
+        run: npm run build
+
       - name: Run unit tests
         run: npm test
 

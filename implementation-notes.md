@@ -780,3 +780,20 @@ reasonable. Two real minor findings on MY OWN work, applied same session:
   project/due audit pairs, only the JSON audit log carries them — deliberately out of scope per
   the plan (title/priority already have this gap partially, this doesn't widen or close it).
   Flagging in case a future pass wants full parity there.
+
+## Codex diff review round 1 (2026-09-27) — REQUEST-CHANGES, 2 findings, both fixed
+
+- 11:05Z — real finding: `describe.skipIf(!existsSync(DIST_CLI))` in the new CLI-level test
+  (and the PRE-EXISTING sibling complete-task-graceful-error.test.ts) silently skips in CI,
+  because `needs: build` only orders job execution — it does not share the filesystem between
+  GitHub Actions runners, and `dist/` is gitignored. The `test` job started with no dist/cli.js
+  at all, so BOTH CLI-level test files were "required" tests that never actually ran on CI. Fixed
+  by adding a `Build CLI` step to the `test` job in .github/workflows/ci.yml, closing the gap for
+  the whole test class, not just the new file.
+- 11:06Z — minor finding: completeTask's empty-assignee fallback case (paired with updateTask's
+  own) had no test — a regression changing ONLY completeTask to the wrong fallback expression
+  would have passed every existing test. Added the missing paired case, sabotage-checked
+  (mutated to `callerAgent ?? assignee ?? 'unknown'`, confirmed the new test fails with the
+  predicted empty-string result, restored).
+- 11:06Z — re-verified: tsc clean, 121/121 in the 5 directly-affected suites (was 120, +1 new
+  test). Rebuilt dist/cli.js after restoring the sabotage mutation.

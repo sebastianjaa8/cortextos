@@ -1300,6 +1300,18 @@ describe('task mutation verbs', () => {
     expect(audit?.agent).toBe('assignee_agent');
   });
 
+  // PAIRED with updateTask's own empty-assignee fallback test above — same exact-fallback
+  // expression (`callerAgent ?? (assignee || 'unknown')`) must hold on completeTask too. Without
+  // this case, a regression that changed ONLY completeTask to `callerAgent ?? assignee ??
+  // 'unknown'` would pass every other test in this file (Codex diff review finding, 2026-09-27).
+  it('completeTask falls back to "unknown" when callerAgent is omitted AND assignee is empty string', () => {
+    const id = createTask(paths, 'assignor', 'org', 'T', { assignee: 'holder' });
+    updateTask(paths, id, 'pending', { assignee: '' });
+    completeTask(paths, id, 'done');
+    const audit = readTaskAudit(paths, id).find((e) => e.event === 'complete');
+    expect(audit?.agent).toBe('unknown');
+  });
+
   /**
    * PROJECT/DUE AUDIT PARITY (task_1785666339329, added 2026-09-27). Same conditional-inclusion
    * shape as the existing priority/assignee/title pairs above — these two fields previously had
