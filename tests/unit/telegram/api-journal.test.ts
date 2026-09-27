@@ -35,8 +35,19 @@ const rows = (root: string) =>
 
 describe('TelegramAPI journalling', () => {
   let root: string;
-  beforeEach(() => { root = mkdtempSync(join(tmpdir(), 'api-j-')); });
-  afterEach(() => { rmSync(root, { recursive: true, force: true }); vi.unstubAllGlobals(); });
+  const originalUnpooled = process.env.CORTEXTOS_TELEGRAM_UNPOOLED_HTTPS;
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), 'api-j-'));
+    // These tests stub global fetch; pin the resilient node:https transport off
+    // (task_1790461967870) so the stub is actually exercised instead of bypassed.
+    process.env.CORTEXTOS_TELEGRAM_UNPOOLED_HTTPS = '0';
+  });
+  afterEach(() => {
+    rmSync(root, { recursive: true, force: true });
+    vi.unstubAllGlobals();
+    if (originalUnpooled === undefined) delete process.env.CORTEXTOS_TELEGRAM_UNPOOLED_HTTPS;
+    else process.env.CORTEXTOS_TELEGRAM_UNPOOLED_HTTPS = originalUnpooled;
+  });
 
   const okFetch = () =>
     vi.fn().mockResolvedValue({
