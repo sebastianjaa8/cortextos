@@ -438,6 +438,7 @@ busCommand
         assignee,
         dueDate: opts.due,
         evidence: opts.evidence,
+        callerAgent: env.agentName,
       });
       console.log(`Updated ${id} -> ${status}`);
       if (status === 'in_progress' && opts.evidence === undefined) warnMissingEvidence('claiming');
@@ -587,7 +588,7 @@ busCommand
           process.exit(1);
         }
       }
-      completeTask(paths, id, effectiveResult, opts.evidence);
+      completeTask(paths, id, effectiveResult, opts.evidence, env.agentName);
       if (opts.evidence === undefined) warnMissingEvidence('completing');
       console.log(`Completed ${id}`);
     } catch (err) {

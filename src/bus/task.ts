@@ -365,6 +365,14 @@ export function updateTask(
     assignee?: string;
     dueDate?: string;
     evidence?: string;
+    /** The agent that actually invoked this update (task_1785666339329, 2026-09-27). Additive
+     *  and optional so every existing call site keeps its old behavior unchanged: when omitted,
+     *  the audit `agent` field falls back to the task's assignee exactly as before. The CLI
+     *  always supplies this from `resolveEnv().agentName` — before this field existed, the audit
+     *  log recorded WHO THE TASK WAS ASSIGNED TO, not who ran the command, so two different
+     *  agents editing the same task in sequence were both attributed to whichever agent the task
+     *  happened to be assigned to at read time. */
+    callerAgent?: string;
   },
 ): { reassigned: boolean; prevAssignee?: string; assignee?: string } {
   const filePath = findTaskFile(paths, taskId);
@@ -400,6 +408,8 @@ export function updateTask(
   let prevPriority: Priority | undefined;
   let prevAssignee: string | undefined;
   let prevTitle: string | undefined;
+  let prevProject: string | undefined;
+  let prevDueDate: string | null | undefined;
   let assignee: string | undefined;
   let currentDescription: string | undefined;
   try {
@@ -408,6 +418,8 @@ export function updateTask(
     prevPriority = task.priority;
     prevAssignee = task.assigned_to;
     prevTitle = task.title;
+    prevProject = task.project;
+    prevDueDate = task.due_date;
     task.status = status;
     if (opts?.priority !== undefined) task.priority = opts.priority;
     if (opts?.description !== undefined) task.description = opts.description;
@@ -443,7 +455,7 @@ export function updateTask(
   }
   appendTaskAudit(paths, taskId, {
     event: 'update',
-    agent: assignee || 'unknown',
+    agent: opts?.callerAgent ?? (assignee || 'unknown'),
     from: prevStatus,
     to: status,
     // Each recorded ONLY when it actually changed, so the log does not fill with no-op lines.
@@ -458,6 +470,15 @@ export function updateTask(
     // only surface most readers ever see.
     ...(opts?.title !== undefined && opts.title !== prevTitle
       ? { from_title: prevTitle, to_title: opts.title }
+      : {}),
+    // project/due parity (task_1785666339329, 2026-09-27): same conditional-inclusion shape as
+    // priority/assignee/title above — these two fields previously had NO audit trail at all.
+    // JSON audit log only; task-history's FORMATTED output is not extended in this pass.
+    ...(opts?.project !== undefined && opts.project !== prevProject
+      ? { from_project: prevProject, to_project: opts.project }
+      : {}),
+    ...(opts?.dueDate !== undefined && opts.dueDate !== prevDueDate
+      ? { from_due: prevDueDate, to_due: opts.dueDate }
       : {}),
     ...(opts?.evidence !== undefined ? { evidence: opts.evidence } : {}),
   }, currentDescription);
@@ -561,6 +582,16 @@ export interface TaskAuditEntry {
    *  That is how a task sequenced for one agent stayed assigned to another. */
   from_assignee?: string;
   to_assignee?: string;
+  /** Present only on a project change (added 2026-09-27, task_1785666339329) — project had no
+   *  audit trail at all before this; same pattern as priority/assignee above. */
+  from_project?: string;
+  to_project?: string;
+  /** Present only on a due-date change (added 2026-09-27, task_1785666339329) — same gap as
+   *  project. `due_date` is nullable on a task (no deadline set), so the FIRST deadline a task
+   *  ever gets records `from_due: null`, not an omitted field — an absent deadline is a real,
+   *  distinct prior state from "never had this field examined at all". */
+  from_due?: string | null;
+  to_due?: string;
   /** Present only on a title CORRECTION (added 2026-08-01). The title is the only field
    *  `list-tasks` renders, so a wrong one is the single error no reader can see past: a corrected
    *  body sits invisibly behind an uncorrected headline and the headline is what gets acted on.
@@ -788,6 +819,11 @@ export function completeTask(
   taskId: string,
   result?: string,
   evidence?: string,
+  // Additive optional 5th param (task_1785666339329, 2026-09-27) — the agent that actually ran
+  // complete-task, not the task's assignee. Omitted callers keep the exact old behavior
+  // (assignee fallback), so every existing 3-or-4-arg call site is unaffected. See updateTask's
+  // matching `callerAgent` doc comment for the full rationale.
+  callerAgent?: string,
 ): void {
   const filePath = findTaskFile(paths, taskId);
   if (!filePath) {
@@ -818,7 +854,7 @@ export function completeTask(
   }
   appendTaskAudit(paths, taskId, {
     event: 'complete',
-    agent: assignee || 'unknown',
+    agent: callerAgent ?? (assignee || 'unknown'),
     from: prevStatus,
     to: 'completed',
     note: result,
