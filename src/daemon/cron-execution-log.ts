@@ -56,10 +56,11 @@ export const ROTATION_SIZE_BYTES = 200 * 1_024;
  * Resolve the absolute path to an agent's execution log.
  *
  * Root comes from resolveCtxRoot(), the same helper src/bus/crons.ts uses, so
- * this file's log path and crons.ts's crons.json path always agree on root
- * even when CTX_ROOT is unset. Previously fell back to `process.cwd()`
- * independently of crons.ts's own (also-buggy) fallback — two files that must
- * agree on root, silently resolving it two different ways
+ * this file's log path and crons.ts's crons.json path are guaranteed to agree
+ * by sharing one implementation. Previously each file had its OWN identical
+ * copy of the same `process.env.CTX_ROOT ?? process.cwd()` expression — two
+ * files that must agree on root, with nothing enforcing that agreement beyond
+ * the two copies happening to stay textually identical
  * (task_1790474717185 item 5, fixed 2026-09-27).
  */
 function logFilePath(agentName: string): string {

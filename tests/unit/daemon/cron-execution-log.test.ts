@@ -518,8 +518,8 @@ describe('disk persistence across module resets', () => {
 // ---------------------------------------------------------------------------
 
 describe('resolveCtxRoot / unset CTX_ROOT (task_1790474717185 item 5)', () => {
-  const originalHome = process.env.HOME;
   let fakeHome: string;
+  let cwdSpy: ReturnType<typeof vi.spyOn> | undefined;
 
   beforeEach(() => {
     // The outer beforeEach already set CTX_ROOT=tmpRoot and reset modules;
@@ -528,13 +528,18 @@ describe('resolveCtxRoot / unset CTX_ROOT (task_1790474717185 item 5)', () => {
     // and isolated from both tmpRoot and the real home directory.
     fakeHome = mkdtempSync(join(tmpdir(), 'ctxroot-fakehome-'));
     delete process.env.CTX_ROOT;
-    process.env.HOME = fakeHome;
+    vi.stubEnv('HOME', fakeHome);
+    vi.stubEnv('USERPROFILE', fakeHome);
+    vi.stubEnv('CTX_INSTANCE_ID', undefined);
+    // Keep env-file discovery and any regressed cwd writes inside the sandbox.
+    cwdSpy = vi.spyOn(process, 'cwd').mockReturnValue(tmpRoot);
     vi.resetModules();
   });
 
   afterEach(() => {
-    if (originalHome !== undefined) process.env.HOME = originalHome;
-    else delete process.env.HOME;
+    cwdSpy?.mockRestore();
+    cwdSpy = undefined;
+    vi.unstubAllEnvs();
     try { rmSync(fakeHome, { recursive: true }); } catch { /* ignore */ }
     // Outer afterEach restores CTX_ROOT from originalCtxRoot and rm's tmpRoot.
   });
