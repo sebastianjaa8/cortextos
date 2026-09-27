@@ -12,6 +12,7 @@ import {
 } from './outbound-journal.js';
 import { existsSync, readFileSync } from 'fs';
 import { basename } from 'path';
+import { Agent as HttpsAgent, request as httpsRequest } from 'https';
 import { applyTelegramNetTuning } from './net-tuning.js';
 
 // Applied at module load: every process that talks to Telegram imports this file,
@@ -19,6 +20,25 @@ import { applyTelegramNetTuning } from './net-tuning.js';
 // point having to remember. Idempotent, and opt-out via env. See net-tuning.ts for
 // the measurements behind it.
 applyTelegramNetTuning();
+
+// A Telegram-only pool, independent from Node fetch/Undici. Ported from upstream
+// (task_1790461967870): on a broken-dual-stack host (IPv6 configured but
+// blackholed), global fetch is backed by Undici, which hardcodes
+// autoSelectFamily=false and so never gets Happy Eyeballs (RFC 8305) — it commits
+// to the dead family and wedges for the full timeout, and because the poller
+// serializes, every subsequent Telegram call queues behind it. Routing through
+// node:https instead gives Happy Eyeballs, which races the families and
+// self-heals, without hard-pinning IPv4 the way an older version of this fix did
+// (that would break genuinely IPv6-only hosts). This agent only supplies the
+// keep-alive pool; classifyTransportFailure + the retry loop in post() above stay
+// the single retry mechanism — this transport just changes how ONE attempt
+// connects, matching postOnce's existing error contract (message shape + `cause`
+// preservation) so the classifier's behavior is identical on both paths.
+const telegramHttpsAgent = new HttpsAgent({
+  keepAlive: true,
+  maxSockets: 64,
+  maxFreeSockets: 16,
+});
 
 /**
  * How a failed request should be treated for retry purposes.
@@ -779,10 +799,43 @@ export class TelegramAPI {
   }
 
   /**
+   * Resilient Telegram transport switch, ported from upstream (task_1790461967870).
+   * On by default. Set CORTEXTOS_TELEGRAM_UNPOOLED_HTTPS=0 to opt out and force
+   * pooled fetch. Reroutes downloadFile and every post()-based method onto
+   * node:https via telegramHttpsAgent; sendPhoto/sendDocument multipart uploads
+   * are out of scope (unchanged, still pooled fetch) — matches upstream's own
+   * documented scope limit.
+   */
+  private get useUnpooledHttps(): boolean {
+    return process.env.CORTEXTOS_TELEGRAM_UNPOOLED_HTTPS !== '0';
+  }
+
+  /**
+   * Per-family connection-attempt timeout for Happy Eyeballs, in ms. 250ms is
+   * Node's own default; on a high-latency client it can false-timeout the first
+   * family before it would have connected, so make it env-tunable.
+   */
+  private get happyEyeballsAttemptTimeoutMs(): number {
+    const raw = Number(process.env.CORTEXTOS_TELEGRAM_HAPPY_EYEBALLS_TIMEOUT_MS);
+    return Number.isFinite(raw) && raw > 0 ? raw : 250;
+  }
+
+  /**
+   * Shared node:https connect options for the resilient transport. Bound once so
+   * postOnceUnpooled and requestUnpooledBuffer cannot diverge on family behavior.
+   */
+  private get unpooledConnectOptions(): { autoSelectFamily: true; autoSelectFamilyAttemptTimeout: number } {
+    return { autoSelectFamily: true, autoSelectFamilyAttemptTimeout: this.happyEyeballsAttemptTimeoutMs };
+  }
+
+  /**
    * Download a file from Telegram servers.
    */
   async downloadFile(filePath: string): Promise<Buffer> {
     const url = `https://api.telegram.org/file/bot${this.getToken()}/${filePath}`;
+    if (this.useUnpooledHttps) {
+      return this.requestUnpooledBuffer(url, 30_000);
+    }
     const response = await fetch(url, { signal: AbortSignal.timeout(30000) });
     if (!response.ok) {
       throw new Error(`Failed to download file: ${response.status}`);
@@ -856,6 +909,9 @@ export class TelegramAPI {
 
   /** One attempt. Separated from the retry loop so each try is a clean request. */
   private async postOnce(method: string, data: object): Promise<any> {
+    if (this.useUnpooledHttps) {
+      return this.postOnceUnpooled(method, data);
+    }
     try {
       const response = await fetch(`${this.baseUrl}/${method}`, {
         method: 'POST',
@@ -883,6 +939,101 @@ export class TelegramAPI {
       // every transport failure look ambiguous and silently disable retry for sends.
       throw new Error(`Telegram API request failed: ${err}`, { cause: (err as any)?.cause ?? err });
     }
+  }
+
+  /**
+   * One attempt over the dedicated keep-alive agent (Happy Eyeballs), bypassing
+   * fetch/Undici. Ported from upstream (task_1790461967870), adapted to match
+   * postOnce's error contract exactly (same message shapes, same `cause`
+   * preservation) so classifyTransportFailure behaves identically regardless of
+   * which transport sent the request. Upstream's own version did NOT preserve
+   * `cause` on the connect-error path — fixed here, since without it every
+   * Happy-Eyeballs AggregateError would classify as 'ambiguous' instead of
+   * 'never_sent', silently disabling the retry-safety guarantee this exists for.
+   */
+  private postOnceUnpooled(method: string, data: object): Promise<any> {
+    const url = new URL(`${this.baseUrl}/${method}`);
+    const body = Buffer.from(JSON.stringify(data));
+    return new Promise((resolve, reject) => {
+      const req = httpsRequest({
+        protocol: url.protocol,
+        hostname: url.hostname,
+        port: url.port || undefined,
+        path: `${url.pathname}${url.search}`,
+        method: 'POST',
+        agent: telegramHttpsAgent,
+        ...this.unpooledConnectOptions,
+        headers: {
+          'content-type': 'application/json',
+          'content-length': String(body.length),
+        },
+      }, res => {
+        const chunks: Buffer[] = [];
+        res.on('data', chunk => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
+        res.once('end', () => {
+          let result: any;
+          try {
+            result = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+          } catch (error) {
+            reject(new Error(`Telegram API request failed: invalid JSON response for ${method}`, { cause: error }));
+            return;
+          }
+          if (!result.ok) {
+            reject(new Error(`Telegram API error: ${result.description || 'Unknown error'}`));
+            return;
+          }
+          resolve(result);
+        });
+      });
+      req.setTimeout(15_000, () => {
+        req.destroy(new Error(`Telegram API request timed out after 15s: ${method}`));
+      });
+      req.once('error', error => {
+        // The timeout path destroys the request with the timeout Error above,
+        // which node re-emits here — pass it through unchanged so the classifier's
+        // `/timed out after \d+s/` check still matches.
+        if (error instanceof Error && error.message.startsWith('Telegram API request timed out')) {
+          reject(error);
+          return;
+        }
+        // Preserve `cause`, matching postOnce's fetch-path contract — see method
+        // doc comment for why this differs from upstream.
+        reject(new Error(`Telegram API request failed: ${error}`, { cause: (error as any)?.cause ?? error }));
+      });
+      req.end(body);
+    });
+  }
+
+  /** GET a Telegram file over the dedicated keep-alive agent (Happy Eyeballs), bypassing fetch/Undici. */
+  private requestUnpooledBuffer(rawUrl: string, timeoutMs: number): Promise<Buffer> {
+    const url = new URL(rawUrl);
+    return new Promise((resolve, reject) => {
+      const req = httpsRequest({
+        protocol: url.protocol,
+        hostname: url.hostname,
+        port: url.port || undefined,
+        path: `${url.pathname}${url.search}`,
+        method: 'GET',
+        agent: telegramHttpsAgent,
+        ...this.unpooledConnectOptions,
+      }, res => {
+        const chunks: Buffer[] = [];
+        res.on('data', chunk => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
+        res.once('end', () => {
+          const status = res.statusCode ?? 0;
+          if (status < 200 || status >= 300) {
+            reject(new Error(`Failed to download file: ${status}`));
+            return;
+          }
+          resolve(Buffer.concat(chunks));
+        });
+      });
+      req.setTimeout(timeoutMs, () => {
+        req.destroy(new Error(`Telegram file download timed out after ${Math.round(timeoutMs / 1000)}s`));
+      });
+      req.once('error', error => reject(error instanceof Error ? error : new Error(String(error))));
+      req.end();
+    });
   }
 
   /**

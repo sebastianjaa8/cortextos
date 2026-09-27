@@ -14,7 +14,12 @@ function queue(r: MockResponse): void {
   responseQueue.push(r);
 }
 
+const originalUnpooled = process.env.CORTEXTOS_TELEGRAM_UNPOOLED_HTTPS;
+
 beforeEach(() => {
+  // The resilient node:https transport is on by default now (task_1790461967870);
+  // pin it off so these tests exercise the fetch path they were written for.
+  process.env.CORTEXTOS_TELEGRAM_UNPOOLED_HTTPS = '0';
   responseQueue = [];
   callLog = [];
   warnLog = [];
@@ -47,6 +52,8 @@ beforeEach(() => {
 afterEach(() => {
   vi.unstubAllGlobals();
   console.warn = originalWarn;
+  if (originalUnpooled === undefined) delete process.env.CORTEXTOS_TELEGRAM_UNPOOLED_HTTPS;
+  else process.env.CORTEXTOS_TELEGRAM_UNPOOLED_HTTPS = originalUnpooled;
 });
 
 describe('TelegramAPI.sendMessage HTML mode', () => {

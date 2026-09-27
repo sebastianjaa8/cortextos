@@ -78,16 +78,22 @@ describe('classifyTransportFailure', () => {
 
 describe('post() retry behaviour', () => {
   let stateDir: string;
+  const originalUnpooled = process.env.CORTEXTOS_TELEGRAM_UNPOOLED_HTTPS;
 
   beforeEach(() => {
     stateDir = mkdtempSync(join(tmpdir(), 'cortextos-telegram-retry-'));
     vi.useFakeTimers();
+    // These tests stub global fetch; pin the resilient node:https transport off
+    // (task_1790461967870) so the stub is actually exercised instead of bypassed.
+    process.env.CORTEXTOS_TELEGRAM_UNPOOLED_HTTPS = '0';
   });
 
   afterEach(() => {
     vi.useRealTimers();
     vi.unstubAllGlobals();
     rmSync(stateDir, { recursive: true, force: true });
+    if (originalUnpooled === undefined) delete process.env.CORTEXTOS_TELEGRAM_UNPOOLED_HTTPS;
+    else process.env.CORTEXTOS_TELEGRAM_UNPOOLED_HTTPS = originalUnpooled;
   });
 
   function readJournal(agent: string): any[] {
