@@ -7,6 +7,54 @@ import { validateAgentName, validateOrgName } from './validate.js';
 import { stripBom } from './strip-bom.js';
 
 /**
+ * Resolve ctxRoot's priority chain (overrides > CTX_ROOT env var > .cortextos-env
+ * file > `~/.cortextos/<instanceId>` default) given an already-parsed
+ * .cortextos-env file. Internal sharing point between resolveEnv() and the
+ * exported resolveCtxRoot() below, so the two can never disagree and a caller
+ * that already has envFile/instanceId (resolveEnv()) does not re-read the file.
+ * Not a pure function — its result depends on process.env and the envFile
+ * argument the caller obtained via I/O; it just performs no I/O itself.
+ */
+function resolveCtxRootFromEnvFile(
+  envFile: Record<string, string>,
+  overrides?: { ctxRoot?: string; instanceId?: string },
+): string {
+  const instanceId =
+    overrides?.instanceId ||
+    process.env.CTX_INSTANCE_ID ||
+    envFile.CTX_INSTANCE_ID ||
+    'default';
+  return (
+    overrides?.ctxRoot ||
+    process.env.CTX_ROOT ||
+    envFile.CTX_ROOT ||
+    join(homedir(), '.cortextos', instanceId)
+  );
+}
+
+/**
+ * Resolve just the cortextOS root directory, without resolveEnv()'s broader
+ * validation (agent-name/org checks, sandbox-leak checks) that can throw for
+ * reasons that have nothing to do with ctxRoot. Use this from narrow file-path
+ * helpers (e.g. src/bus/crons.ts, src/daemon/cron-execution-log.ts) that only
+ * need a root, not full env resolution — those callers previously fell back to
+ * `process.cwd()` when CTX_ROOT was unset, silently writing/reading under
+ * whatever directory the process happened to be invoked from instead of the
+ * real cortextOS root (task_1790474717185 item 5).
+ *
+ * Reads and parses .cortextos-env itself on every call — not free of I/O, do
+ * not call this in a hot loop. resolveEnv() does not call this directly; it
+ * calls the shared resolveCtxRootFromEnvFile() helper above with the envFile
+ * it already parsed, so .cortextos-env is never parsed twice in one resolveEnv()
+ * call.
+ */
+export function resolveCtxRoot(overrides?: { ctxRoot?: string; instanceId?: string }): string {
+  const cortextosEnvPath = join(process.cwd(), '.cortextos-env');
+  const envFile = existsSync(cortextosEnvPath) ? parseEnvFile(cortextosEnvPath) : {};
+  return resolveCtxRootFromEnvFile(envFile, overrides);
+}
+
+/**
  * Resolve the cortextOS environment context.
  * Equivalent of bash _ctx-env.sh - reads from env vars, .cortextos-env, .env files.
  */
@@ -26,11 +74,10 @@ export function resolveEnv(overrides?: Partial<CtxEnv>): CtxEnv {
     envFile.CTX_INSTANCE_ID ||
     'default';
 
-  const ctxRoot =
-    overrides?.ctxRoot ||
-    process.env.CTX_ROOT ||
-    envFile.CTX_ROOT ||
-    join(homedir(), '.cortextos', instanceId);
+  // Delegates to the same priority chain resolveCtxRoot() exposes below, passing
+  // the already-parsed envFile and instanceId through so .cortextos-env is only
+  // read/parsed once per resolveEnv() call, not twice.
+  const ctxRoot = resolveCtxRootFromEnvFile(envFile, { ctxRoot: overrides?.ctxRoot, instanceId });
 
   const frameworkRoot =
     overrides?.frameworkRoot ||
