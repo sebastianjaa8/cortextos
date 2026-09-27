@@ -142,7 +142,7 @@ describe('HermesPTY startup injection', () => {
       await vi.advanceTimersByTimeAsync(500);
       pty.getOutputBuffer().push('⚠ 599 commits behind — run hermes update');  // late boot output
       await vi.advanceTimersByTimeAsync(3000);
-      expect(writes[0]).toBe('Read .cortextos-startup.md and follow the instructions there.');
+      expect(writes[0]).toBe(`Read ${mockEnv.agentDir}/.cortextos-startup.md and follow the instructions there.`);
       // First Enter swallowed (no turn output); second produces a turn.
       await vi.advanceTimersByTimeAsync(4500);
       expect(writes.filter(w => w === '\r').length).toBe(2);

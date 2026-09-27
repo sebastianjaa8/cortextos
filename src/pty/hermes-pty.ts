@@ -143,7 +143,8 @@ export class HermesPTY extends AgentPTY {
       if (now === last) break;
       last = now;
     }
-    this.write(`Read ${STARTUP_PROMPT_FILE} and follow the instructions there.`);
+    // Absolute path: qwen resolved the bare filename against the repo root (09-27 boot).
+    this.write(`Read ${join(this.agentDir, STARTUP_PROMPT_FILE)} and follow the instructions there.`);
     await sleep(STARTUP_TYPE_SETTLE_MS);
     // Submit, then verify a turn actually started (output well beyond the echo);
     // re-send Enter if not. Same verify-and-retry shape as inject.ts.
