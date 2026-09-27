@@ -591,4 +591,17 @@ describe('resolveCtxRoot / unset CTX_ROOT (task_1790474717185 item 5)', () => {
     // Both paths share the identical root prefix up through 'agents/boris'.
     expect(dirname(fakeHomeCronsPath())).toBe(dirname(fakeHomeLogPath()));
   });
+
+  it('getExecutionLogPage() reads back an entry written under the fake-HOME default root (Codex REQUEST-CHANGES 2026-09-27: the file-existence agreement test above never exercised this reader — a regression reverting only crons.ts:372 back to the old cwd fallback would escape it)', async () => {
+    const { appendExecutionLog } = await importLog();
+    const { getExecutionLogPage } = await importCrons();
+
+    appendExecutionLog('boris', makeEntry({ cron: 'heartbeat', status: 'fired', attempt: 3 }));
+
+    const page = getExecutionLogPage('boris');
+    expect(page.total).toBe(1);
+    expect(page.hasMore).toBe(false);
+    expect(page.entries).toHaveLength(1);
+    expect(page.entries[0]).toMatchObject({ cron: 'heartbeat', status: 'fired', attempt: 3 });
+  });
 });

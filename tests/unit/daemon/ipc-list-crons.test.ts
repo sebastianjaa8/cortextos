@@ -421,3 +421,90 @@ describe('cron-utils formatRelative', () => {
     expect(formatRelative(justNow)).toBe('just now');
   });
 });
+
+// ---------------------------------------------------------------------------
+// resolveCtxRoot / unset CTX_ROOT — IPC discovery (task_1790474717185 item 5
+// follow-up, Codex REQUEST-CHANGES 2026-09-27)
+//
+// listAllCrons(), computeFleetHealth(), and getEnabledAgents() each resolved
+// enabled-agents.json's root independently via `process.env.CTX_ROOT ??
+// process.cwd()`, left un-migrated when crons.ts/cron-execution-log.ts were
+// fixed. With CTX_ROOT unset, IPC agent discovery could silently read a
+// DIFFERENT root than the cron/log data it reports on. Mirrors the
+// fake-HOME + cwd-spy fixture in cron-execution-log.test.ts's own
+// resolveCtxRoot suite.
+// ---------------------------------------------------------------------------
+
+describe('resolveCtxRoot / unset CTX_ROOT — IPC discovery (task_1790474717185 item 5)', () => {
+  let fakeHome: string;
+  let cwdSpy: ReturnType<typeof vi.spyOn> | undefined;
+
+  beforeEach(() => {
+    fakeHome = mkdtempSync(join(tmpdir(), 'ipc-ctxroot-fakehome-'));
+    delete process.env.CTX_ROOT;
+    vi.stubEnv('HOME', fakeHome);
+    vi.stubEnv('USERPROFILE', fakeHome);
+    vi.stubEnv('CTX_INSTANCE_ID', undefined);
+    // Keep any regressed cwd reads/writes inside the sandbox, not the real cwd.
+    cwdSpy = vi.spyOn(process, 'cwd').mockReturnValue(tmpRoot);
+    vi.resetModules();
+  });
+
+  afterEach(() => {
+    cwdSpy?.mockRestore();
+    cwdSpy = undefined;
+    vi.unstubAllEnvs();
+    // Outer afterEach restores CTX_ROOT from originalCtxRoot and rm's tmpRoot.
+  });
+
+  function fakeHomeRoot(): string {
+    return join(fakeHome, '.cortextos', 'default');
+  }
+
+  function writeEnabledAgentsAtFakeHome(agents: Record<string, { enabled?: boolean; org?: string }>): void {
+    const configDir = join(fakeHomeRoot(), 'config');
+    mkdirSync(configDir, { recursive: true });
+    writeFileSync(join(configDir, 'enabled-agents.json'), JSON.stringify(agents, null, 2));
+  }
+
+  function writeCronsAtFakeHome(agentName: string, crons: CronDefinition[]): void {
+    const dir = join(fakeHomeRoot(), CRONS_DIR, agentName);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, 'crons.json'),
+      JSON.stringify({ updated_at: new Date().toISOString(), crons }, null, 2),
+    );
+  }
+
+  it('handleAddCron rejects an unlisted agent found only via the fake-HOME enabled-agents.json (getEnabledAgents, ipc-server.ts formerly line 353)', async () => {
+    // 'mallory' deliberately absent — if getEnabledAgents fell back to reading
+    // cwd/tmpRoot (where no file exists), enabledAgents would resolve to []
+    // and the not-found check would be silently skipped, letting the add through.
+    writeEnabledAgentsAtFakeHome({ boris: { enabled: true } });
+    const { handleAddCron } = await import('../../../src/daemon/ipc-server.js');
+
+    const result = handleAddCron('mallory', {
+      name: 'heartbeat',
+      prompt: 'hi',
+      schedule: '6h',
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.field).toBe('agent');
+  });
+
+  it('computeFleetHealth() counts a cron seeded only under the fake-HOME root (listAllCrons + its own enabledFile lookup, ipc-server.ts formerly lines 200 and 270)', async () => {
+    writeEnabledAgentsAtFakeHome({ boris: { enabled: true } });
+    writeCronsAtFakeHome('boris', [
+      { name: 'heartbeat', prompt: 'hi', schedule: '6h', enabled: true, created_at: '2026-04-01T00:00:00.000Z' },
+    ]);
+    const { computeFleetHealth } = await import('../../../src/daemon/ipc-server.js');
+
+    const result = computeFleetHealth('boris');
+
+    // Under the old cwd fallback, enabled-agents.json would not be found at
+    // cwd/tmpRoot and this would silently resolve to 0 crons discovered.
+    expect(result.summary.total).toBe(1);
+    expect(result.summary.agents.boris).toBeDefined();
+  });
+});

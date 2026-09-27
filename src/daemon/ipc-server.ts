@@ -12,6 +12,7 @@ import type { ExecutionLogStatusFilter } from '../bus/crons.js';
 import { nextFireFromCron } from './cron-scheduler.js';
 import { parseDurationMs } from '../bus/cron-state.js';
 import { computeHealth, aggregateFleetHealth } from '../utils/cron-health.js';
+import { resolveCtxRoot } from '../utils/env.js';
 
 const WORKER_NAME_REGEX = /^[a-z0-9_-]+$/;
 const IPC_TOKEN_BYTES = 32;
@@ -197,7 +198,11 @@ export function computeNextFire(
  * and cron execution log, and return a combined summary array.
  */
 function listAllCrons(): CronSummaryRow[] {
-  const ctxRoot = process.env.CTX_ROOT ?? process.cwd();
+  // resolveCtxRoot() (task_1790474717185 item 5 follow-up, Codex REQUEST-CHANGES
+  // 2026-09-27): previously fell back to process.cwd() independently of
+  // src/bus/crons.ts's cron/log path resolution, so with CTX_ROOT unset, agent
+  // discovery here could read a different root than the cron data it reports on.
+  const ctxRoot = resolveCtxRoot();
   const enabledFile = join(ctxRoot, 'config', 'enabled-agents.json');
 
   let enabledAgents: Record<string, { enabled?: boolean; org?: string }> = {};
@@ -267,7 +272,11 @@ export function computeFleetHealth(
     return _fleetHealthCache.result;
   }
 
-  const ctxRoot = process.env.CTX_ROOT ?? process.cwd();
+  // resolveCtxRoot() (task_1790474717185 item 5 follow-up, Codex REQUEST-CHANGES
+  // 2026-09-27): previously fell back to process.cwd() independently of
+  // src/bus/crons.ts's cron/log path resolution, so with CTX_ROOT unset, agent
+  // discovery here could read a different root than the cron data it reports on.
+  const ctxRoot = resolveCtxRoot();
   const enabledFile = join(ctxRoot, 'config', 'enabled-agents.json');
 
   let enabledAgents: Record<string, { enabled?: boolean; org?: string }> = {};
@@ -350,7 +359,11 @@ export function isValidSchedule(schedule: string): boolean {
  * Read the list of enabled agent names from enabled-agents.json.
  */
 function getEnabledAgents(): string[] {
-  const ctxRoot = process.env.CTX_ROOT ?? process.cwd();
+  // resolveCtxRoot() (task_1790474717185 item 5 follow-up, Codex REQUEST-CHANGES
+  // 2026-09-27): previously fell back to process.cwd() independently of
+  // src/bus/crons.ts's cron/log path resolution, so with CTX_ROOT unset, agent
+  // discovery here could read a different root than the cron data it reports on.
+  const ctxRoot = resolveCtxRoot();
   const enabledFile = join(ctxRoot, 'config', 'enabled-agents.json');
   if (!existsSync(enabledFile)) return [];
   try {

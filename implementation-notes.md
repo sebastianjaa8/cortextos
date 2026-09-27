@@ -659,3 +659,42 @@ merged (`git log 48ebe69..upstream/main` is empty), so no second upstream merge 
   and consuming `.force-fresh`; the stub PTY's pid is fake, so the test now stubs
   utils/process-ownership exactly like agent-process-opencode.test.ts. Marker/log/session files stay
   real fs; assertions unchanged.
+
+---
+
+# task_1790474717185 item 5 — Codex REQUEST-CHANGES round 2 (builder_1, 2026-09-27)
+
+Codex diff review on f51229e+4476f8b came back REQUEST-CHANGES: 4 remaining `?? process.cwd()`
+sites not migrated (src/daemon/cron-delivery-log.ts:38, src/daemon/ipc-server.ts:200/270/353) plus
+a cross-file agreement test that asserted file-existence but never called getExecutionLogPage(), so
+a regression reverting only crons.ts's reader would have escaped it.
+
+- 06:20Z — decision: migrate all 4 remaining sites to resolveCtxRoot() rather than partially, since
+  the whole point of item 5 was "every reader of this root agrees" — leaving even one un-migrated
+  site defeats it. ipc-server.ts:800's `process.env.CTX_ROOT ? pathResolve(...) : ''` is a DIFFERENT
+  pattern (no cwd fallback, empty-string sentinel) and Codex didn't flag it — left untouched.
+- 06:20Z — added 4 tests, one per gap Codex named: (1) getExecutionLogPage() actually reads back an
+  entry written under the fake-HOME root (closes the tautological-agreement gap); (2) handleAddCron
+  rejects an unlisted agent found only via fake-HOME enabled-agents.json (exercises getEnabledAgents,
+  formerly line 353); (3) computeFleetHealth() counts a cron seeded only under fake-HOME (exercises
+  listAllCrons's own enabledFile lookup at 200 AND computeFleetHealth's own duplicate lookup at 270 —
+  both fire from one call since computeFleetHealth calls listAllCrons internally); (4) appendDeliveryLog
+  places its file under fake-HOME, not cwd.
+- 06:20Z — gotcha, found the hard way for test (2): handleAddCron's own not-found check is
+  `if (enabledAgents.length > 0 && !enabledAgents.includes(agent))` — if getEnabledAgents silently
+  returns [] (old cwd-fallback bug, file not found there), the check is SKIPPED, not failed, so an
+  add would incorrectly SUCCEED rather than error. Naive test (assert success) can't discriminate a
+  regression from a pass; had to assert REJECTION of an agent deliberately absent from the fake-HOME
+  file, which only rejects when the file is actually found and read.
+- 06:20Z — sabotage-checked all 4 new tests: reverted all 4 sites back to the literal `?? process.cwd()`
+  fallback via a scripted `perl -0pi` substitution (not touching the tautological old assertions, only
+  the bare `resolveCtxRoot()` call lines), confirmed all 4 new tests fail with the exact predicted
+  signature (existsSync false, total 0, add wrongly succeeds), restored via a pre-edit backup copy,
+  re-verified green.
+- 06:20Z — verified: tsc clean. 158/158 in the 8 affected daemon/ipc test files. Full suite: 1 failed
+  (the pre-existing macOS /tmp symlink hooks.test.ts case, documented above and confirmed unrelated by
+  Codex's own item1-piecea review) / 3023 passed / 3 skipped — no new regressions from item1-piecea's
+  merge into main landing in this worktree's history either.
+- could-be-better: didn't add a regression test for ipc-server.ts:800's different pattern since Codex
+  didn't flag it as in-scope — if a future reviewer wants full-file consistency, that's a separate,
+  smaller follow-up (empty-string sentinel instead of cwd, arguably a different bug class).
