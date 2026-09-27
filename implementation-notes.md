@@ -698,3 +698,23 @@ a regression reverting only crons.ts's reader would have escaped it.
 - could-be-better: didn't add a regression test for ipc-server.ts:800's different pattern since Codex
   didn't flag it as in-scope — if a future reviewer wants full-file consistency, that's a separate,
   smaller follow-up (empty-string sentinel instead of cwd, arguably a different bug class).
+
+## Codex confirmation review (GO, 2026-09-27) — 2 corrections, non-blocking
+
+Codex confirmed 57c3aad: GO, all 4 flagged sites migrated, readback gap closed, line-800 exclusion
+reasonable. Two real minor findings on MY OWN work, applied same session:
+
+- **Overstated claim, corrected not deleted**: my commit message and the computeFleetHealth test's
+  title claimed it exercised "computeFleetHealth's own duplicate lookup at line 270" alongside
+  listAllCrons's. Codex checked the actual source: computeFleetHealth() reads `enabledAgents` at
+  that line but never uses the variable afterward — pre-existing dead code this fix didn't introduce,
+  just relocated to the correct (still-unused) root. The test genuinely only discriminates a
+  regression in listAllCrons()'s lookup. Corrected the test's title and added a comment explaining
+  why, rather than silently deleting the wrong claim — same rule as GUARDRAILS' "never bulk-fix
+  records", here applied to a live test docstring instead of a memory file: a corrected error
+  teaches, a silently fixed one doesn't.
+- **Real resource leak**: the new IPC-discovery fixture's `fakeHome` tempdir was never rmSync'd in
+  its own afterEach (unlike the sibling fixture in cron-execution-log.test.ts, which does this
+  correctly) — copy-paste omission. Fixed.
+- Re-verified: tsc clean, 32/32 in ipc-list-crons.test.ts. Did not re-run the full suite for this
+  cosmetic-plus-leak-fix pass — no production code changed, only test title/comment/cleanup.

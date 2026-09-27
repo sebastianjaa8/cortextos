@@ -454,6 +454,7 @@ describe('resolveCtxRoot / unset CTX_ROOT — IPC discovery (task_1790474717185 
     cwdSpy?.mockRestore();
     cwdSpy = undefined;
     vi.unstubAllEnvs();
+    try { rmSync(fakeHome, { recursive: true }); } catch { /* ignore */ }
     // Outer afterEach restores CTX_ROOT from originalCtxRoot and rm's tmpRoot.
   });
 
@@ -493,7 +494,16 @@ describe('resolveCtxRoot / unset CTX_ROOT — IPC discovery (task_1790474717185 
     expect(result.field).toBe('agent');
   });
 
-  it('computeFleetHealth() counts a cron seeded only under the fake-HOME root (listAllCrons + its own enabledFile lookup, ipc-server.ts formerly lines 200 and 270)', async () => {
+  it('computeFleetHealth() counts a cron seeded only under the fake-HOME root (listAllCrons\'s enabledFile lookup, ipc-server.ts formerly line 200)', async () => {
+    // Correction (Codex confirmation review, 2026-09-27): computeFleetHealth()
+    // has its OWN local enabledFile/enabledAgents read (formerly line 270,
+    // now migrated alongside the others) but never actually uses that
+    // variable afterward — it's pre-existing dead code this fix did not
+    // introduce. This test therefore only discriminates a regression in
+    // listAllCrons()'s lookup (line 200), not computeFleetHealth's own
+    // (unused) one, despite what an earlier version of this test's title
+    // claimed. The migration at line 279 is still correct to keep root
+    // resolution consistent even though nothing reads the result today.
     writeEnabledAgentsAtFakeHome({ boris: { enabled: true } });
     writeCronsAtFakeHome('boris', [
       { name: 'heartbeat', prompt: 'hi', schedule: '6h', enabled: true, created_at: '2026-04-01T00:00:00.000Z' },
