@@ -40,20 +40,43 @@ if (process.argv.includes('--self-test')) {
   const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs');
   const { join } = await import('node:path');
   const { tmpdir } = await import('node:os');
-  const dir = mkdtempSync(join(tmpdir(), 'pathform-'));
-  const win = join(dir, 'probe.txt').replace(/\\/g, '/');
-  writeFileSync(win, 'ok', 'utf8');
-  const m = /^([A-Za-z]):\/(.*)$/.exec(win);
-  const msys = `/${m[1].toLowerCase()}/${m[2]}`;
   const { readFileSync } = await import('node:fs');
-  const cases = [
-    // THE MSYS CASE IS THE ONE THAT FAILS TODAY. A test using only the Windows form
-    // proves nothing — that is exactly how this survived three occurrences.
-    ['windows form opens', () => readFileSync(resolve(win), 'utf8') === 'ok'],
-    ['MSYS form opens', () => readFileSync(resolve(msys), 'utf8') === 'ok'],
-    ['backslash form opens', () => readFileSync(resolve(win.replace(/\//g, '\\')), 'utf8') === 'ok'],
-    ['both forms resolve to the SAME inode', () =>
-      statSync(resolve(win)).ino === statSync(resolve(msys)).ino],
+  const dir = mkdtempSync(join(tmpdir(), 'pathform-'));
+  const native = join(dir, 'probe.txt');
+  writeFileSync(native, 'ok', 'utf8');
+
+  // PLATFORM GATE (2026-09-28): the four cases below assumed tmpdir() returns a
+  // Windows-drive-letter path, which is only true on win32 — on macOS/Linux the regex
+  // never matches, `m` is null, and `m[1]` threw. Real MSYS<->Windows I/O can only be
+  // exercised where a C:/-style file can actually exist, so on non-Windows platforms we
+  // test the STRING CONVERSION logic directly (forms() is pure, no I/O — this needs no
+  // real file) plus a real-file check that a native path still opens unchanged.
+  let cases;
+  if (process.platform === 'win32') {
+    const win = native.replace(/\\/g, '/');
+    const m = /^([A-Za-z]):\/(.*)$/.exec(win);
+    const msys = `/${m[1].toLowerCase()}/${m[2]}`;
+    cases = [
+      // THE MSYS CASE IS THE ONE THAT FAILS TODAY. A test using only the Windows form
+      // proves nothing — that is exactly how this survived three occurrences.
+      ['windows form opens', () => readFileSync(resolve(win), 'utf8') === 'ok'],
+      ['MSYS form opens', () => readFileSync(resolve(msys), 'utf8') === 'ok'],
+      ['backslash form opens', () => readFileSync(resolve(win.replace(/\//g, '\\')), 'utf8') === 'ok'],
+      ['both forms resolve to the SAME inode', () =>
+        statSync(resolve(win)).ino === statSync(resolve(msys)).ino],
+    ];
+  } else {
+    cases = [
+      ['native path opens unchanged', () => readFileSync(resolve(native), 'utf8') === 'ok'],
+      ['MSYS string converts to Windows form', () =>
+        forms('/c/Users/x/y.txt').includes('C:/Users/x/y.txt')],
+      ['Windows string converts to MSYS form', () =>
+        forms('C:/Users/x/y.txt').includes('/c/Users/x/y.txt')],
+      ['Windows backslash string converts to MSYS form', () =>
+        forms('C:\\Users\\x\\y.txt').includes('/c/Users/x/y.txt')],
+    ];
+  }
+  cases.push(
     // NEGATIVE. Without it the helper could return its input unchanged, pass everything
     // above, and turn a real missing file into a silent success.
     ['a genuinely absent path still THROWS', () => {
@@ -66,7 +89,7 @@ if (process.argv.includes('--self-test')) {
     }],
     ['mustExist:false returns rather than throwing', () =>
       resolve('/c/no/such', { mustExist: false }) === '/c/no/such'],
-  ];
+  );
   let failed = 0;
   for (const [name, fn] of cases) {
     let ok = false;

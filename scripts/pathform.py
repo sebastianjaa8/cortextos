@@ -74,29 +74,47 @@ def resolve(p, must_exist=True):
 
 def _self_test():
     import tempfile
-    fd, win = tempfile.mkstemp(suffix="-pathform.txt")
+    fd, native = tempfile.mkstemp(suffix="-pathform.txt")
     os.write(fd, b"ok")
     os.close(fd)
-    win = win.replace("\\", "/")
-    m = re.match(r"^([A-Za-z]):/(.*)$", win)
-    assert m, win
-    msys = "/" + m.group(1).lower() + "/" + m.group(2)
-    failed = 0
-    try:
+    native = native.replace("\\", "/")
+
+    # PLATFORM GATE (2026-09-28): the four cases below assumed tempfile.mkstemp() returns
+    # a Windows-drive-letter path, which is only true on win32 — on macOS/Linux the regex
+    # never matches, `m` is None, and `assert m, win` raised. Real MSYS<->Windows I/O can
+    # only be exercised where a C:/-style file can actually exist, so on non-Windows
+    # platforms we test the STRING CONVERSION logic directly (forms() is pure, no I/O —
+    # this needs no real file) plus a real-file check that a native path still opens
+    # unchanged.
+    if sys.platform == "win32":
+        m = re.match(r"^([A-Za-z]):/(.*)$", native)
+        assert m, native
+        msys = "/" + m.group(1).lower() + "/" + m.group(2)
         cases = [
             # The two forms this language is handed in practice. THE MSYS ONE IS THE
             # CASE THAT FAILS TODAY — a test using only the Windows form proves nothing,
             # which is precisely how this survived three occurrences.
-            ("windows form opens", lambda: open(resolve(win)).read() == "ok"),
+            ("windows form opens", lambda: open(resolve(native)).read() == "ok"),
             ("MSYS form opens", lambda: open(resolve(msys)).read() == "ok"),
-            ("backslash form opens", lambda: open(resolve(win.replace("/", "\\"))).read() == "ok"),
-            ("both forms resolve to the SAME file", lambda: os.path.samefile(resolve(win), resolve(msys))),
-            # NEGATIVE. Without this the helper could return its input unchanged and pass
-            # every case above while making a real missing file invisible.
-            ("a genuinely absent path still RAISES", _absent_raises),
-            ("the raise NAMES the forms it tried", _raise_names_forms),
-            ("must_exist=False returns rather than raising", lambda: resolve("/c/no/such", must_exist=False) == "/c/no/such"),
+            ("backslash form opens", lambda: open(resolve(native.replace("/", "\\"))).read() == "ok"),
+            ("both forms resolve to the SAME file", lambda: os.path.samefile(resolve(native), resolve(msys))),
         ]
+    else:
+        cases = [
+            ("native path opens unchanged", lambda: open(resolve(native)).read() == "ok"),
+            ("MSYS string converts to Windows form", lambda: "C:/Users/x/y.txt" in forms("/c/Users/x/y.txt")),
+            ("Windows string converts to MSYS form", lambda: "/c/Users/x/y.txt" in forms("C:/Users/x/y.txt")),
+            ("Windows backslash string converts to MSYS form", lambda: "/c/Users/x/y.txt" in forms("C:\\Users\\x\\y.txt")),
+        ]
+    cases += [
+        # NEGATIVE. Without this the helper could return its input unchanged and pass
+        # every case above while making a real missing file invisible.
+        ("a genuinely absent path still RAISES", _absent_raises),
+        ("the raise NAMES the forms it tried", _raise_names_forms),
+        ("must_exist=False returns rather than raising", lambda: resolve("/c/no/such", must_exist=False) == "/c/no/such"),
+    ]
+    failed = 0
+    try:
         for name, fn in cases:
             try:
                 ok = fn() is True
@@ -105,7 +123,7 @@ def _self_test():
             failed += 0 if ok else 1
             print(("ok   " if ok else "FAIL ") + name)
     finally:
-        os.unlink(win)
+        os.unlink(native)
     print()
     print(f"pathform --self-test: {len(cases) - failed}/{len(cases)}")
     print("BOUNDARY: proves both forms open FROM PYTHON. The node twin (pathform.mjs) "
