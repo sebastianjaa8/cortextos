@@ -861,3 +861,32 @@ leaving it deferred.
   1 failed / 193 passed / 1 skipped (195 total, no double-counting) — same single pre-existing
   hooks.test.ts failure as before. Wall-clock dropped from 253s to 92s per run as a side effect
   of no longer running 186 files twice.
+
+---
+
+## pathform.mjs/py self-test: platform-gate Windows-only cases (2026-09-28, task_1790584378264_41757426)
+
+Root cause diagnosed 2026-09-27 (see that day's memory), fix proposed then, no seb_boss reply
+after 24h+ -- proceeded per standing repair authority (GOALS.md focus: "maintaining and improving
+our own system, including repair of accidental breakage").
+
+- 08:32Z — decision: the 4 Windows-form/MSYS-form/backslash-form/same-inode self-test cases
+  assumed `tmpdir()`/`tempfile.mkstemp()` return a Windows-drive-letter path. True on win32 only —
+  on macOS/Linux the drive-letter regex never matches, so `m` is null/None and the next line
+  (`m[1]` in JS, `assert m, win` in Python) crashed. Platform-gated: win32 keeps the original 4
+  I/O cases; macOS/Linux gets 4 replacement cases — one real-file check (native path opens
+  unchanged) plus 3 pure string-logic checks against `forms()` (no I/O needed, since a real
+  Windows-drive-letter file cannot exist on this platform to test against).
+- 08:33Z — sabotage-checked both twins: mutated the MSYS->Windows drive-letter case
+  (`toUpperCase()`->`toLowerCase()` in JS, `.upper()`->`.lower()` in Python) via `sed`, confirmed
+  the new "MSYS string converts to Windows form" case goes FAIL, restored, confirmed 7/7 green
+  again. Both directions of the fix are provably alive, not just quiet.
+- 08:33Z — verified: full `node scripts/run-selftests.mjs` sweep now exits 0 (was 2), pathform.mjs
+  and pathform.py both 7/7 (was crashing before any case ran). Full repo build clean, `npm test`:
+  1 failed (same pre-existing unrelated hooks.test.ts symlink-escape case) / 192 passed / 1
+  skipped — unrelated to this change.
+- could-be-better: the two self-tests now diverge in case COUNT by platform (4 win32 vs 4
+  non-win32, same total but different content) — acceptable since the underlying claim ("both
+  forms open, from both languages") is fundamentally untestable on a single OS without a real
+  Windows box; this trades a false crash for an honest platform boundary rather than pretending
+  full coverage.
