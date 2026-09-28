@@ -1002,11 +1002,14 @@ inline in the test files with the exact reasoning:
   survives (isn't cleared), and never proved a retry actually happens once cooldown clears. Fixed
   with a fuller sequence (fail once → assert cooldown holds for a full window → assert retry at
   cooldown expiry → assert the ORIGINAL content, not a substitute, delivers once bootstrapped).
-  **Sabotage-checked the fix itself**: moved the `lastNeverBootstrappedNudgeAt = Date.now()`
-  assignment to AFTER the throwing call (the exact regression this test exists to catch) — the
-  strengthened assertion caught it immediately (179 calls instead of a quiet cooldown window); the
-  ORIGINAL (pre-fix) test would NOT have caught this same mutation, since it only checked
-  `not.toThrow()`.
+  **Sabotage-checked the fix itself**: the mutation actually applied REMOVED the cooldown-timestamp
+  assignment entirely (not a clean relocation as the working comment claimed at the time —
+  correcting that here rather than leaving an inaccurate description) — with
+  `lastNeverBootstrappedNudgeAt` staying `null` forever, the cooldown-active check is permanently
+  false, so EVERY subsequent tick where the overdue-baseline condition holds attempts a nudge,
+  observed as 179 calls across the advanced window (one per 5s tick), instead of the expected
+  cooldown-bounded count. The strengthened assertion caught this immediately; the ORIGINAL (pre-fix)
+  test would NOT have caught this same mutation, since it only checked `not.toThrow()`.
 - **P2 real finding**: the "retries exhausted" containment test threw from EVERY `verify.log(...)`
   call, so it exited at the FIRST interim retry log — never reaching the actual exhaustion branch,
   and never exercising `onFailed` at all (which sits on the line immediately after the exhaustion
