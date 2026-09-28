@@ -953,16 +953,18 @@ covers execution only.
   before I added a single new test.
 - 11:00Z — applied the plan's exact diff to `inject.ts`: two nested try/catch wraps around the
   existing (unmodified in body) setTimeout callback and its check() closure. Confirmed the
-  existing 20-test suite passes unmodified first.
-- 11:01Z — wrote 15 new tests in agent-process-queued-inject.test.ts (MUST-FAIL delivery case,
+  existing 17-test suite passes unmodified first (**correction, 2026-09-28 ~15:05Z**: earlier note
+  in this section said "20-test suite" — wrong, actual base count is 17; caught by Codex's diff
+  review, see below).
+- 11:01Z — wrote 13 new tests in agent-process-queued-inject.test.ts (MUST-FAIL delivery case,
   paired negative, content-leak check, cooldown bounding, dedup-salt, multi-item backlog
   retention+ordering, same-instance restart with vi.setSystemTime() clock-jump, write-failure
   containment, failure-log containment, {ok:false} result logging, success-path-log-throw
-  containment, bootstrap-transition content preservation, runtime gating) and 13 new tests in
-  inject.test.ts (7 MUST-FAIL containment cases across both catch layers + 2 R8 console.warn-itself-
-  throws cases + 2 R8 toString()-itself-throws cases + the 2 originally-scoped coverage-gap cases
-  for check()-scope getOutputBytes() and retry-path onFailed). All 28 new + 58 existing (30+28)
-  passed together on first full run after one test-design fix (see below).
+  containment, bootstrap-transition content preservation, runtime gating) and 12 new tests in
+  inject.test.ts (containment cases across both catch layers + R8 console.warn-itself-throws cases
+  + R8 toString()-itself-throws cases + coverage-gap cases for check()-scope getOutputBytes() and
+  retry-path onFailed). 34 base (17+17) + 25 new (13+12) = 59 total, all passed together on first
+  full run after one test-design fix (see below).
 - 11:00Z — one test design bug, self-caught by actually running it, not assumed: the "backlog with
   multiple already-overdue items" test originally expected only 1 delivery when bootstrapped
   flipped true, but by that point in the test all 3 queued items are ALSO massively overdue by
@@ -987,4 +989,46 @@ covers execution only.
 - could-be-better: did not chase the 2 newly-discovered pre-existing failures — worth a follow-up
   investigation (possibly environment/fixture-specific to this machine, given they weren't caught
   by this session's earlier full-suite runs before now) but genuinely out of scope for a Tier-3
-  daemon fix already 10 review rounds deep.
+  daemon fix already 10 review rounds deep. seb_boss filed task_1790608009600_77593720 for it.
+
+### Codex diff review round 1 (2026-09-28 ~15:00Z) — REQUEST-CHANGES, 0 production bugs, 4 real test-rigor gaps
+
+Production code confirmed to conform exactly to the 10-round-reviewed plan, no new bug found. All
+4 findings were in test rigor or documentation accuracy — every one fixed, all still marked-up
+inline in the test files with the exact reasoning:
+
+- **P2 real finding**: the failed-nudge containment test only asserted `not.toThrow()` — it never
+  proved the cooldown timestamp still gets set on a FAILED attempt, never proved the queued item
+  survives (isn't cleared), and never proved a retry actually happens once cooldown clears. Fixed
+  with a fuller sequence (fail once → assert cooldown holds for a full window → assert retry at
+  cooldown expiry → assert the ORIGINAL content, not a substitute, delivers once bootstrapped).
+  **Sabotage-checked the fix itself**: moved the `lastNeverBootstrappedNudgeAt = Date.now()`
+  assignment to AFTER the throwing call (the exact regression this test exists to catch) — the
+  strengthened assertion caught it immediately (179 calls instead of a quiet cooldown window); the
+  ORIGINAL (pre-fix) test would NOT have caught this same mutation, since it only checked
+  `not.toThrow()`.
+- **P2 real finding**: the "retries exhausted" containment test threw from EVERY `verify.log(...)`
+  call, so it exited at the FIRST interim retry log — never reaching the actual exhaustion branch,
+  and never exercising `onFailed` at all (which sits on the line immediately after the exhaustion
+  log call, source order matters). Split into two tests: one throwing ONLY at the exhaustion-
+  specific log message (asserts 3 interim logs happened first, proving genuine exhaustion, and
+  that `onFailed` was correctly NEVER reached since the log throw precedes it in source order);
+  one where logging succeeds and `onFailed` itself throws at exhaustion (asserts `onFailed` was
+  genuinely invoked via `vi.fn()`, not just "didn't throw").
+- **P2 real finding**: the nudge/real-content leak test used `.not.toBe(exactString)`, which would
+  pass even if the nudge embedded the real cron content inside a prefix/timestamp wrapper. Fixed
+  to a distinctive-sentinel `.not.toContain()` check. **Sabotage-checked**: temporarily appended
+  `head.content` to the nudge string (exactly the leak class described) — the strengthened test
+  caught it immediately; confirmed the old exact-equality version would NOT have (the sentinel was
+  present as a substring, `.not.toBe()` on the full string would still have passed).
+- Diff-hygiene finding: my own implementation-notes.md entry above had wrong test counts (said
+  "20-test suite" for inject.ts's base, said 28 new total) — actual base is 17+17=34, actual new
+  count is 13+12=25, total 59. Corrected above rather than left wrong.
+- Also strengthened (Codex's own "lower-priority, not blocking" note) 3 more containment tests
+  that asserted only `not.toThrow()` without confirming the triggering callback actually ran —
+  added `vi.fn()`-based invocation assertions throughout. One of those fixes itself caught a wrong
+  assumption in my own test: `console.warn(...)` is never actually INVOKED when the exception
+  originates from building its own argument (`String(err)` on a throwing `toString()`) — the
+  throw happens before the call expression runs at all, so the correct assertion is
+  `warnSpy.not.toHaveBeenCalled()`, not `toHaveBeenCalledTimes(1)` as I'd first written. Caught by
+  actually running the test, not by inspection.

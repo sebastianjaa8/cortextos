@@ -474,14 +474,19 @@ describe('AgentProcess.drainTick — never-bootstrapped nudge (task_179059143221
     expect(mockInjectMessage).not.toHaveBeenCalled();
   });
 
-  it('nudge content is NOT the queued cron content', () => {
+  it('nudge content is NOT the queued cron content, and does not even embed it as a substring', () => {
     const { proc, state } = makeRunningProcess('hermes');
+    // Distinctive sentinel, not just an inequality target — a nudge that embedded the full
+    // cron prompt inside a prefix/timestamp wrapper would still pass a plain .not.toBe() check
+    // (Codex round-review finding). Assert the sentinel does not appear anywhere in the
+    // injected string, not just that the two strings aren't byte-identical.
+    const sentinel = 'SENTINEL-REAL-CRON-CONTENT-MUST-NOT-LEAK-9f3a1';
     state.bootstrapped = false;
-    proc.injectMessageQueued('real cron content — must not leak pre-bootstrap');
+    proc.injectMessageQueued(sentinel);
 
     vi.advanceTimersByTime(DRAIN_MAX_WAIT_MS);
     expect(mockInjectMessage).toHaveBeenCalledTimes(1);
-    expect(mockInjectMessage.mock.calls[0][1]).not.toBe('real cron content — must not leak pre-bootstrap');
+    expect(mockInjectMessage.mock.calls[0][1]).not.toContain(sentinel);
   });
 
   it('cooldown, not one-shot: nudges once per DRAIN_MAX_WAIT_MS window, not every tick', () => {
@@ -581,7 +586,7 @@ describe('AgentProcess.drainTick — never-bootstrapped nudge (task_179059143221
     expect(mockInjectMessage).toHaveBeenCalledTimes(1);
   });
 
-  it('nudge-write failure is contained: a synchronous throw from injectMessageDetailed does not crash drainTick', () => {
+  it('nudge-write failure is contained: a synchronous throw from injectMessageDetailed does not crash drainTick, does not clear the queue, still respects cooldown, and still retries at the next window', () => {
     const { proc, state } = makeRunningProcess('hermes');
     state.bootstrapped = false;
     proc.injectMessageQueued('real cron content');
@@ -589,7 +594,31 @@ describe('AgentProcess.drainTick — never-bootstrapped nudge (task_179059143221
       throw new Error('simulated PTY write failure');
     });
 
+    // The throwing attempt itself must still happen (not skipped) and must not crash.
     expect(() => vi.advanceTimersByTime(DRAIN_MAX_WAIT_MS)).not.toThrow();
+    expect(mockInjectMessage).toHaveBeenCalledTimes(1);
+
+    // Cooldown must still be respected after a FAILED attempt — this is the case Codex flagged
+    // as unproven: moving the cooldown-timestamp assignment to only the success path (or after
+    // the throwing call) would let this next assertion fail by re-attempting every 5s tick.
+    mockInjectMessage.mockClear();
+    vi.advanceTimersByTime(DRAIN_MAX_WAIT_MS - TICK);
+    expect(mockInjectMessage).not.toHaveBeenCalled();
+
+    // Once the cooldown clears, the SAME still-queued item drives a fresh (this time
+    // non-throwing) attempt — proving the item was never cleared by the failed attempt, and
+    // proving cooldown expiry, not the earlier throw, governs the next try. Also confirms
+    // content retention directly: flip bootstrapped true afterward and require the ORIGINAL
+    // content (not a re-enqueued substitute) to be what the existing drain path delivers.
+    vi.advanceTimersByTime(TICK);
+    expect(mockInjectMessage).toHaveBeenCalledTimes(1);
+    expect(mockInjectMessage.mock.calls[0][1]).not.toBe('real cron content'); // still a nudge, not real content
+
+    mockInjectMessage.mockClear();
+    state.bootstrapped = true;
+    vi.advanceTimersByTime(TICK);
+    expect(mockInjectMessage).toHaveBeenCalledTimes(1);
+    expect(mockInjectMessage.mock.calls[0][1]).toBe('real cron content');
   });
 
   it("nudge's own failure-log call is contained too: a throwing logger does not escape the catch", () => {
