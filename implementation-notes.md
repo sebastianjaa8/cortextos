@@ -797,3 +797,39 @@ reasonable. Two real minor findings on MY OWN work, applied same session:
   predicted empty-string result, restored).
 - 11:06Z — re-verified: tsc clean, 121/121 in the 5 directly-affected suites (was 120, +1 new
   test). Rebuilt dist/cli.js after restoring the sabotage mutation.
+
+---
+
+## vitest sequential pool for flaky lock/PID + integration tests (2026-09-28, task_1790569048315_06300956)
+
+Fast-follow on task_1786592962516_42324247 (the flake this file's own notes above already
+independently rediscovered mid-verification). seb_boss approved landing a config fix rather than
+leaving it deferred.
+
+- 00:19Z — decision: used vitest 4's `test.projects` (not `--no-file-parallelism` globally) so
+  only the 9 evidenced-flaky files run single-worker; everything else keeps parallel wall-clock
+  savings. Confirmed via context7 (/vitest-dev/vitest v4.1.6 docs) that `projects` +
+  `fileParallelism: false` per-project is the current API, `extends: true` inherits root
+  resolve/alias/pool.
+- 00:20Z — gotcha: `test.exclude` REPLACES vitest's default exclude array (node_modules, .git)
+  rather than merging with it — confirmed via docs, not assumed. Spread `configDefaults.exclude`
+  into the 'parallel' project's exclude list to avoid accidentally scanning node_modules.
+- 00:20Z — decision: scoped to exactly the 9 files the isolation ladder in task_1786592962516
+  confirmed went green under --no-file-parallelism (process-ownership, lock, status-ownership,
+  restart-command, phase2-backtesting, phase5-performance, phase5-failure-modes,
+  multi-agent-crons, concurrent-cron-mutations). Deliberately excluded the 4 other still-flaky
+  files (phase4-dashboard-backtest, phase4-performance, phase5-user-journeys,
+  phase5-e2e-simulation) — different root cause per that task's own notes (vi.resetModules() +
+  dynamic Next.js route import), would not be fixed by this change, filed separately.
+- 00:20Z — decision: also left out sibling files in the same directories
+  (process-ownership-malformed-spawn.test.ts, process-ownership-darwin.test.ts,
+  daemon-instance-lock.test.ts, multi-agent-crons-codex.test.ts) sharing the PID/lock-timing
+  shape but never actually evidenced as flaky — scoping to evidence, not file-family guesswork.
+- 00:24Z — verified: full suite run twice with the new config (worktree; node_modules and
+  dashboard/node_modules symlinked from the main checkout since git worktree doesn't share
+  them). Both runs identical: 2 failed / 377 passed / 2 skipped (test-file count) — the 2
+  failures are both the SAME pre-existing, unrelated hooks.test.ts symlink-escape case,
+  confirmed pre-existing via `git stash` + rerunning that file alone against the unmodified
+  config (fails identically). None of the 9 target files failed in either run.
+- could-be-better: only 2 full-suite passes, not N — proportionate given the original
+  isolation-ladder task already did the heavier statistical proof; not re-deriving that here.
