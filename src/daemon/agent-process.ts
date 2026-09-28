@@ -739,6 +739,13 @@ export class AgentProcess {
   private drainTimer: ReturnType<typeof setInterval> | null = null;
   /** getTotalBytes() sample from the previous drain tick; -1 = no baseline. */
   private drainLastBytes = -1;
+  /**
+   * Last time maybeSendNeverBootstrappedNudge() sent a nudge, or null if never.
+   * Not reset on restart (this AgentProcess instance is reused across
+   * session-refresh/crash-recovery — see maybeSendNeverBootstrappedNudge()'s own
+   * comment for why a plain elapsed-time cooldown against this is still correct).
+   */
+  private lastNeverBootstrappedNudgeAt: number | null = null;
 
   /** How often the drain loop samples PTY output activity. */
   private static readonly DRAIN_TICK_MS = 5_000;
@@ -825,8 +832,18 @@ export class AgentProcess {
     }
     const buffer = this.pty.getOutputBuffer();
     if (!buffer.isBootstrapped()) {
+      // task_1790591432216_84154671 (2026-09-28): isBootstrapped() is a one-way latch
+      // (output-buffer.ts) that can get stuck false after a PTY respawn even though the
+      // process is genuinely alive — confirmed live on hermes_local: 2 consecutive heartbeat
+      // cron fires queued and never delivered, zero error signal anywhere, because this
+      // early-return made the DRAIN_MAX_WAIT_MS safety valve below unreachable. Hermes-only
+      // (confirmed live only there; other runtimes' bootstrap detectors weren't analyzed for
+      // this failure mode) nudge to try to re-latch it — see maybeSendNeverBootstrappedNudge().
+      if (this.config.runtime === 'hermes') {
+        this.maybeSendNeverBootstrappedNudge();
+      }
       this.drainLastBytes = -1;
-      return;
+      return; // unchanged — the queue is never touched, never drained, here.
     }
 
     const bytes = buffer.getTotalBytes();
@@ -893,6 +910,79 @@ export class AgentProcess {
     // The delivered prompt starts its own turn — force a fresh baseline so the
     // next queued item waits for THAT turn to finish.
     this.drainLastBytes = -1;
+  }
+
+  /**
+   * Hermes-only (2026-09-28, task_1790591432216_84154671): isBootstrapped() can get stuck
+   * false after a PTY respawn even though the process is genuinely alive -- confirmed live on
+   * hermes_local. This does NOT deliver the queued cron content (that stays exactly where it
+   * is, draining only through drainTick()'s unmodified bootstrapped path once isBootstrapped()
+   * genuinely flips true). It sends a small, generic, cooldown-bounded nudge -- mirroring the
+   * interim mitigation (scripts/hermes-queue-nudge.mjs, already merged) but becoming eligible
+   * at DRAIN_MAX_WAIT_MS of the actual stall (subject to the 5s DRAIN_TICK_MS poll interval
+   * and scheduling slack, not an exact bound) instead of waiting for that external cron's own
+   * cadence. injectMessageDetailed() does not gate on isBootstrapped() (only pty/status/dedup);
+   * its own output, IF it produces the bootstrap marker, re-triggers output-buffer.ts's
+   * checkBootstrap() on the next push() and lets the queue start draining normally through the
+   * unmodified path above.
+   *
+   * This is NOT claimed to be harmless -- it is a real paste+Enter into the PTY, same as any
+   * other injection, and hermes-pty.ts documents a real bracketed-paste corruption class this
+   * doesn't eliminate. The residual-risk claim is comparative, not absolute: a small generic
+   * string is lower blast-radius than the real, time-sensitive queued cron content would be,
+   * delivered into a session with no independently verified readiness signal beyond the one
+   * that's stuck.
+   *
+   * The async exception exposure this newly creates (the current unbootstrapped branch does
+   * nothing today, zero exposure to inject.ts's async verify-retry path) is closed directly by
+   * hardening that path's own callback bodies in inject.ts (see injectMessage() below) rather
+   * than accepted as residual risk -- seb_boss's explicit scope-expansion decision,
+   * 2026-09-28. task_1790599481559_57500922 stays open for the rest of the shared async
+   * surface beyond what this fix's own scope needs.
+   */
+  private maybeSendNeverBootstrappedNudge(): void {
+    if (this.pendingInjections.length === 0) return;
+    const head = this.pendingInjections[0];
+    // A queue item that was already stale before a restart must not inherit that staleness
+    // into a PTY that has not had a chance to boot yet -- this PTY generation's own creation
+    // time (sessionStart) sets a fresh floor.
+    const readyBaseline = Math.max(head.enqueuedAt, this.sessionStart?.getTime() ?? 0);
+    if (Date.now() - readyBaseline < AgentProcess.DRAIN_MAX_WAIT_MS) return;
+    // Plain elapsed-time cooldown, no generation-aware comparison needed: readyBaseline and
+    // this cooldown both key off DRAIN_MAX_WAIT_MS, and time only moves forward, so for any
+    // restart at T2 after a nudge at T1 (T2 > T1), by the time THIS generation's own
+    // readyBaseline check above passes (at T2 + DRAIN_MAX_WAIT_MS), the plain elapsed-since-T1
+    // is DRAIN_MAX_WAIT_MS + (T2 - T1), which is always > DRAIN_MAX_WAIT_MS -- a plain cooldown
+    // can never incorrectly suppress a nudge the current generation needs.
+    if (
+      this.lastNeverBootstrappedNudgeAt !== null
+      && Date.now() - this.lastNeverBootstrappedNudgeAt < AgentProcess.DRAIN_MAX_WAIT_MS
+    ) return;
+    this.lastNeverBootstrappedNudgeAt = Date.now();
+    try {
+      // Salted with the fire timestamp -- injectMessageDetailed()'s dedup hashes the full
+      // content (same reason the CronScheduler onFire path salts recurring cron prompts, see
+      // its own comment in agent-manager.ts); an unsalted identical string risks DEDUPED
+      // rejection on a later cooldown-cycle nudge whose hash is still within the dedup window.
+      const result = this.injectMessageDetailed(
+        `cortextOS daemon: automated repaint nudge (queue stalled, bootstrap not yet confirmed -- ` +
+        `see task_1790591432216_84154671). No action needed. [${new Date().toISOString()}]`,
+      );
+      this.log(
+        `Queue stalled, never bootstrapped (queue head age from ${new Date(readyBaseline).toISOString()}) ` +
+        `-- nudge attempt: ${result.ok ? 'submitted (async verification pending)' : `not sent (${result.code})`}`
+      );
+    } catch (err) {
+      // Contain a SYNCHRONOUS throw from the initial paste write so it cannot propagate into
+      // drainTick()'s raw setInterval and reach the daemon's fatal-error handler
+      // (src/daemon/index.ts) -- an uncaught exception anywhere in this process triggers
+      // process.exit(1), taking down every agent, not just this one. lastNeverBootstrappedNudgeAt
+      // is already set above, so a failing nudge still respects cooldown rather than retrying
+      // in a tight loop.
+      try {
+        this.log(`Never-bootstrapped nudge failed (non-fatal, will retry after cooldown): ${err instanceof Error ? err.message : String(err)}`);
+      } catch { /* absolute last resort: do not let error-formatting itself crash the daemon */ }
+    }
   }
 
   /**

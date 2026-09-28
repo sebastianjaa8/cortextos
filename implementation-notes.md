@@ -934,3 +934,57 @@ daylight review + Codex peer review, NOT landed at night.
   ever stops including the kb-ingest step, this mitigation goes blind even though the daemon bug
   could still be live. Named here so the daylight Tier-3 fix (or a better interim signal) isn't
   designed in ignorance of this ceiling.
+
+---
+
+## drainTick() never-bootstrapped nudge + inject.ts async containment (2026-09-28, task_1790591432216_84154671)
+
+Tier-3 production daemon fix. Full design history (10 Codex plan-review rounds, GO on round 10)
+lives at `orgs/SEB_company/agents/builder_1/work/drainTick-bootstrap-fix/PLAN.md` — this section
+covers execution only.
+
+- 11:00Z — decision: worktree-isolated Tier-3 change, branched fresh off origin/main (not local
+  main, which drifted earlier this session — see GUARDRAIL from that incident). Symlinked
+  node_modules rather than full reinstall.
+- 11:00Z — applied the plan's exact diff to `agent-process.ts`: new `lastNeverBootstrappedNudgeAt`
+  field, new `maybeSendNeverBootstrappedNudge()` method inserted right after `drainTick()`, one
+  additive call site inside the existing `if (!buffer.isBootstrapped())` branch. Zero reordering
+  of existing drainTick() logic, confirmed by the existing 17-test suite passing unmodified
+  before I added a single new test.
+- 11:00Z — applied the plan's exact diff to `inject.ts`: two nested try/catch wraps around the
+  existing (unmodified in body) setTimeout callback and its check() closure. Confirmed the
+  existing 20-test suite passes unmodified first.
+- 11:01Z — wrote 15 new tests in agent-process-queued-inject.test.ts (MUST-FAIL delivery case,
+  paired negative, content-leak check, cooldown bounding, dedup-salt, multi-item backlog
+  retention+ordering, same-instance restart with vi.setSystemTime() clock-jump, write-failure
+  containment, failure-log containment, {ok:false} result logging, success-path-log-throw
+  containment, bootstrap-transition content preservation, runtime gating) and 13 new tests in
+  inject.test.ts (7 MUST-FAIL containment cases across both catch layers + 2 R8 console.warn-itself-
+  throws cases + 2 R8 toString()-itself-throws cases + the 2 originally-scoped coverage-gap cases
+  for check()-scope getOutputBytes() and retry-path onFailed). All 28 new + 58 existing (30+28)
+  passed together on first full run after one test-design fix (see below).
+- 11:00Z — one test design bug, self-caught by actually running it, not assumed: the "backlog with
+  multiple already-overdue items" test originally expected only 1 delivery when bootstrapped
+  flipped true, but by that point in the test all 3 queued items are ALSO massively overdue by
+  `head.enqueuedAt` (queued 3 windows earlier), so the EXISTING (unmodified) overdue branch
+  delivers them one per tick without the quiet-window wait — correct existing behavior, wrong test
+  expectation. Fixed to assert all 3 deliver in order.
+- 11:01Z — sabotage-checked 5 distinct mechanisms, all confirmed red/green: (1) removing the
+  `maybeSendNeverBootstrappedNudge()` call site — 9 tests red; (2) dropping `sessionStart` from
+  `readyBaseline` — the restart-discrimination test red; (3) removing the timestamp salt — the
+  dedup test red; (4) removing agent-process.ts's outer try/catch — the write-failure containment
+  test red; (5) removing inject.ts's OUTER try/catch — 5 tests red, INNER (check()) try/catch —
+  a DIFFERENT 6 tests red while the outer-handler tests stayed green, proving the two layers are
+  independently load-bearing, not redundant.
+- 11:01Z — verified: `npm run build` clean, `tsc --noEmit` clean, full `npm test`: 12 failed / 3077
+  passed / 3 skipped. Investigated the delta from the expected single pre-existing hooks.test.ts
+  failure: 2 OTHER files (`upgrade-cron-teaching-cli.test.ts`, `message-signing.test.ts`, 11 tests)
+  also failed. Confirmed NOT caused by this change and NOT a parallel-contention flake: reran both
+  in isolation with `--no-file-parallelism` (still failed identically) AND on unmodified
+  `origin/main` via `git stash` (failed identically there too) — pre-existing, previously
+  undiscovered failures on this environment, out of scope for this task, flagged separately rather
+  than silently absorbed into "expected 1 failure."
+- could-be-better: did not chase the 2 newly-discovered pre-existing failures — worth a follow-up
+  investigation (possibly environment/fixture-specific to this machine, given they weren't caught
+  by this session's earlier full-suite runs before now) but genuinely out of scope for a Tier-3
+  daemon fix already 10 review rounds deep.

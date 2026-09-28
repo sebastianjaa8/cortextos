@@ -68,12 +68,13 @@ function makeFakePty() {
   return { pty, state };
 }
 
-function makeRunningProcess() {
-  const proc = new AgentProcess('alice', mockEnv, { runtime: 'claude' } as any, () => {});
+function makeRunningProcess(runtime: string = 'claude') {
+  const logFn = vi.fn();
+  const proc = new AgentProcess('alice', mockEnv, { runtime } as any, logFn);
   const { pty, state } = makeFakePty();
   (proc as any).pty = pty;
   (proc as any).status = 'running';
-  return { proc, pty, state };
+  return { proc, pty, state, logFn };
 }
 
 const TICK = 5_000;
@@ -438,5 +439,232 @@ describe('AgentProcess.injectMessageQueued — turn-boundary drain', () => {
         fired_at: '2026-08-17T00:00:00.000Z',
       });
     });
+  });
+});
+
+const DRAIN_MAX_WAIT_MS = 15 * 60_000;
+
+describe('AgentProcess.drainTick — never-bootstrapped nudge (task_1790591432216_84154671)', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    mockInjectMessage.mockClear();
+    mockLogEvent.mockClear();
+    mockAppendDeliveryLog.mockClear();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('MUST-FAIL: nudges once the queue is stalled past DRAIN_MAX_WAIT_MS with isBootstrapped stuck false', () => {
+    const { proc, state } = makeRunningProcess('hermes');
+    state.bootstrapped = false;
+    proc.injectMessageQueued('real cron content');
+
+    vi.advanceTimersByTime(DRAIN_MAX_WAIT_MS);
+    expect(mockInjectMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it('paired negative: does not nudge before DRAIN_MAX_WAIT_MS elapses', () => {
+    const { proc, state } = makeRunningProcess('hermes');
+    state.bootstrapped = false;
+    proc.injectMessageQueued('real cron content');
+
+    vi.advanceTimersByTime(DRAIN_MAX_WAIT_MS - 1_000);
+    expect(mockInjectMessage).not.toHaveBeenCalled();
+  });
+
+  it('nudge content is NOT the queued cron content', () => {
+    const { proc, state } = makeRunningProcess('hermes');
+    state.bootstrapped = false;
+    proc.injectMessageQueued('real cron content — must not leak pre-bootstrap');
+
+    vi.advanceTimersByTime(DRAIN_MAX_WAIT_MS);
+    expect(mockInjectMessage).toHaveBeenCalledTimes(1);
+    expect(mockInjectMessage.mock.calls[0][1]).not.toBe('real cron content — must not leak pre-bootstrap');
+  });
+
+  it('cooldown, not one-shot: nudges once per DRAIN_MAX_WAIT_MS window, not every tick', () => {
+    const { proc, state } = makeRunningProcess('hermes');
+    state.bootstrapped = false;
+    proc.injectMessageQueued('real cron content');
+
+    vi.advanceTimersByTime(DRAIN_MAX_WAIT_MS);
+    expect(mockInjectMessage).toHaveBeenCalledTimes(1);
+
+    // Advance to just under the second window — still exactly one nudge.
+    vi.advanceTimersByTime(DRAIN_MAX_WAIT_MS - TICK);
+    expect(mockInjectMessage).toHaveBeenCalledTimes(1);
+
+    // Cross into the second window — a second nudge fires.
+    vi.advanceTimersByTime(TICK);
+    expect(mockInjectMessage).toHaveBeenCalledTimes(2);
+  });
+
+  it('dedup-salt regression: successive nudges carry different content (fire-timestamp salted)', () => {
+    const { proc, state } = makeRunningProcess('hermes');
+    state.bootstrapped = false;
+    proc.injectMessageQueued('real cron content');
+
+    vi.advanceTimersByTime(DRAIN_MAX_WAIT_MS);
+    vi.advanceTimersByTime(DRAIN_MAX_WAIT_MS);
+    expect(mockInjectMessage).toHaveBeenCalledTimes(2);
+    expect(mockInjectMessage.mock.calls[0][1]).not.toBe(mockInjectMessage.mock.calls[1][1]);
+  });
+
+  it('backlog with multiple already-overdue items, re-latching never succeeds: nudges stay cooldown-bounded, queue never drains while unbootstrapped', () => {
+    const { proc, state } = makeRunningProcess('hermes');
+    state.bootstrapped = false;
+    proc.injectMessageQueued('item 1');
+    proc.injectMessageQueued('item 2');
+    proc.injectMessageQueued('item 3');
+
+    // Advance across several windows — bootstrapped never flips true.
+    vi.advanceTimersByTime(DRAIN_MAX_WAIT_MS * 3);
+
+    // Bounded: at most one nudge per window, not one per queued item and not one per tick.
+    expect(mockInjectMessage.mock.calls.length).toBeLessThanOrEqual(3);
+    expect(mockInjectMessage.mock.calls.length).toBeGreaterThanOrEqual(2);
+    // None of the nudge calls carried real content — the queue was never drained.
+    for (const call of mockInjectMessage.mock.calls) {
+      expect(call[1]).not.toBe('item 1');
+      expect(call[1]).not.toBe('item 2');
+      expect(call[1]).not.toBe('item 3');
+    }
+
+    // Confirm the queue is still intact: flip bootstrapped true and let the existing,
+    // unmodified drain path take over — all 3 real items must still be there to deliver.
+    // By now every item is also massively overdue by head.enqueuedAt (queued 3 windows ago),
+    // so the existing overdue branch (unmodified by this fix) skips the quiet-window wait and
+    // delivers one per tick, in order — proving retention AND ordering, not the quiet-boundary
+    // shape a fresher queue would take.
+    mockInjectMessage.mockClear();
+    state.bootstrapped = true;
+    vi.advanceTimersByTime(TICK * 3);
+    expect(mockInjectMessage).toHaveBeenCalledTimes(3);
+    expect(mockInjectMessage.mock.calls[0][1]).toBe('item 1');
+    expect(mockInjectMessage.mock.calls[1][1]).toBe('item 2');
+    expect(mockInjectMessage.mock.calls[2][1]).toBe('item 3');
+  });
+
+  it('same-instance restart: a stale cooldown timestamp does not suppress the new generation, but the new generation still gets its own fresh grace period', () => {
+    const { proc, state } = makeRunningProcess('hermes');
+    state.bootstrapped = false;
+    proc.injectMessageQueued('real cron content');
+
+    // T0 -> T1: one real nudge.
+    vi.advanceTimersByTime(DRAIN_MAX_WAIT_MS);
+    expect(mockInjectMessage).toHaveBeenCalledTimes(1);
+
+    // Jump the clock to a LATE restart moment (T2 = T0 + 5*D) WITHOUT executing intermediate
+    // ticks — setSystemTime() fires no callbacks and shifts pending timers' remaining delays
+    // rather than running a catch-up burst, so lastNeverBootstrappedNudgeAt genuinely stays
+    // frozen at its T1 value instead of having refired at every intermediate window.
+    const t2 = Date.now() + DRAIN_MAX_WAIT_MS * 4;
+    vi.setSystemTime(t2);
+    // Same-instance session-refresh: reassign fields on the existing proc, don't reconstruct it
+    // — matches real start()/startImpl() behavior (confirmed: restarts reuse the same
+    // AgentProcess object). The queue is NOT cleared, matching real injectMessageQueued()
+    // behavior across restarts.
+    (proc as any).sessionStart = new Date(t2);
+    state.bootstrapped = false;
+
+    // 10 seconds after the restart: both the raw enqueue-age (5D+10s) and the plain
+    // cooldown-age (4D+10s) are already well past D — only sessionStart in readyBaseline
+    // correctly withholds the nudge here.
+    mockInjectMessage.mockClear();
+    vi.advanceTimersByTime(10_000);
+    expect(mockInjectMessage).not.toHaveBeenCalled();
+
+    // Once the NEW generation's own grace period elapses, a nudge fires.
+    vi.advanceTimersByTime(DRAIN_MAX_WAIT_MS - 10_000);
+    expect(mockInjectMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it('nudge-write failure is contained: a synchronous throw from injectMessageDetailed does not crash drainTick', () => {
+    const { proc, state } = makeRunningProcess('hermes');
+    state.bootstrapped = false;
+    proc.injectMessageQueued('real cron content');
+    mockInjectMessage.mockImplementationOnce(() => {
+      throw new Error('simulated PTY write failure');
+    });
+
+    expect(() => vi.advanceTimersByTime(DRAIN_MAX_WAIT_MS)).not.toThrow();
+  });
+
+  it("nudge's own failure-log call is contained too: a throwing logger does not escape the catch", () => {
+    const { proc, state, logFn } = makeRunningProcess('hermes');
+    state.bootstrapped = false;
+    proc.injectMessageQueued('real cron content');
+    mockInjectMessage.mockImplementationOnce(() => {
+      throw new Error('simulated PTY write failure');
+    });
+    logFn.mockImplementationOnce(() => {
+      throw new Error('simulated broken logger');
+    });
+
+    expect(() => vi.advanceTimersByTime(DRAIN_MAX_WAIT_MS)).not.toThrow();
+  });
+
+  it('injectMessageDetailed returning { ok: false } (NOT_RUNNING/DEDUPED) is logged accurately, not claimed as sent', () => {
+    const { proc, state, logFn } = makeRunningProcess('hermes');
+    state.bootstrapped = false;
+    proc.injectMessageQueued('real cron content');
+    const spy = vi.spyOn(proc as any, 'injectMessageDetailed').mockReturnValueOnce({
+      ok: false,
+      code: 'DEDUPED',
+      message: 'test dedup',
+    });
+
+    vi.advanceTimersByTime(DRAIN_MAX_WAIT_MS);
+    expect(spy).toHaveBeenCalledTimes(1);
+    const logged = logFn.mock.calls.map((c) => String(c[0])).join('\n');
+    expect(logged).toMatch(/not sent \(DEDUPED\)/);
+  });
+
+  it('a successful injection whose success-path log call itself throws is still contained', () => {
+    const { proc, state, logFn } = makeRunningProcess('hermes');
+    state.bootstrapped = false;
+    proc.injectMessageQueued('real cron content');
+    logFn.mockImplementationOnce(() => {
+      throw new Error('simulated broken logger on the success path');
+    });
+
+    expect(() => vi.advanceTimersByTime(DRAIN_MAX_WAIT_MS)).not.toThrow();
+    expect(mockInjectMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it('bootstrap-transition preserves queued content: delivers the ORIGINAL item via the unlogged overdue path, not the nudge string', () => {
+    const { proc, state } = makeRunningProcess('hermes');
+    state.bootstrapped = false;
+    proc.injectMessageQueued('real cron content', { cron: 'starver', firedAt: '2026-09-28T00:00:00.000Z' });
+
+    // Nudge fires once the item is overdue (readyBaseline uses the same DRAIN_MAX_WAIT_MS,
+    // so head.enqueuedAt is also already past it by construction).
+    vi.advanceTimersByTime(DRAIN_MAX_WAIT_MS);
+    expect(mockInjectMessage).toHaveBeenCalledTimes(1);
+    expect(mockInjectMessage.mock.calls[0][1]).not.toBe('real cron content');
+
+    // Simulate a successful re-latch and let the existing, unmodified bootstrapped path drain
+    // the ORIGINAL item.
+    mockInjectMessage.mockClear();
+    state.bootstrapped = true;
+    vi.advanceTimersByTime(TICK);
+    expect(mockInjectMessage).toHaveBeenCalledTimes(1);
+    expect(mockInjectMessage.mock.calls[0][1]).toBe('real cron content');
+
+    // Matching the existing line-380 test's own pattern: even a CONFIRMED accept on this
+    // (already-overdue) path must not produce a delivery record.
+    mockInjectMessage.mock.calls[0][3].onAccepted();
+    expect(mockAppendDeliveryLog).not.toHaveBeenCalled();
+  });
+
+  it('runtime gating: a non-hermes runtime never nudges, even stalled well past DRAIN_MAX_WAIT_MS', () => {
+    const { proc, state } = makeRunningProcess('opencode');
+    state.bootstrapped = false;
+    proc.injectMessageQueued('real cron content');
+
+    vi.advanceTimersByTime(DRAIN_MAX_WAIT_MS * 2);
+    expect(mockInjectMessage).not.toHaveBeenCalled();
   });
 });
