@@ -890,3 +890,47 @@ our own system, including repair of accidental breakage").
   forms open, from both languages") is fundamentally untestable on a single OS without a real
   Windows box; this trades a false crash for an honest platform boundary rather than pretending
   full coverage.
+
+---
+
+## hermes-queue-nudge.mjs: interim mitigation for stuck hermes-runtime cron queues (2026-09-28, task_1790590503920_46716808)
+
+Interim mitigation only, per seb_boss's scope call: the real fix (drainTick()/output-buffer.ts
+in src/daemon) is Tier-3 production daemon code affecting every hermes-runtime agent and needs
+daylight review + Codex peer review, NOT landed at night.
+
+- 10:15Z — root cause confirmed and reproduced LIVE (not just theorized): output-buffer.ts's
+  isBootstrapped() is a one-way latch that drainTick() (QUEUED cron delivery) gates on with no
+  error/retry/drop-event if it's false. A hermes PTY respawn (unlogged ~02:26Z restart) left the
+  latch stuck false even though the process ran normally, silently queuing 2 heartbeat cycles
+  forever with zero observable failure signal. Confirmed the escape hatch: a DIRECT bus message
+  (injectMessageDetailed, not the gated injectMessageQueued) produced fresh PTY output, which
+  re-ran checkBootstrap() (called on every push()) and re-latched the flag — the 2-cycle backlog
+  drained within ~45s of the ping.
+- 10:20Z — decision: mitigation reuses the EXACT kb-ingest-receipt staleness signal
+  kb-ingest-gap-check.mjs already trusts (same receipt file, same cadence-derivation shape) as
+  the proxy for "this agent's queue looks stuck" — no new instrumentation needed, no CLI/IPC
+  exposure of internal daemon state exists to query pendingInjections directly.
+- 10:21Z — gotcha, caught by actually running the self-test rather than trusting a green exit:
+  first draft imported heartbeatIntervalMs/verdict directly from kb-ingest-gap-check.mjs. That
+  file's `if (process.argv.includes('--self-test')) selfTest()` runs as a top-level import-time
+  side effect — importing it made `--self-test` on THIS script silently run and exit inside THAT
+  file's self-test instead (22 cases, an exact count match to kb-ingest-gap-check.mjs's own suite
+  — only caught because the printed case NAMES didn't match what was written here). Fixed by
+  inlining the ~30 lines of pure logic instead of importing a script with argv side effects.
+- 10:22Z — sabotage-checked: flipped the cooldown comparison (`<` to `>`), confirmed 2 cases go
+  FAIL, restored, confirmed 9/9 green again.
+- 10:23Z — cooldown set to 30min (>= drainTick's own DRAIN_MAX_WAIT_MS 15-min valve), so a nudge
+  gets a full chance to land before this script tries again — avoids nudge-spamming a genuinely
+  down agent (which a nudge cannot fix) while still recovering promptly from the actual bug.
+- 10:24Z — wired as builder_1 cron `hermes-queue-nudge` (30m interval) so this runs independent
+  of hermes_local's own session state (which is exactly what would be stuck if the bug recurs).
+- 10:24Z — verified: full run-selftests.mjs sweep picks it up automatically (15 scripts now, was
+  14), self-test passes, live run against the real fleet correctly identifies hermes_local as the
+  only hermes-runtime agent and correctly reports CLEAN (my earlier manual ping already unstuck
+  it and a real 10:17Z receipt landed before this ran).
+- could-be-better: this is a stopgap tied to one detectable symptom (kb-ingest staleness) rather
+  than the actual internal queue-length signal — if a hermes-runtime agent's heartbeat prompt
+  ever stops including the kb-ingest step, this mitigation goes blind even though the daemon bug
+  could still be live. Named here so the daylight Tier-3 fix (or a better interim signal) isn't
+  designed in ignorance of this ceiling.
