@@ -833,3 +833,31 @@ leaving it deferred.
   config (fails identically). None of the 9 target files failed in either run.
 - could-be-better: only 2 full-suite passes, not N — proportionate given the original
   isolation-ladder task already did the heavier statistical proof; not re-deriving that here.
+
+### Codex diff review round 1 (2026-09-28) — REQUEST-CHANGES, 1 blocker, fixed
+
+- 00:31Z — real finding: `extends: true` on a project CONCATENATES array options like `include`
+  with the root's, rather than letting the project override it. My root-level `test.include`
+  leaked into the 'sequential' project, so it matched everything the 'parallel' project matched
+  too — `vitest list --project sequential --filesOnly` showed 195 files (should be 9), 186
+  overlapping with 'parallel', so 186 files ran TWICE (once per-worker single-threaded, once
+  parallel). My original "2 clean runs" verification didn't catch this because the union of both
+  projects still covered the full suite and produced a plausible-looking pass/fail total (377
+  passed on the buggy config vs 193 on the fixed one — right answer, wrong number of file
+  executions to get there).
+- 00:32Z — fix: removed the root-level `include` entirely (documented why in a comment — the
+  concatenation behavior isn't obvious from vitest's own docs). Gave 'parallel' its own explicit
+  `include` (the original two broad globs) alongside its `exclude` of the 9 sequential files.
+  Extracted the 9 sequential file paths into a shared `SEQUENTIAL_FILES` const, used in both
+  the sequential project's `include` and the parallel project's `exclude` — Codex's minor
+  suggestion, prevents future drift between the two lists.
+- 00:32Z — also softened the phase4-dashboard-backtest/phase4-performance root-cause comment:
+  Codex's runtime check found those two files import routes dynamically but do NOT call
+  `vi.resetModules()` (only phase5-e2e-simulation's Scenario 7 confirmed does) — the original
+  comment overstated a single confirmed mechanism across all 4 files.
+- 00:34Z — re-verified per Codex's exact prescription: `vitest list --project sequential
+  --filesOnly` / `--project parallel --filesOnly` now show 9 / 186 with 0 overlap (195 unique,
+  matches the full suite). Reran full suite twice on the corrected config: identical both times,
+  1 failed / 193 passed / 1 skipped (195 total, no double-counting) — same single pre-existing
+  hooks.test.ts failure as before. Wall-clock dropped from 253s to 92s per run as a side effect
+  of no longer running 186 files twice.
