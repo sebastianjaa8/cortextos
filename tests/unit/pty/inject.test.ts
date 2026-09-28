@@ -258,3 +258,203 @@ describe('injectMessage — verified submit (Enter retry)', () => {
     expect(countEnters(writes)).toBe(1);
   });
 });
+
+describe('injectMessage — verify-callback crash containment (task_1790591432216_84154671)', () => {
+  // Round 7 of the drainTick never-bootstrapped-nudge plan review found that a caller-supplied
+  // verify callback (log/onAccepted/onFailed/onSubmitted/getOutputBytes) throwing inside these
+  // setTimeout callbacks would escape uncaught — no surrounding handler existed here before this
+  // fix, and drainTick()'s new nudge exercises this async path in a state (unbootstrapped) that
+  // previously never reached it, so a callback throw here could crash the whole daemon process
+  // (src/daemon/index.ts's uncaughtException handler calls process.exit(1)).
+  beforeEach(() => { vi.useFakeTimers(); });
+  afterEach(() => { vi.useRealTimers(); });
+
+  it('a throwing verify.onSubmitted does not crash the deferred handler', () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    injectMessage(() => {}, 'msg', 300, {
+      onSubmitted: () => { throw new Error('onSubmitted boom'); },
+    });
+    expect(() => vi.advanceTimersByTime(300)).not.toThrow();
+    expect(warnSpy.mock.calls.some((c) => String(c[0]).includes('deferred submit handling failed'))).toBe(true);
+    warnSpy.mockRestore();
+  });
+
+  it("a throwing verify.getOutputBytes on its FIRST call (outer handler, before check() exists) does not crash the deferred handler", () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    injectMessage(() => {}, 'msg', 300, {
+      getOutputBytes: () => { throw new Error('getOutputBytes boom'); },
+    });
+    expect(() => vi.advanceTimersByTime(300)).not.toThrow();
+    expect(warnSpy.mock.calls.some((c) => String(c[0]).includes('deferred submit handling failed'))).toBe(true);
+    warnSpy.mockRestore();
+  });
+
+  it('a throwing verify.onAccepted inside check() does not crash the retry loop', () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    let outputBytes = 0;
+    injectMessage(() => {}, 'msg', 300, {
+      getOutputBytes: () => outputBytes,
+      onAccepted: () => { throw new Error('onAccepted boom'); },
+    });
+    vi.advanceTimersByTime(300); // Enter sent, check() scheduled
+    outputBytes += 5000; // growth on the next check() tick triggers onAccepted
+    expect(() => vi.advanceTimersByTime(4000)).not.toThrow();
+    expect(warnSpy.mock.calls.some((c) => String(c[0]).includes('verify-retry check failed'))).toBe(true);
+    warnSpy.mockRestore();
+  });
+
+  it('a throwing verify.log at the EXHAUSTION point specifically (not the interim retry logs) does not crash the retry loop', () => {
+    // The original version of this test threw from EVERY log() call, so it exited at the
+    // FIRST retry's "re-sending Enter" log — never reaching the exhaustion branch at all
+    // (review finding: "exercises a different branch"). Throwing only when the message
+    // identifies the exhaustion log distinguishes the two call sites and proves the retry loop
+    // ran to genuine exhaustion (3 interim retries logged) before the throw, not an early exit.
+    // Source order is `verify.log?.(...)` THEN `verify.onFailed?.(...)` at exhaustion — the log
+    // throw is expected to prevent onFailed from ever running in THIS scenario (that pairing is
+    // covered by the next test, where log succeeds and onFailed is what throws).
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const onFailed = vi.fn();
+    const interimLogs: string[] = [];
+    injectMessage(() => {}, 'msg', 300, {
+      getOutputBytes: () => 0,
+      onFailed,
+      log: (msg) => {
+        if (msg.includes('retries exhausted')) throw new Error('log boom at exhaustion');
+        interimLogs.push(msg);
+      },
+    });
+    vi.advanceTimersByTime(300); // first Enter
+    expect(() => vi.advanceTimersByTime(120000)).not.toThrow(); // drives all the way to exhaustion
+    expect(interimLogs).toHaveLength(3); // all 3 retries logged normally before the exhaustion throw
+    expect(onFailed).not.toHaveBeenCalled(); // never reached — the exhaustion log throws first
+    warnSpy.mockRestore();
+  });
+
+  it('a throwing verify.onFailed AT exhaustion (log succeeds normally) does not crash the retry loop', () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const logs: string[] = [];
+    // vi.fn() still records the call in .mock.calls even when its own implementation throws
+    // (the call is registered before the implementation runs) — used here specifically so the
+    // test can assert onFailed was genuinely INVOKED, not just that its throw was contained.
+    const onFailed = vi.fn(() => { throw new Error('onFailed boom at exhaustion'); });
+    injectMessage(() => {}, 'msg', 300, {
+      getOutputBytes: () => 0,
+      log: (msg) => { logs.push(msg); },
+      onFailed,
+    });
+    vi.advanceTimersByTime(300);
+    expect(() => vi.advanceTimersByTime(120000)).not.toThrow();
+    expect(logs.some((l) => l.includes('retries exhausted'))).toBe(true); // exhaustion genuinely reached
+    expect(onFailed).toHaveBeenCalledTimes(1); // onFailed itself genuinely ran, not just skipped over
+    warnSpy.mockRestore();
+  });
+
+  it('a throwing verify.getOutputBytes on a SUBSEQUENT call (inside check()s retry sampling, not the first) does not crash the retry loop', () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    let call = 0;
+    injectMessage(() => {}, 'msg', 300, {
+      getOutputBytes: () => {
+        call++;
+        if (call === 1) return 0; // baseline capture in the outer handler succeeds
+        throw new Error('getOutputBytes boom on retry sampling');
+      },
+    });
+    vi.advanceTimersByTime(300); // baseline captured successfully
+    expect(() => vi.advanceTimersByTime(4000)).not.toThrow(); // check()'s own call throws
+    expect(warnSpy.mock.calls.some((c) => String(c[0]).includes('verify-retry check failed'))).toBe(true);
+    warnSpy.mockRestore();
+  });
+
+  it('a throwing verify.onFailed after an Enter WRITE failure (not retries-exhausted) does not crash the deferred handler', () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    let ptyAlive = true;
+    const write = (_: string) => {
+      if (!ptyAlive) throw new TypeError('null.write');
+    };
+    injectMessage(write, 'msg', 300, {
+      getOutputBytes: () => 0,
+      onFailed: () => { throw new Error('onFailed boom'); },
+    });
+    ptyAlive = false;
+    expect(() => vi.advanceTimersByTime(300)).not.toThrow();
+    warnSpy.mockRestore();
+  });
+
+  it('a throwing verify.onFailed after a RETRY Enter write failure (inside check()) does not crash the retry loop', () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    let enterCount = 0;
+    const write = (data: string) => {
+      if (data === KEYS.ENTER) {
+        enterCount++;
+        if (enterCount === 2) throw new TypeError('null.write on retry');
+      }
+    };
+    const onFailed = vi.fn(() => { throw new Error('onFailed boom on retry'); });
+    injectMessage(write, 'msg', 300, {
+      getOutputBytes: () => 0, // never grows -> triggers a retry
+      onFailed,
+    });
+    vi.advanceTimersByTime(300); // first Enter succeeds
+    expect(() => vi.advanceTimersByTime(4000)).not.toThrow(); // retry Enter throws -> onFailed throws
+    expect(enterCount).toBe(2); // the retry write genuinely happened and genuinely threw
+    expect(onFailed).toHaveBeenCalledTimes(1); // onFailed genuinely ran, not skipped over
+    warnSpy.mockRestore();
+  });
+
+  it('[R8] a throwing console.warn on top of a throwing callback is still contained (outer handler)', () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => { throw new Error('warn boom'); });
+    injectMessage(() => {}, 'msg', 300, {
+      onSubmitted: () => { throw new Error('onSubmitted boom'); },
+    });
+    expect(() => vi.advanceTimersByTime(300)).not.toThrow();
+    warnSpy.mockRestore();
+  });
+
+  it('[R8] a throwing console.warn on top of a throwing callback is still contained (check() closure)', () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => { throw new Error('warn boom'); });
+    let outputBytes = 0;
+    const onAccepted = vi.fn(() => { throw new Error('onAccepted boom'); });
+    injectMessage(() => {}, 'msg', 300, {
+      getOutputBytes: () => outputBytes,
+      onAccepted,
+    });
+    vi.advanceTimersByTime(300);
+    outputBytes += 5000;
+    expect(() => vi.advanceTimersByTime(4000)).not.toThrow();
+    expect(onAccepted).toHaveBeenCalledTimes(1); // the triggering callback genuinely ran
+    expect(warnSpy).toHaveBeenCalledTimes(1); // the (also-throwing) reporting call was attempted
+    warnSpy.mockRestore();
+  });
+
+  it('[R8] a thrown value whose toString() itself throws does not escape either catch (outer handler)', () => {
+    // console.warn(...) is never actually INVOKED in this scenario — the throw happens while
+    // building its argument (the template literal's String(err) call), before the call
+    // expression itself runs. The containment here is the inner try/catch around the whole
+    // console.warn(...) statement, not console.warn surviving a throw from within itself.
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const evil = { toString() { throw new Error('conversion boom'); } };
+    const onSubmitted = vi.fn(() => { throw evil; });
+    injectMessage(() => {}, 'msg', 300, { onSubmitted });
+    expect(() => vi.advanceTimersByTime(300)).not.toThrow();
+    expect(onSubmitted).toHaveBeenCalledTimes(1); // the triggering callback genuinely ran
+    expect(warnSpy).not.toHaveBeenCalled(); // confirms WHERE containment happened: arg-building, not the call itself
+    warnSpy.mockRestore();
+  });
+
+  it('[R8] a thrown value whose toString() itself throws does not escape either catch (check() closure)', () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const evil = { toString() { throw new Error('conversion boom'); } };
+    let outputBytes = 0;
+    const onAccepted = vi.fn(() => { throw evil; });
+    injectMessage(() => {}, 'msg', 300, {
+      getOutputBytes: () => outputBytes,
+      onAccepted,
+    });
+    vi.advanceTimersByTime(300);
+    outputBytes += 5000;
+    expect(() => vi.advanceTimersByTime(4000)).not.toThrow();
+    expect(onAccepted).toHaveBeenCalledTimes(1);
+    expect(warnSpy).not.toHaveBeenCalled(); // same reason as the outer-handler case above
+    warnSpy.mockRestore();
+  });
+});

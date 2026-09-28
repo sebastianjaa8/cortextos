@@ -172,43 +172,66 @@ export function injectMessage(
   };
 
   setTimeout(() => {
-    if (!sendEnter()) {
-      // Enter never reached the PTY — the paste is stranded (or the PTY is
-      // gone entirely). Report failure so dedup state can be un-poisoned.
-      verify?.onFailed?.(new Error('deferred Enter write failed'));
-      return;
-    }
-    verify?.onSubmitted?.();
-    const getOutputBytes = verify?.getOutputBytes;
-    if (!getOutputBytes) return;
-
-    // Verified-submit loop: if the PTY produced (almost) no output since
-    // Enter, the composer still holds the paste — re-send Enter. A bare
-    // Enter on an already-submitted (empty) composer is a no-op, so a
-    // false-negative retry is harmless.
-    let baseline = getOutputBytes();
-    let attempt = 0;
-    const check = () => {
-      const grown = getOutputBytes() - baseline;
-      if (grown >= SUBMIT_ACTIVITY_MIN_BYTES) {
-        verify.onAccepted?.();
-        return;
-      }
-      if (attempt >= ENTER_RETRY_DELAYS_MS.length) {
-        verify.log?.(`[inject] Enter retries exhausted (${grown}B output) — message may be stuck in composer`);
-        verify.onFailed?.(new Error('Enter retries exhausted without PTY response'));
-        return;
-      }
-      verify.log?.(`[inject] no PTY output after Enter (${grown}B) — re-sending Enter (retry ${attempt + 1})`);
-      baseline = getOutputBytes();
+    try {
       if (!sendEnter()) {
-        verify.onFailed?.(new Error('deferred Enter retry failed'));
+        // Enter never reached the PTY — the paste is stranded (or the PTY is
+        // gone entirely). Report failure so dedup state can be un-poisoned.
+        verify?.onFailed?.(new Error('deferred Enter write failed'));
         return;
       }
-      attempt++;
-      setTimeout(check, ENTER_RETRY_DELAYS_MS[Math.min(attempt, ENTER_RETRY_DELAYS_MS.length - 1)]);
-    };
-    setTimeout(check, ENTER_RETRY_DELAYS_MS[0]);
+      verify?.onSubmitted?.();
+      const getOutputBytes = verify?.getOutputBytes;
+      if (!getOutputBytes) return;
+
+      // Verified-submit loop: if the PTY produced (almost) no output since
+      // Enter, the composer still holds the paste — re-send Enter. A bare
+      // Enter on an already-submitted (empty) composer is a no-op, so a
+      // false-negative retry is harmless.
+      let baseline = getOutputBytes();
+      let attempt = 0;
+      const check = () => {
+        try {
+          const grown = getOutputBytes() - baseline;
+          if (grown >= SUBMIT_ACTIVITY_MIN_BYTES) {
+            verify.onAccepted?.();
+            return;
+          }
+          if (attempt >= ENTER_RETRY_DELAYS_MS.length) {
+            verify.log?.(`[inject] Enter retries exhausted (${grown}B output) — message may be stuck in composer`);
+            verify.onFailed?.(new Error('Enter retries exhausted without PTY response'));
+            return;
+          }
+          verify.log?.(`[inject] no PTY output after Enter (${grown}B) — re-sending Enter (retry ${attempt + 1})`);
+          baseline = getOutputBytes();
+          if (!sendEnter()) {
+            verify.onFailed?.(new Error('deferred Enter retry failed'));
+            return;
+          }
+          attempt++;
+          setTimeout(check, ENTER_RETRY_DELAYS_MS[Math.min(attempt, ENTER_RETRY_DELAYS_MS.length - 1)]);
+        } catch (err) {
+          // task_1790591432216_84154671 (2026-09-28): a caller-supplied callback
+          // (log/onAccepted/onFailed/getOutputBytes) throwing here must not crash the daemon —
+          // this setTimeout callback has no surrounding handler, so an uncaught exception here
+          // reaches the daemon's fatal-error handler (src/daemon/index.ts) and takes down every
+          // agent, not just this one. console.warn (not verify.log, which is exactly one of the
+          // things that could have thrown to get here) as the last line of defense, matching
+          // sendEnter()'s own existing pattern above. The reporting call itself is wrapped
+          // again — if even error-formatting (e.g. a thrown value with a throwing toString())
+          // fails, the failure is silently swallowed rather than escaping this catch too.
+          try {
+            console.warn(`[inject] verify-retry check failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+          } catch { /* absolute last resort: do not let error-formatting itself crash the daemon */ }
+        }
+      };
+      setTimeout(check, ENTER_RETRY_DELAYS_MS[0]);
+    } catch (err) {
+      // Same containment for the outer deferred-submit handler (onSubmitted/onFailed/the first
+      // getOutputBytes() call, before check() exists to protect them) — see the comment above.
+      try {
+        console.warn(`[inject] deferred submit handling failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+      } catch { /* absolute last resort: do not let error-formatting itself crash the daemon */ }
+    }
   }, delay);
 }
 
